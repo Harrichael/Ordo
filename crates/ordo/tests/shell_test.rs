@@ -216,6 +216,73 @@ fn logged_run_replays_without_divergence() {
 }
 
 #[test]
+fn replay_from_a_checkpoint_is_clean_and_skips_the_checkpointed_event() {
+    // F1: a checkpoint at seq S stores the state *after* event S. Resuming must
+    // start at S+1, not re-apply S. A checkpoint is always written at seq 0, so
+    // replay(Some(0)) resumes at seq 1 and must be clean — the off-by-one used
+    // to double-apply event 0 and report a spurious mismatch.
+    let dir = std::env::temp_dir().join(format!("ordo-cp-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = dir.join("cp.db");
+    let _ = std::fs::remove_file(&db);
+
+    let run_id = {
+        let logger = Logger::open(&db, "test", "native", 1_000).unwrap();
+        let run_id = logger.run_id();
+        let world = ScriptedWorld {
+            snaps: vec![
+                snap(Some(3), 1, 1),
+                snap(Some(2), 1, 1),
+                snap(Some(1), 2, 2),
+            ],
+            at: Rc::new(Cell::new(0)),
+        };
+        let mut engine = Engine::new(
+            logger,
+            Box::new(world),
+            Box::new(OkEffector),
+            Box::new(StepClock { n: Cell::new(0) }),
+        );
+        engine.observe(ordo_core::RescanTrigger::Startup);
+        engine.observe(ordo_core::RescanTrigger::Periodic);
+        engine.pump(ordo_core::Event::Hotkey {
+            at: ordo_core::Ts {
+                wall_ms: 2_000,
+                mono_ns: 999,
+            },
+            action: ordo_core::HotkeyAction::WorkspaceNext,
+        });
+        run_id
+    };
+
+    let conn = Connection::open(&db).unwrap();
+    let total = count(&conn, "SELECT COUNT(*) FROM events");
+    assert!(count(&conn, "SELECT COUNT(*) FROM checkpoints WHERE seq = 0") == 1);
+
+    let full = replay(&conn, run_id, None).unwrap();
+    assert!(
+        full.is_clean(),
+        "full replay diverged: {:?}",
+        full.mismatches
+    );
+    assert_eq!(
+        full.events_replayed as i64, total,
+        "full run verified from empty"
+    );
+
+    let from_cp = replay(&conn, run_id, Some(0)).unwrap();
+    assert!(
+        from_cp.is_clean(),
+        "checkpoint replay diverged: {:?}",
+        from_cp.mismatches
+    );
+    // Resumed after event 0, so it verifies one fewer event.
+    assert_eq!(from_cp.events_replayed as i64, total - 1);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn retention_prunes_runs_older_than_the_window() {
     let dir = std::env::temp_dir().join(format!("ordo-ret-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();

@@ -11,7 +11,7 @@
 //! unlimited instant workspaces with no private Space APIs — see the research.
 //! Best paired with "Displays have separate Spaces" off.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use ordo_core::{Rect, WindowId, WorkspaceId};
 
@@ -31,6 +31,10 @@ pub struct EmulatedBackend {
     ledger: Ledger,
     /// On-screen frame to restore each parked window to.
     saved: HashMap<WindowId, Rect>,
+    /// Windows currently parked off-screen. Tracked so re-parking an
+    /// already-parked window (a hidden->hidden move) doesn't overwrite its real
+    /// saved frame with the sliver position.
+    parked: HashSet<WindowId>,
 }
 
 impl EmulatedBackend {
@@ -38,6 +42,7 @@ impl EmulatedBackend {
         EmulatedBackend {
             ledger: Ledger::new(count),
             saved: HashMap::new(),
+            parked: HashSet::new(),
         }
     }
 
@@ -62,13 +67,21 @@ impl EmulatedBackend {
     }
 
     fn park(&mut self, window: WindowId, frames: &HashMap<WindowId, Rect>) {
+        // Save the real frame only on the transition onto-screen -> parked; a
+        // window already parked keeps its original saved frame rather than
+        // recording the sliver position.
+        if self.parked.contains(&window) {
+            return;
+        }
         if let Some(f) = frames.get(&window) {
             self.saved.insert(window, *f);
+            self.parked.insert(window);
             ax::set_frame(window, Self::park_frame(*f));
         }
     }
 
     fn restore(&mut self, window: WindowId) {
+        self.parked.remove(&window);
         if let Some(f) = self.saved.get(&window) {
             ax::set_frame(window, *f);
         }

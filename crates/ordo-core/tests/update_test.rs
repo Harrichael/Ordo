@@ -581,6 +581,140 @@ fn move_focused_window_to_other_monitor_brings_the_mouse() {
         .any(|e| matches!(e, Effect::WarpMouse { to } if *to == center)));
 }
 
+// --- review fixes --------------------------------------------------------------
+
+fn count_moves_to_ws(effects: &[Effect], w: u32) -> usize {
+    effects
+        .iter()
+        .filter(|e| matches!(e, Effect::MoveWindowToWorkspace { window, .. } if *window == wid(w)))
+        .count()
+}
+
+fn count_set_frames(effects: &[Effect], w: u32) -> usize {
+    effects
+        .iter()
+        .filter(|e| matches!(e, Effect::SetWindowFrame { window, .. } if *window == wid(w)))
+        .count()
+}
+
+#[test]
+fn corral_leaves_previously_missed_same_app_windows_alone() {
+    // F2: a full rescan reports every unmodeled window as "created". Two windows
+    // of the same app surface at once — w9 is the genuinely new one that took
+    // focus, w8 was merely missed (sitting on another workspace, unfocused).
+    // Only the focused newcomer should be corralled.
+    let s = booted(&[1]); // anchor: workspace 1, monitor A
+    let mut wins = std_windows();
+    wins.push(win(8, 300, 2, rect(2100.0, 400.0))); // same pid, not focused
+    wins.push(win(9, 300, 2, rect(2200.0, 300.0))); // same pid, focused (new)
+    let obs = update(
+        &s,
+        &observed(
+            vec![mon_a(1), mon_b(1)],
+            wins,
+            Some(9),
+            RescanTrigger::AxHint {
+                pid: Some(Pid(300)),
+                kind: AxHintKind::WindowCreated,
+            },
+        ),
+    );
+    assert!(count_moves_to_ws(&obs.effects, 9) >= 1, "w9 corralled");
+    assert_eq!(count_moves_to_ws(&obs.effects, 8), 0, "w8 left alone");
+    assert_eq!(count_set_frames(&obs.effects, 8), 0, "w8 not reframed");
+}
+
+#[test]
+fn tear_realign_skips_workspaces_no_display_can_reach() {
+    // F3: monitor A has 5 spaces and sits on space 5; monitor B has only 3.
+    // The world is torn, but no display can reach workspace 5, so Ordo must not
+    // fire a futile switch.
+    let mon_a5 = MonitorSnap {
+        id: mid(1),
+        frame: Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 1920.0,
+            h: 1080.0,
+        },
+        is_main: true,
+        active_workspace: ws(5),
+        workspace_count: 5,
+    };
+    let mon_b3 = MonitorSnap {
+        id: mid(2),
+        frame: Rect {
+            x: 1920.0,
+            y: 0.0,
+            w: 1920.0,
+            h: 1080.0,
+        },
+        is_main: false,
+        active_workspace: ws(1),
+        workspace_count: 3,
+    };
+    let obs = update(
+        &State::new(),
+        &Event::WorldObserved {
+            at: ts(),
+            trigger: RescanTrigger::Startup,
+            snap: WorldSnapshot {
+                monitors: vec![mon_a5, mon_b3],
+                windows: vec![win(1, 100, 5, rect(100.0, 100.0))],
+                focused: Some(wid(1)),
+            },
+        },
+    );
+    assert!(obs.state.is_torn());
+    assert_eq!(obs.state.current_workspace(), Some(ws(5)));
+    assert!(
+        count_switches(&obs.effects) == 0,
+        "no realign toward an unreachable workspace"
+    );
+}
+
+#[test]
+fn damping_budgets_are_independent_per_axis() {
+    // F4: a new focused window is wrong on BOTH workspace and monitor, and the
+    // app resists both. Each axis must get its own full retry budget (initial +
+    // 2 retries = 3), i.e. 6 correctives total — impossible if the two shared
+    // one counter.
+    let s = booted(&[1]); // anchor workspace 1, monitor A
+    let mut wins = std_windows();
+    wins.push(win(9, 300, 2, rect(2100.0, 300.0))); // wrong ws (2) AND wrong monitor (B)
+    let created = observed(
+        vec![mon_a(1), mon_b(1)],
+        wins.clone(),
+        Some(9),
+        RescanTrigger::AxHint {
+            pid: Some(Pid(300)),
+            kind: AxHintKind::WindowCreated,
+        },
+    );
+    let mut step = update(&s, &created);
+    let mut ws_moves = count_moves_to_ws(&step.effects, 9);
+    let mut frame_sets = count_set_frames(&step.effects, 9);
+    let mut diverged = false;
+    for _ in 0..25 {
+        let next = update(
+            &step.state,
+            &observed(
+                vec![mon_a(1), mon_b(1)],
+                wins.clone(),
+                Some(9),
+                RescanTrigger::Periodic,
+            ),
+        );
+        ws_moves += count_moves_to_ws(&next.effects, 9);
+        frame_sets += count_set_frames(&next.effects, 9);
+        diverged |= next.notes.contains(&Note::Diverged { window: wid(9) });
+        step = next;
+    }
+    assert_eq!(ws_moves, 3, "workspace axis: initial + 2 retries");
+    assert_eq!(frame_sets, 3, "frame axis: initial + 2 retries");
+    assert!(diverged);
+}
+
 // --- replay & determinism -----------------------------------------------------
 
 #[test]

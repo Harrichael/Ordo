@@ -39,7 +39,7 @@ mod reconcile;
 mod state;
 mod update;
 
-pub use effect::{Effect, Expectation};
+pub use effect::{CorrectionAxis, Effect, Expectation};
 pub use event::{
     AxHintKind, Event, HotkeyAction, MonitorSnap, OpOutcome, RescanTrigger, Ts, WindowSnap,
     WorldSnapshot,

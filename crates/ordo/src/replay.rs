@@ -41,9 +41,7 @@ pub fn replay(
     run_id: i64,
     from_seq: Option<u64>,
 ) -> rusqlite::Result<ReplayReport> {
-    let target = from_seq.unwrap_or(0);
-
-    let (mut state, start_seq) = load_checkpoint(conn, run_id, target)?;
+    let (mut state, start_seq) = resume_point(conn, run_id, from_seq)?;
 
     let mut stmt = conn.prepare(
         "SELECT seq, payload FROM events
@@ -84,10 +82,24 @@ pub fn replay(
     Ok(report)
 }
 
-/// The most recent checkpoint at or before `target`, and the seq to resume
-/// from. Checkpoints store the state *before* their seq's event was applied, so
-/// replay resumes at that seq.
-fn load_checkpoint(conn: &Connection, run_id: i64, target: u64) -> rusqlite::Result<(State, u64)> {
+/// Where to start replaying: the starting `State` and the first event seq to
+/// apply.
+///
+/// A checkpoint at seq `S` stores the state *after* event `S` was applied (that
+/// is what the logger writes). So resuming from it means loading that state and
+/// applying events with seq `> S`, i.e. starting at `S + 1` — applying `S` again
+/// would double-apply it. For a whole-run replay (`from_seq = None`) we ignore
+/// checkpoints entirely and start from an empty state at seq 0, so every event
+/// including the first is verified against a clean re-run.
+fn resume_point(
+    conn: &Connection,
+    run_id: i64,
+    from_seq: Option<u64>,
+) -> rusqlite::Result<(State, u64)> {
+    let Some(target) = from_seq else {
+        return Ok((State::new(), 0));
+    };
+
     let found: Option<(i64, String)> = conn
         .query_row(
             "SELECT seq, payload FROM checkpoints
@@ -100,7 +112,7 @@ fn load_checkpoint(conn: &Connection, run_id: i64, target: u64) -> rusqlite::Res
     match found {
         Some((seq, payload)) => {
             let state = serde_json::from_str(&payload).unwrap_or_else(|_| State::new());
-            Ok((state, seq as u64))
+            Ok((state, seq as u64 + 1))
         }
         None => Ok((State::new(), 0)),
     }

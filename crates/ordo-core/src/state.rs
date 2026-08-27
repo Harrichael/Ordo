@@ -36,10 +36,14 @@ pub struct WindowRecord {
     /// the hot path and reconcile already recomputes it per snapshot.
     pub monitor: MonitorId,
     pub frame: Rect,
-    /// Placement correctives issued without the world staying put. At the
-    /// damping limit we stop correcting and log instead — an app that fights
-    /// back becomes a loud log line, never an effect loop.
-    pub corrections: u8,
+    /// Placement correctives issued without the world staying put, damped per
+    /// axis: workspace assignment and on-screen frame are independent fights
+    /// (a new window can be wrong on both at once), so a single counter would
+    /// double-count and cross-reset them. At a counter's limit we stop
+    /// correcting that axis and log instead — an app that fights back becomes a
+    /// loud log line, never an effect loop.
+    pub ws_corrections: u8,
+    pub frame_corrections: u8,
 }
 
 /// A self-initiated operation awaiting its echo in a snapshot. Deltas that

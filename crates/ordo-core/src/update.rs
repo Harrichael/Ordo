@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::effect::{Effect, Expectation};
+use crate::effect::{CorrectionAxis, Effect, Expectation};
 use crate::event::{AxHintKind, Event, HotkeyAction, OpOutcome, RescanTrigger, WorldSnapshot};
 use crate::ids::{OpId, WindowId, WorkspaceId, FRAME_EPSILON};
 use crate::reconcile::{self, Delta};
@@ -223,10 +223,15 @@ fn handle_snapshot(
     for mut p in std::mem::take(&mut s.pending) {
         if expectation_satisfied(&p.expect, s) {
             notes.push(Note::SelfConfirmed { op: p.op });
-            // The world accepted this placement: the fight (if any) is over.
-            if let Some(w) = p.expect.window() {
+            // The world accepted this placement: this axis's fight is over.
+            // Reset only the matching axis so a confirmed workspace move doesn't
+            // wipe the budget an in-progress frame fight has accrued.
+            if let (Some(w), Some(axis)) = (p.expect.window(), p.expect.axis()) {
                 if let Some(r) = s.windows.get_mut(&w) {
-                    r.corrections = 0;
+                    match axis {
+                        CorrectionAxis::Workspace => r.ws_corrections = 0,
+                        CorrectionAxis::Frame => r.frame_corrections = 0,
+                    }
                 }
             }
         } else {
@@ -269,28 +274,44 @@ fn handle_snapshot(
                     .get(&window)
                     .is_some_and(|r| r.workspace != workspace) =>
             {
-                correct_window(s, window, notes, &mut last_op, fx, |op| {
-                    (
-                        Effect::MoveWindowToWorkspace {
-                            op,
-                            window,
-                            target: workspace,
-                        },
-                        Expectation::WindowOn { window, workspace },
-                    )
-                });
+                correct_window(
+                    s,
+                    window,
+                    CorrectionAxis::Workspace,
+                    notes,
+                    &mut last_op,
+                    fx,
+                    |op| {
+                        (
+                            Effect::MoveWindowToWorkspace {
+                                op,
+                                window,
+                                target: workspace,
+                            },
+                            Expectation::WindowOn { window, workspace },
+                        )
+                    },
+                );
             }
             Expectation::WindowFramed { window, frame }
                 if s.windows
                     .get(&window)
                     .is_some_and(|r| !r.frame.approx_eq(&frame, FRAME_EPSILON)) =>
             {
-                correct_window(s, window, notes, &mut last_op, fx, |op| {
-                    (
-                        Effect::SetWindowFrame { op, window, frame },
-                        Expectation::WindowFramed { window, frame },
-                    )
-                });
+                correct_window(
+                    s,
+                    window,
+                    CorrectionAxis::Frame,
+                    notes,
+                    &mut last_op,
+                    fx,
+                    |op| {
+                        (
+                            Effect::SetWindowFrame { op, window, frame },
+                            Expectation::WindowFramed { window, frame },
+                        )
+                    },
+                );
             }
             _ => {}
         }
@@ -306,6 +327,17 @@ fn handle_snapshot(
         if let (Some(anchor_ws), Some(anchor_mon)) = (anchor_ws, anchor_mon) {
             for d in &deltas {
                 let Delta::WindowCreated(w) = d else { continue };
+                // Only corral the window that actually took focus. A full rescan
+                // reports every previously-unmodeled window as "created", so
+                // without this a same-app window that was merely missed (e.g. it
+                // sat on another Space) would be dragged along with a genuinely
+                // new one — AeroSpace's "windows randomly jump" bug. The newly
+                // created window is the one that came to focus; that's the one
+                // we place. (Non-focus-stealing new windows are left where they
+                // open, by design.)
+                if s.focused != Some(*w) {
+                    continue;
+                }
                 let Some(rec) = s.windows.get(w).cloned() else {
                     continue;
                 };
@@ -314,19 +346,27 @@ fn handle_snapshot(
                 }
                 if rec.workspace != anchor_ws {
                     let window = *w;
-                    correct_window(s, window, notes, &mut last_op, fx, |op| {
-                        (
-                            Effect::MoveWindowToWorkspace {
-                                op,
-                                window,
-                                target: anchor_ws,
-                            },
-                            Expectation::WindowOn {
-                                window,
-                                workspace: anchor_ws,
-                            },
-                        )
-                    });
+                    correct_window(
+                        s,
+                        window,
+                        CorrectionAxis::Workspace,
+                        notes,
+                        &mut last_op,
+                        fx,
+                        |op| {
+                            (
+                                Effect::MoveWindowToWorkspace {
+                                    op,
+                                    window,
+                                    target: anchor_ws,
+                                },
+                                Expectation::WindowOn {
+                                    window,
+                                    workspace: anchor_ws,
+                                },
+                            )
+                        },
+                    );
                 }
                 if rec.monitor != anchor_mon {
                     if let (Some(from_mon), Some(to_mon)) =
@@ -334,12 +374,20 @@ fn handle_snapshot(
                     {
                         let frame = rec.frame.translate_between(&from_mon.frame, &to_mon.frame);
                         let window = *w;
-                        correct_window(s, window, notes, &mut last_op, fx, |op| {
-                            (
-                                Effect::SetWindowFrame { op, window, frame },
-                                Expectation::WindowFramed { window, frame },
-                            )
-                        });
+                        correct_window(
+                            s,
+                            window,
+                            CorrectionAxis::Frame,
+                            notes,
+                            &mut last_op,
+                            fx,
+                            |op| {
+                                (
+                                    Effect::SetWindowFrame { op, window, frame },
+                                    Expectation::WindowFramed { window, frame },
+                                )
+                            },
+                        );
                     }
                 }
             }
@@ -358,7 +406,14 @@ fn handle_snapshot(
         .any(|p| matches!(p.expect, Expectation::AllMonitorsOn(_)))
     {
         if s.tear_corrections < DAMPING_LIMIT {
-            if let Some(target) = s.current_workspace() {
+            // Only realign toward a workspace every display can actually reach.
+            // With asymmetric Space counts a monitor can sit on a workspace the
+            // others don't have; targeting it would be an unsatisfiable, futile
+            // swipe-storm, so leave that tear alone rather than fight it.
+            let reachable = s
+                .current_workspace()
+                .filter(|t| t.0 >= 1 && t.0 <= s.workspace_count);
+            if let Some(target) = reachable {
                 let op = s.mint_op();
                 fx.push(Effect::SwitchWorkspace { op, target });
                 s.pending.push(PendingOp {
@@ -384,17 +439,23 @@ fn handle_snapshot(
     }
 }
 
-/// Emit a placement corrective for `window` unless it has hit the damping
-/// limit, in which case note the divergence and stand down.
+/// Emit a placement corrective for `window` on `axis` unless that axis has hit
+/// the damping limit, in which case note the divergence and stand down. Damping
+/// is per axis so a window wrong on both workspace and frame gets a full retry
+/// budget for each.
 fn correct_window(
     s: &mut State,
     window: WindowId,
+    axis: CorrectionAxis,
     notes: &mut Vec<Note>,
     last_op: &mut Option<OpId>,
     fx: &mut Vec<Effect>,
     build: impl FnOnce(OpId) -> (Effect, Expectation),
 ) {
-    let corrections = s.windows.get(&window).map_or(0, |r| r.corrections);
+    let corrections = s.windows.get(&window).map_or(0, |r| match axis {
+        CorrectionAxis::Workspace => r.ws_corrections,
+        CorrectionAxis::Frame => r.frame_corrections,
+    });
     if corrections >= DAMPING_LIMIT {
         notes.push(Note::Diverged { window });
         return;
@@ -408,7 +469,10 @@ fn correct_window(
         rescans_left: EXPECTATION_RESCANS,
     });
     if let Some(r) = s.windows.get_mut(&window) {
-        r.corrections += 1;
+        match axis {
+            CorrectionAxis::Workspace => r.ws_corrections += 1,
+            CorrectionAxis::Frame => r.frame_corrections += 1,
+        }
     }
     *last_op = Some(op);
 }

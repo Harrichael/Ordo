@@ -68,6 +68,15 @@ pub enum Expectation {
     Focused(WindowId),
 }
 
+/// Which independent placement fight a correction belongs to. Workspace
+/// assignment and on-screen frame are corrected separately and damped
+/// separately, so a window wrong on both doesn't burn one shared budget.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CorrectionAxis {
+    Workspace,
+    Frame,
+}
+
 impl Expectation {
     /// The window whose placement this expectation guards, if any — used to
     /// reset that window's damping counter once the world accepts a correction.
@@ -76,6 +85,15 @@ impl Expectation {
             Expectation::WindowOn { window, .. } | Expectation::WindowFramed { window, .. } => {
                 Some(*window)
             }
+            _ => None,
+        }
+    }
+
+    /// The damping axis this expectation's correction is damped on.
+    pub fn axis(&self) -> Option<CorrectionAxis> {
+        match self {
+            Expectation::WindowOn { .. } => Some(CorrectionAxis::Workspace),
+            Expectation::WindowFramed { .. } => Some(CorrectionAxis::Frame),
             _ => None,
         }
     }

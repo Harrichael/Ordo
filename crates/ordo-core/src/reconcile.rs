@@ -144,7 +144,10 @@ pub(crate) fn apply_snapshot(s: &mut State, snap: &WorldSnapshot) {
         let Some(monitor) = derive_monitor(&w.frame, &snap.monitors) else {
             continue;
         };
-        let corrections = old_windows.get(&w.id).map_or(0, |r| r.corrections);
+        let (ws_corrections, frame_corrections) = old_windows
+            .get(&w.id)
+            .map_or((0, 0), |r| (r.ws_corrections, r.frame_corrections));
+        let is_new = !old_windows.contains_key(&w.id);
         s.windows.insert(
             w.id,
             WindowRecord {
@@ -155,19 +158,21 @@ pub(crate) fn apply_snapshot(s: &mut State, snap: &WorldSnapshot) {
                 workspace: w.workspace,
                 monitor,
                 frame: w.frame,
-                corrections,
+                ws_corrections,
+                frame_corrections,
             },
         );
+        // Enter never-before-seen windows into the MRU history at the back — but
+        // only ones that actually made it into the model, so focus_history stays
+        // a subset of `windows` (an invariant the rest of the core relies on).
+        if is_new {
+            s.focus_history.note_created(w.id);
+        }
     }
 
     for gone in old_windows.keys() {
         if !s.windows.contains_key(gone) {
             s.focus_history.remove(*gone);
-        }
-    }
-    for w in &snap.windows {
-        if !old_windows.contains_key(&w.id) {
-            s.focus_history.note_created(w.id);
         }
     }
 
