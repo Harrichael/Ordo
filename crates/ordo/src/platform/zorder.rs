@@ -96,61 +96,136 @@ pub fn stack_front_to_back() -> Vec<WindowId> {
 /// position at the bottom are skipped entirely — the common round trip
 /// raises only what actually moved.
 ///
-/// The currently focused window is not ordered like the rest: background
-/// raises land below it for free, and it is re-raised right after any of its
-/// own app's siblings (they jump above it — see the sequencing comment below).
+/// `desired[0]` is the DESIGNATED top — the window the core wants focused —
+/// not whatever AX says is focused right now. Asking AX mid-reveal races the
+/// focus effect's own landing (and the outgoing app may already be hidden),
+/// which returned the old window or nothing; that put the real top window
+/// into the ordering set, made every "first among want" gate unsatisfiable
+/// (backgrounds can't rise above the key window), burned all the timeouts,
+/// and let the unsequenced raises land coin-flip — the lived "scrambled,
+/// then the top window ping-pongs each round trip" bug. Intent is the
+/// authority; the actual key window, whichever it transiently is, sits in no
+/// gate's scope and settles on top by itself.
 pub fn reassert_stack(desired: &[WindowId]) {
     const PRESENCE_TIMEOUT_MS: u64 = 600;
-    const LANDING_TIMEOUT_MS: u64 = 400;
+    // Generous on purpose: a landed gate exits in single-digit ms, so this is
+    // paid only by an app genuinely slower than it — and a timeout means an
+    // unaccounted-for raise is in flight, which is exactly what the second
+    // pass exists to absorb. (Chrome has been measured past 400ms.)
+    const LANDING_TIMEOUT_MS: u64 = 1000;
     const POLL_MS: u64 = 5;
 
-    let focused = ax::focused_window();
-    let want: Vec<WindowId> = desired
-        .iter()
-        .copied()
-        .filter(|w| Some(*w) != focused)
-        .collect();
-    if want.len() < 2 {
+    let Some((&top, rest)) = desired.split_first() else {
+        return;
+    };
+    if rest.is_empty() {
         return;
     }
 
-    let observed = |want: &[WindowId]| -> Vec<WindowId> {
+    let observed = |scope: &[WindowId]| -> Vec<WindowId> {
         stack_front_to_back()
             .into_iter()
-            .filter(|w| want.contains(w))
+            .filter(|w| scope.contains(w))
             .collect()
     };
 
     // Wait for un-hides to finish resurfacing every window we're about to
     // order; a window that pops back mid-pass would land wherever it left off.
     let mut waited = 0;
-    while observed(&want).len() < want.len() && waited < PRESENCE_TIMEOUT_MS {
+    while observed(desired).len() < desired.len() && waited < PRESENCE_TIMEOUT_MS {
         std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
         waited += POLL_MS;
     }
     // Anything still missing isn't coming (closed, or a stuck app): order
     // what's actually there.
-    let present = observed(&want);
-    let want: Vec<WindowId> = want.into_iter().filter(|w| present.contains(w)).collect();
-    if want.len() < 2 {
+    let present = observed(desired);
+    let mut want: Vec<WindowId> = rest
+        .iter()
+        .copied()
+        .filter(|w| present.contains(w))
+        .collect();
+    if want.is_empty() {
         return;
     }
 
-    // The focused APP's windows obey different raise physics than everyone
-    // else's (probed in slps_sibling_probe.rs, refuting AeroSpace #395 on
-    // Tahoe): a background app's window raises to just below the key window,
-    // but a sibling of the key window raises ABOVE it, to global top.
+    // While a window we must order HOLDS key status, nothing can be raised
+    // above it — so wait out the in-flight focus handoff (the effect always
+    // precedes the restack) until the key window is out of `want`. This is
+    // AX-as-wait-condition, not AX-as-authority: the condition is monotone
+    // (once the handoff lands it stays landed), unlike the racing "who's
+    // focused" read this function used to key its physics on. Alt+End is the
+    // flow that needs it: the demoted window stays key until the handoff.
+    let mut waited = 0;
+    let mut key_in_want = None;
+    while waited < LANDING_TIMEOUT_MS {
+        match ax::focused_window() {
+            Some(f) if want.contains(&f) => {
+                key_in_want = Some(f);
+                std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
+                waited += POLL_MS;
+            }
+            _ => {
+                key_in_want = None;
+                break;
+            }
+        }
+    }
+    // Still key after the wait — the handoff isn't coming (an external focus
+    // grab, or a caller whose desired[0] isn't the window it focused).
+    // Physics wins: nothing can be raised above the key window, so exempt it
+    // and order the rest instead of burning every gate's timeout against an
+    // unsatisfiable condition (once a 13-second engine freeze per switch).
+    if let Some(f) = key_in_want {
+        want.retain(|w| *w != f);
+        if want.is_empty() {
+            return;
+        }
+    }
+    let scope: Vec<WindowId> = std::iter::once(top).chain(want.iter().copied()).collect();
+
+    // Two passes: the first does the work; the second exists solely to absorb
+    // a ghost — a raise that outlived its landing timeout and touched down
+    // after the pass finished, breaking the order behind our back. The settle
+    // sleep gives such a straggler time to land where the re-pass can see it;
+    // the suffix-skip keeps the re-pass to just the windows it displaced.
+    for pass in 0..2 {
+        if pass > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+        }
+        if observed(&scope) == scope {
+            return; // exact (also the common repeated-switch case: zero raises)
+        }
+        raise_pass(top, &want, &scope, &observed);
+    }
+}
+
+/// One sequenced, landing-gated raise pass. See [`reassert_stack`] for why
+/// this shape is the only deterministic one available.
+fn raise_pass(
+    top: WindowId,
+    want: &[WindowId],
+    scope: &[WindowId],
+    observed: &dyn Fn(&[WindowId]) -> Vec<WindowId>,
+) {
+    const LANDING_TIMEOUT_MS: u64 = 1000;
+    const POLL_MS: u64 = 5;
+
+    // The designated top's OWN app's windows obey different raise physics
+    // than everyone else's (probed in slps_sibling_probe.rs, refuting
+    // AeroSpace #395 on Tahoe): a background app's window raises to just
+    // below the key window, but a sibling of the key window raises ABOVE it.
     //
     // Both still amount to "insert on top of the processed region" if the
     // stack is built back-to-front and every sibling raise is immediately
-    // followed by re-raising the focused window: the sibling briefly covers
+    // followed by re-raising the designated top: the sibling briefly covers
     // it, the re-raise freezes the sibling in as the new top of the below-
-    // focus region, and later background raises insert above it as usual.
-    // That one extra same-app raise per sibling makes ANY interleaving of
-    // apps in the desired order achievable — no focus changes, key status
-    // never moves.
+    // top region, and later background raises insert above it as usual. That
+    // one extra same-app raise per sibling makes ANY interleaving of apps in
+    // the desired order achievable — no focus changes, key status never
+    // moves. A final unconditional raise of the designated top makes the
+    // result independent of when its focus effect happens to land.
     let with_pids = stack_with_pids();
-    let fpid = focused.and_then(|f| with_pids.iter().find(|(w, _)| *w == f.0).map(|(_, p)| *p));
+    let fpid = with_pids.iter().find(|(w, _)| *w == top.0).map(|(_, p)| *p);
     let is_sibling = |w: WindowId| {
         fpid.is_some()
             && with_pids
@@ -161,7 +236,7 @@ pub fn reassert_stack(desired: &[WindowId]) {
     };
 
     // Skip the already-correct bottom of the stack.
-    let actual = observed(&want);
+    let actual = observed(want);
     let mut keep = 0;
     while keep < want.len()
         && keep < actual.len()
@@ -174,22 +249,27 @@ pub fn reassert_stack(desired: &[WindowId]) {
     for i in (0..want.len() - keep).rev() {
         sequence.push(want[i]);
         if is_sibling(want[i]) {
-            sequence.extend(focused);
+            sequence.push(top);
         }
+    }
+    if sequence.last() != Some(&top) {
+        sequence.push(top);
     }
 
     // One landing at a time. Landed is the raise's own observable, never a
     // vacuous ordering check (the first window's "suffix in order" is
     // trivially true, which once let its in-flight raise leapfrog two later
-    // ones): a background raise lands at top-of-non-key, i.e. above every
-    // other window we're ordering; a sibling (or the focused re-raise) lands
-    // at the absolute top.
+    // ones), and always RELATIVE to the windows being ordered — never "the
+    // absolute top", which the transient key window owns: a landed raise
+    // reads back above every other window in its scope. The designated top's
+    // scope includes everything; the others' excludes the designated top,
+    // which legitimately sits above them.
     ax::raise_sequenced(&sequence, |w| {
         let landed = |w: WindowId| {
-            if Some(w) == focused || is_sibling(w) {
-                stack_front_to_back().first() == Some(&w)
+            if w == top {
+                observed(scope).first() == Some(&w)
             } else {
-                observed(&want).first() == Some(&w)
+                observed(want).first() == Some(&w)
             }
         };
         let mut waited = 0;

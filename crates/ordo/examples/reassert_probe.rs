@@ -48,11 +48,16 @@ fn main() {
     let mut reversed = original.clone();
     reversed.reverse();
 
+    // Mirror the daemon's contract: desired[0] is the designated top and the
+    // core always focuses it before restacking (a key window inside the rest
+    // of the order would be physically impossible to stack under).
+    ax::focus(reversed[0]);
     let t = std::time::Instant::now();
     zorder::reassert_stack(&reversed);
     println!("\nreverse pass took {:?}", t.elapsed());
     let ok1 = check("reversed", &reversed);
 
+    ax::focus(original[0]);
     let t = std::time::Instant::now();
     zorder::reassert_stack(&original);
     println!("\nrestore pass took {:?}", t.elapsed());

@@ -438,6 +438,44 @@ fn switching_restacks_the_destination_by_mru() {
 }
 
 #[test]
+fn round_trip_through_empty_workspace_refocuses_the_same_window() {
+    // Leaving for an empty workspace never moves focus (parking doesn't
+    // defocus), so coming back must re-focus the SAME window — and the focus
+    // target must be the restack's head, or the reassert's physics are
+    // unsatisfiable (the key window can't be ordered underneath anything).
+    // The regression: alt-tab's skip-the-focused selection here focused the
+    // second MRU window on every return, flip-flopping the top window.
+    let s = booted(&[2, 3, 1]); // history: [1, 3, 2], all on ws 1
+    let away = update(&s, &hotkey(HotkeyAction::WorkspaceNext));
+    assert!(
+        focus_targets(&away.effects).is_empty(),
+        "empty destination: nobody to focus"
+    );
+    let parked = update(
+        &away.state,
+        &observed(
+            vec![mon_a(2), mon_b(2)],
+            std_windows(),
+            Some(1),
+            RescanTrigger::PostEffect { op: OpId(1) },
+        ),
+    )
+    .state;
+
+    let back = update(&parked, &hotkey(HotkeyAction::WorkspacePrev));
+    let restack = back
+        .effects
+        .iter()
+        .find_map(|e| match e {
+            Effect::RestackWindows { order } => Some(order.clone()),
+            _ => None,
+        })
+        .expect("restack effect");
+    assert_eq!(focus_targets(&back.effects), vec![wid(1)]);
+    assert_eq!(restack, vec![wid(1), wid(3), wid(2)]);
+}
+
+#[test]
 fn external_focus_on_a_hidden_workspaces_window_is_followed() {
     // The user Cmd+Tabbed to w2, which is parked on workspace 2: Ordo brings
     // workspace 2 over, mirroring native Spaces.

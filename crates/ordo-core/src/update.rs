@@ -127,20 +127,28 @@ fn handle_hotkey(s: &mut State, action: HotkeyAction, fx: &mut Vec<Effect>) {
             // the focused app) could never dim the workspace being left. No
             // mouse warp: the core's frame belief for that window is its
             // parked sliver position, so a warp would aim at the corner.
-            let focus_target = {
-                let windows = &s.windows;
-                s.focus_history.most_recent(s.focused, |w| {
-                    windows.get(&w).is_some_and(|r| r.workspace == target)
-                })
-            };
-            if let Some(fw) = focus_target {
+            //
+            // The focus target IS the head of the restack order — one list
+            // feeds both. The restack's physics require its designated top to
+            // be the key window, and this must hold even when the focused
+            // window never left (a round trip through an empty workspace):
+            // alt-tab's skip-the-focused selection here handed focus to the
+            // SECOND MRU window on each return while the restack still named
+            // the first, which made the ordering unsatisfiable and flipped
+            // the top window every round trip.
+            let stack = mru_stack(s, target);
+            if let Some(&fw) = stack.first() {
                 let op = s.mint_op();
                 fx.push(Effect::FocusWindow { op, window: fw });
-                s.pending.push(PendingOp {
-                    op,
-                    expect: Expectation::Focused(fw),
-                    rescans_left: EXPECTATION_RESCANS,
-                });
+                // Re-asserting focus the belief already holds produces no
+                // delta, so there is nothing to attribute to an expectation.
+                if s.focused != Some(fw) {
+                    s.pending.push(PendingOp {
+                        op,
+                        expect: Expectation::Focused(fw),
+                        rescans_left: EXPECTATION_RESCANS,
+                    });
+                }
             }
             let op = s.mint_op();
             fx.push(Effect::SwitchWorkspace { op, target });
@@ -149,7 +157,9 @@ fn handle_hotkey(s: &mut State, action: HotkeyAction, fx: &mut Vec<Effect>) {
                 expect: Expectation::AllMonitorsOn(target),
                 rescans_left: EXPECTATION_RESCANS,
             });
-            push_restack(s, target, fx);
+            if stack.len() >= 2 {
+                fx.push(Effect::RestackWindows { order: stack });
+            }
             fx.push(Effect::RequestRescan {
                 reason: RescanTrigger::PostEffect { op },
             });
