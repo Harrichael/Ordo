@@ -17,6 +17,7 @@
 pub mod backend;
 pub mod clock;
 pub mod engine;
+pub mod keys;
 pub mod logger;
 pub mod ports;
 pub mod replay;

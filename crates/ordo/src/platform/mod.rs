@@ -15,9 +15,13 @@
 pub mod ax;
 pub mod cf;
 pub mod display;
+pub mod effector;
 pub mod mouse;
 pub mod native_backend;
 pub mod skylight;
+pub mod tap;
+
+pub use effector::MacEffector;
 
 use std::cell::RefCell;
 use std::collections::HashMap;

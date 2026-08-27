@@ -11,15 +11,19 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run the daemon. In this milestone it observes and logs only — it decides
-    /// what it *would* do and records it, but executes nothing.
+    /// Run the daemon: intercept hotkeys and act on them (focus + mouse warp
+    /// now; workspace switching lands in a later milestone). Pass --observe to
+    /// decide-and-log without touching anything.
     Run {
         /// Log database path (defaults to ~/Library/Application Support/Ordo/log.db).
         #[arg(long)]
         db: Option<PathBuf>,
-        /// Seconds between full rescans.
+        /// Seconds between full rescans (the reconcile safety net).
         #[arg(long, default_value_t = 2.0)]
         interval: f64,
+        /// Observe and log only; execute nothing and intercept no keys.
+        #[arg(long)]
+        observe: bool,
     },
     /// Replay a logged run through the core and report any effect-stream
     /// divergence — the tool for "what happened, and does the current core
@@ -39,7 +43,11 @@ enum Command {
 fn main() {
     let cli = Cli::parse();
     match cli.command {
-        Command::Run { db, interval } => run(db, interval),
+        Command::Run {
+            db,
+            interval,
+            observe,
+        } => run(db, interval, observe),
         Command::Replay { db, run, from } => replay(db, run, from),
     }
 }
@@ -49,7 +57,7 @@ fn db_path(db: Option<PathBuf>) -> PathBuf {
 }
 
 #[cfg(target_os = "macos")]
-fn run(db: Option<PathBuf>, interval: f64) {
+fn run(db: Option<PathBuf>, interval: f64, observe: bool) {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
@@ -57,24 +65,37 @@ fn run(db: Option<PathBuf>, interval: f64) {
     use ordo::clock::{Clock, SystemClock};
     use ordo::engine::{Engine, Msg};
     use ordo::logger::Logger;
-    use ordo::platform::{native_backend, MacWorldSource};
-    use ordo::ports::NullEffector;
+    use ordo::platform::{native_backend, tap, MacEffector, MacWorldSource};
+    use ordo::ports::{Effector, NullEffector};
     use ordo_core::RescanTrigger;
 
     let path = db_path(db);
-    println!("ordo: observe-only. Logging to {}", path.display());
+    if observe {
+        println!("ordo: observe-only. Logging to {}", path.display());
+    } else {
+        println!("ordo: active. Logging to {}", path.display());
+        println!("ordo: rescue = Ctrl+Alt+Cmd+Escape pressed twice within 2s.");
+    }
     println!("ordo: requires Accessibility permission (System Settings > Privacy & Security > Accessibility).");
     println!("ordo: press Ctrl-C to stop.");
 
     let stop = Arc::new(AtomicBool::new(false));
     install_sigint(stop.clone());
 
+    // Intercepting starts on for an active run; the tap and effector share it.
+    let intercepting = Arc::new(AtomicBool::new(!observe));
     let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
 
+    if !observe {
+        tap::spawn(tx.clone(), intercepting.clone());
+    }
+
     // The engine and all macOS handles live entirely on this one thread.
+    let engine_intercepting = intercepting.clone();
     let engine_thread = std::thread::spawn(move || {
         let clock = SystemClock::new();
-        let logger = match Logger::open(&path, ordo::VERSION, "native", clock.now().wall_ms) {
+        let backend_label = if observe { "native(observe)" } else { "native" };
+        let logger = match Logger::open(&path, ordo::VERSION, backend_label, clock.now().wall_ms) {
             Ok(l) => l,
             Err(e) => {
                 eprintln!("ordo: cannot open log db: {e}");
@@ -82,13 +103,13 @@ fn run(db: Option<PathBuf>, interval: f64) {
             }
         };
         let backend = native_backend();
-        let world = MacWorldSource::new(backend);
-        let engine = Engine::new(
-            logger,
-            Box::new(world),
-            Box::new(NullEffector),
-            Box::new(clock),
-        );
+        let world = MacWorldSource::new(backend.clone());
+        let effector: Box<dyn Effector> = if observe {
+            Box::new(NullEffector)
+        } else {
+            Box::new(MacEffector::new(backend, engine_intercepting))
+        };
+        let engine = Engine::new(logger, Box::new(world), effector, Box::new(clock));
         engine.run(rx);
     });
 
@@ -101,7 +122,9 @@ fn run(db: Option<PathBuf>, interval: f64) {
         }
         std::thread::sleep(period);
     }
-    drop(tx);
+    // An explicit shutdown, because the tap thread holds a sender clone that
+    // would otherwise keep the engine's channel open forever.
+    let _ = tx.send(Msg::Shutdown);
     let _ = engine_thread.join();
     println!("ordo: stopped.");
 }

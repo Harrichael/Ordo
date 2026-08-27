@@ -31,6 +31,10 @@ pub enum Msg {
     Hotkey(HotkeyAction),
     Rescan(RescanTrigger),
     Rescue,
+    /// Stop the loop and close the run. Needed because producer threads (the
+    /// event tap) hold sender clones that outlive shutdown, so channel-close
+    /// alone can't end the loop.
+    Shutdown,
 }
 
 /// A single external event can only spawn so many internal follow-ups before
@@ -93,6 +97,7 @@ impl Engine {
                 Msg::Rescue => self.pump(Event::RescueEngaged {
                     at: self.clock.now(),
                 }),
+                Msg::Shutdown => break,
             }
         }
         let _ = self.logger.close(self.clock.now().wall_ms);

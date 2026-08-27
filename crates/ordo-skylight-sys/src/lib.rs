@@ -138,4 +138,9 @@ extern "C" {
     /// The callback set that makes a CFArray retain/release CF objects — needed
     /// when building the window-id array for `SLSCopySpacesForWindows`.
     pub static kCFTypeArrayCallBacks: c_void;
+
+    /// The shared CFBoolean singletons, used to toggle the AX
+    /// `AXEnhancedUserInterface` flag around window moves.
+    pub static kCFBooleanTrue: CFTypeRef;
+    pub static kCFBooleanFalse: CFTypeRef;
 }

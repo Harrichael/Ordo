@@ -16,8 +16,8 @@
 use std::ffi::c_void;
 use std::ptr::NonNull;
 
-use objc2_app_kit::{NSApplicationActivationPolicy, NSWorkspace};
-use objc2_application_services::{AXError, AXUIElement, AXValueType};
+use objc2_app_kit::{NSApplicationActivationOptions, NSApplicationActivationPolicy, NSWorkspace};
+use objc2_application_services::{AXError, AXUIElement, AXValue, AXValueType};
 use objc2_core_foundation::{CFString, CFType, CGPoint, CGSize};
 use ordo_core::{Pid, Rect, WindowId};
 use ordo_skylight_sys as sys;
@@ -186,4 +186,154 @@ unsafe fn copy_size(el: &AXUIElement, name: &str) -> Option<CGSize> {
     } else {
         None
     }
+}
+
+// --- writes ----------------------------------------------------------------
+
+/// Raise `target`, make it its app's main/focused window, and activate the app.
+/// Returns whether the window was found (its AX writes are best-effort — some
+/// apps refuse `kAXRaise` but still come forward on activation).
+pub fn focus(target: WindowId) -> bool {
+    with_window(target, |_app, win, pid| {
+        let win = unsafe { &*win };
+        unsafe {
+            set_bool(win, "AXMain", true);
+            set_bool(win, "AXFocused", true);
+            let raise = CFString::from_str("AXRaise");
+            let _ = win.perform_action(&raise);
+        }
+        activate_pid(pid);
+    })
+    .is_some()
+}
+
+/// Move/resize `target` to `frame`. Uses the position -> size -> position idiom
+/// (apps clamp size to the *current* screen before a cross-display move lands,
+/// so a single set often misses) and brackets the writes with
+/// `AXEnhancedUserInterface` disabled — without which Chromium/Electron windows
+/// move slowly and land wrong.
+pub fn set_frame(target: WindowId, frame: Rect) -> bool {
+    with_window(target, |app, win, _pid| {
+        let win = unsafe { &*win };
+        let restore_eui = unsafe { disable_enhanced_ui(app) };
+        unsafe {
+            set_point(win, "AXPosition", frame.x, frame.y);
+            set_size_attr(win, frame.w, frame.h);
+            set_point(win, "AXPosition", frame.x, frame.y);
+            if restore_eui {
+                set_bool(app, "AXEnhancedUserInterface", true);
+            }
+        }
+    })
+    .is_some()
+}
+
+/// Walk regular apps, and when the window whose id is `target` is found, run
+/// `f(app_element, window_ptr, pid)` while both handles are live. `None` if the
+/// window isn't found (gone, or an app with no AX tree).
+fn with_window<T>(
+    target: WindowId,
+    f: impl FnOnce(&AXUIElement, *const AXUIElement, i32) -> T,
+) -> Option<T> {
+    let apps = NSWorkspace::sharedWorkspace().runningApplications();
+    for app in apps.iter() {
+        if app.activationPolicy() != NSApplicationActivationPolicy::Regular {
+            continue;
+        }
+        let pid = app.processIdentifier();
+        if pid <= 0 {
+            continue;
+        }
+        let el = unsafe { AXUIElement::new_application(pid) };
+        unsafe { el.set_messaging_timeout(MESSAGING_TIMEOUT_SECS) };
+
+        let Some(raw) = (unsafe { copy_attr(&el, "AXWindows") }) else {
+            continue;
+        };
+        let mut found = None;
+        unsafe {
+            for i in 0..super::cf::array_len(raw) {
+                let win = super::cf::array_get(raw, i) as *const AXUIElement;
+                if window_id(win) == Some(target) {
+                    found = Some((win, pid));
+                    break;
+                }
+            }
+        }
+        if let Some((win, pid)) = found {
+            let out = f(&el, win, pid);
+            unsafe { sys::CFRelease(raw) };
+            return Some(out);
+        }
+        unsafe { sys::CFRelease(raw) };
+    }
+    None
+}
+
+fn activate_pid(pid: i32) {
+    let apps = NSWorkspace::sharedWorkspace().runningApplications();
+    for app in apps.iter() {
+        if app.processIdentifier() == pid {
+            // Deprecated but still the reliable way to bring a background app's
+            // window forward with keyboard focus.
+            #[allow(deprecated)]
+            let _ = app.activateWithOptions(NSApplicationActivationOptions::ActivateAllWindows);
+            return;
+        }
+    }
+}
+
+unsafe fn set_bool(el: &AXUIElement, name: &str, value: bool) {
+    let attr = CFString::from_str(name);
+    let b = if value {
+        sys::kCFBooleanTrue
+    } else {
+        sys::kCFBooleanFalse
+    };
+    if b.is_null() {
+        return;
+    }
+    let cf: &CFType = &*(b as *const CFType);
+    let _ = el.set_attribute_value(&attr, cf);
+}
+
+unsafe fn set_point(el: &AXUIElement, name: &str, x: f64, y: f64) {
+    let mut p = CGPoint { x, y };
+    let Some(val) = AXValue::new(
+        AXValueType::CGPoint,
+        NonNull::new(&mut p as *mut _ as *mut c_void).unwrap(),
+    ) else {
+        return;
+    };
+    let attr = CFString::from_str(name);
+    let _ = el.set_attribute_value(&attr, val.as_ref());
+}
+
+unsafe fn set_size_attr(el: &AXUIElement, w: f64, h: f64) {
+    let mut s = CGSize {
+        width: w,
+        height: h,
+    };
+    let Some(val) = AXValue::new(
+        AXValueType::CGSize,
+        NonNull::new(&mut s as *mut _ as *mut c_void).unwrap(),
+    ) else {
+        return;
+    };
+    let attr = CFString::from_str("AXSize");
+    let _ = el.set_attribute_value(&attr, val.as_ref());
+}
+
+/// Read `AXEnhancedUserInterface`; if it's on, turn it off and report that it
+/// needs restoring. Returns false if it was already off (nothing to restore).
+unsafe fn disable_enhanced_ui(app: &AXUIElement) -> bool {
+    let Some(cur) = copy_attr(app, "AXEnhancedUserInterface") else {
+        return false;
+    };
+    let was_on = !sys::kCFBooleanTrue.is_null() && sys::CFEqual(cur, sys::kCFBooleanTrue) != 0;
+    sys::CFRelease(cur);
+    if was_on {
+        set_bool(app, "AXEnhancedUserInterface", false);
+    }
+    was_on
 }
