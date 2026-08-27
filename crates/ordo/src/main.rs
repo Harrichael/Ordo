@@ -30,9 +30,15 @@ enum Command {
         /// Observe and log only; execute nothing and intercept no keys.
         #[arg(long)]
         observe: bool,
-        /// Workspace backend: native macOS Spaces, or Ordo-emulated
-        /// (park-off-screen) workspaces.
-        #[arg(long, value_enum, default_value_t = Backend::Native)]
+        /// Start disengaged: hotkeys pass through untouched until you press
+        /// Ctrl+Alt+Cmd+O to engage. (Meaningless with --observe, which never
+        /// engages at all.)
+        #[arg(long, conflicts_with = "observe")]
+        paused: bool,
+        /// Workspace backend: Ordo-emulated (park-off-screen) workspaces —
+        /// instant, animation-free — or native macOS Spaces (animated, and
+        /// needs the Mission Control shortcut lever + pre-created Spaces).
+        #[arg(long, value_enum, default_value_t = Backend::Emulated)]
         backend: Backend,
         /// Number of emulated workspaces (ignored for the native backend, which
         /// uses the Spaces you created in Mission Control).
@@ -68,9 +74,10 @@ fn main() {
             db,
             interval,
             observe,
+            paused,
             backend,
             workspaces,
-        } => run(db, interval, observe, backend, workspaces),
+        } => run(db, interval, observe, paused, backend, workspaces),
         Command::Rescue { db } => rescue(db),
         Command::Replay { db, run, from } => replay(db, run, from),
     }
@@ -89,7 +96,14 @@ fn pid_path(db: &std::path::Path) -> PathBuf {
 }
 
 #[cfg(target_os = "macos")]
-fn run(db: Option<PathBuf>, interval: f64, observe: bool, backend: Backend, workspaces: u8) {
+fn run(
+    db: Option<PathBuf>,
+    interval: f64,
+    observe: bool,
+    paused: bool,
+    backend: Backend,
+    workspaces: u8,
+) {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
@@ -107,8 +121,13 @@ fn run(db: Option<PathBuf>, interval: f64, observe: bool, backend: Backend, work
     if observe {
         println!("ordo: observe-only. Logging to {}", path.display());
     } else {
-        println!("ordo: active. Logging to {}", path.display());
-        println!("ordo: rescue = Ctrl+Alt+Cmd+Escape pressed twice within 2s.");
+        if paused {
+            println!("ordo: paused (disengaged). Logging to {}", path.display());
+        } else {
+            println!("ordo: active. Logging to {}", path.display());
+        }
+        println!("ordo: rescue (off) = Ctrl+Alt+Cmd+Escape pressed twice within 2s.");
+        println!("ordo: engage (on)  = Ctrl+Alt+Cmd+O.");
     }
     println!("ordo: requires Accessibility permission (System Settings > Privacy & Security > Accessibility).");
     println!("ordo: press Ctrl-C to stop.");
@@ -123,13 +142,19 @@ fn run(db: Option<PathBuf>, interval: f64, observe: bool, backend: Backend, work
     let _ = std::fs::write(&pidfile, std::process::id().to_string());
 
     // Intercepting starts on for an active run; the tap and effector share it.
-    let intercepting = Arc::new(AtomicBool::new(!observe));
+    let intercepting = Arc::new(AtomicBool::new(!observe && !paused));
     let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
 
     if !observe {
+        // The tap runs even when paused — it's what hears the engage chord.
         tap::spawn(tx.clone(), intercepting.clone());
         // New-window corralling depends on the WindowCreated hint this emits.
         observer::spawn(tx.clone());
+    }
+    if paused {
+        // A paused start is a run born rescued: same inert mode, entered via a
+        // logged event so a replay reproduces the pause exactly.
+        let _ = tx.send(Msg::Rescue);
     }
 
     // The engine and all macOS handles live entirely on this one thread.
@@ -163,6 +188,12 @@ fn run(db: Option<PathBuf>, interval: f64, observe: bool, backend: Backend, work
         engine.run(rx);
     });
 
+    if !observe {
+        // Near-instant reaction to external Space switches (Ordo's own
+        // switches already rescan via PostEffect).
+        observer::spawn_space_watcher(tx.clone());
+    }
+
     // Periodic rescans drive observation. Dropping this tx on stop closes the
     // engine's channel, which ends its loop and writes the run's end time.
     let period = Duration::from_secs_f64(interval.max(0.1));
@@ -188,7 +219,14 @@ fn run(db: Option<PathBuf>, interval: f64, observe: bool, backend: Backend, work
 }
 
 #[cfg(not(target_os = "macos"))]
-fn run(_db: Option<PathBuf>, _interval: f64, _observe: bool, _backend: Backend, _workspaces: u8) {
+fn run(
+    _db: Option<PathBuf>,
+    _interval: f64,
+    _observe: bool,
+    _paused: bool,
+    _backend: Backend,
+    _workspaces: u8,
+) {
     eprintln!("ordo run is only supported on macOS.");
 }
 

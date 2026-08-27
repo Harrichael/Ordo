@@ -17,3 +17,10 @@ pub fn warp_to(p: Point) {
     // feel broken right after a focus switch.
     let _ = CGAssociateMouseAndMouseCursorPosition(true);
 }
+
+/// Where the pointer is now, so a caller that warps it around can restore it.
+pub fn position() -> Option<Point> {
+    objc2_core_graphics::CGEvent::new(None)
+        .map(|ev| objc2_core_graphics::CGEvent::location(Some(&ev)))
+        .map(|p| Point { x: p.x, y: p.y })
+}

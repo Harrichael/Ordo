@@ -40,17 +40,24 @@ The two rules that make it work:
   `Alt+Backtick` (+ app). The mouse warps to the focused window's center.
 - **New-window placement**: a newly created window is corralled onto the focused
   workspace and monitor.
-- **Move window to the other monitor** (operation implemented; no key bound yet).
+- **Move window to the other monitor**: `Cmd+Shift+Left/Right` — focus and
+  mouse travel with the window.
+- **MRU demote**: `Alt+End` sends the focused window to the back of the MRU
+  history and focuses the next one.
 - **Structured SQLite log** at `~/Library/Application Support/Ordo/log.db`.
 - **Kill switch**: `Ctrl+Alt+Cmd+Escape` twice within 2s, or `ordo rescue` —
   disengages interception and gathers displaced windows back on-screen.
+- **Engage switch**: `Ctrl+Alt+Cmd+O` — the reverse: re-engage after a rescue,
+  or bring a `run --paused` daemon alive for the first time.
 
 Two workspace backends behind one trait:
 
-- **`native`** (default) — drives real macOS Spaces via private SkyLight APIs
-  (no SIP disable). You pre-create the Spaces in Mission Control.
-- **`emulated`** — Ordo owns workspaces AeroSpace-style, parking hidden windows
-  off-screen. Unlimited workspaces, no private Space APIs.
+- **`emulated`** (default) — Ordo owns workspaces AeroSpace-style, parking
+  hidden windows off-screen. Instant and animation-free, unlimited workspaces,
+  no private Space APIs. Best with a single native Space per display.
+- **`native`** — drives real macOS Spaces (pre-created in Mission Control) by
+  pulling Mission Control's own rebound keyboard shortcut per display. Real
+  Spaces, but every switch plays the system animation.
 
 ## Build & run
 
@@ -58,7 +65,9 @@ Two workspace backends behind one trait:
 cargo build --release
 ./target/release/ordo run                 # native backend, active
 ./target/release/ordo run --observe       # decide + log, execute nothing
-./target/release/ordo run --backend emulated --workspaces 9
+./target/release/ordo run --paused        # start disengaged; Ctrl+Alt+Cmd+O engages
+./target/release/ordo run --workspaces 9          # emulated is the default backend
+./target/release/ordo run --backend native        # real macOS Spaces instead
 ./target/release/ordo rescue              # kill switch from the CLI
 ./target/release/ordo replay              # verify the last run replays clean
 ```
@@ -85,8 +94,13 @@ honestly (verify-and-report) rather than desyncing silently.
 
 - **SkyLight CFDictionary schema** (`platform/skylight.rs`) is undocumented and
   shifts across macOS releases — the single most version-fragile piece.
-- **Dock-swipe gesture field numbers** (`platform/gesture.rs`) for animation-free
-  Space switching are private; switching verifies afterward and retries once.
+  (Validated on Tahoe 26.6.)
+- **Native Space switching drives Mission Control's own keyboard shortcut**
+  ("Move left/right a space", rebound to Ctrl+Alt+Cmd+arrows in System
+  Settings — required setup). The shortcut acts on the display under the
+  pointer, so Ordo warps the pointer per display and restores it. Every
+  private switching API half-works or no-ops on Tahoe; see `issues.txt` and
+  the probes in `crates/ordo/examples/`.
 - **`SLSMoveWindowsToManagedSpace`** may be restricted from a non-Dock process on
   recent macOS; the move verifies and reports failure, where the emulated
   backend is the fallback.

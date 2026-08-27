@@ -83,7 +83,59 @@ extern "C" {
         windows: CFArrayRef,
         space: CgsSpaceId,
     );
+
+    /// Point a display at a space directly, keyed by the display's identifier
+    /// string from `SLSCopyManagedDisplaySpaces`. Returns a CGError (0 = ok).
+    /// The candidate replacement for gesture-synthesized switching, which
+    /// Tahoe ignores; like every private call here, callers must verify the
+    /// world actually changed rather than trust the return code.
+    pub fn SLSManagedDisplaySetCurrentSpace(
+        cid: CgsConnectionId,
+        display: CFStringRef,
+        space: CgsSpaceId,
+    ) -> i32;
+
+    /// Drive the compositor's side of a space transition: make the given
+    /// spaces visible / invisible. `SLSManagedDisplaySetCurrentSpace` alone
+    /// updates only SkyLight's bookkeeping (observed on Tahoe: AX visibility
+    /// follows the record while the screen keeps showing the old space); the
+    /// show/hide pair is what yabai's Dock payload runs to move the pixels.
+    /// `spaces` is a CFArray of CFNumber space ids.
+    pub fn SLSShowSpaces(cid: CgsConnectionId, spaces: CFArrayRef);
+    pub fn SLSHideSpaces(cid: CgsConnectionId, spaces: CFArrayRef);
+
+    /// Make a process frontmost with a specific window designated, bypassing
+    /// AppKit's cooperative activation — which refuses activation requests from
+    /// background daemons entirely (observed on Tahoe: `NSRunningApplication
+    /// activate` returns without effect, so AX raises succeed but keyboard
+    /// focus never moves). This is the yabai/AeroSpace focus path. (The
+    /// `_SLPSSetFrontProcessWithMode` variant is NOT in SkyLight's export
+    /// table on Tahoe; this one is.)
+    pub fn SLPSSetFrontProcessWithOptions(
+        psn: *const ProcessSerialNumber,
+        window: u32,
+        mode: u32,
+    ) -> i32;
+
+    /// Post a raw 0xf8-byte WindowServer event record to a process. Paired
+    /// with `SLPSSetFrontProcessWithOptions`: the front-process call alone
+    /// does not hand the target window key status (verified on Tahoe); the
+    /// two "make key window" records are what complete the focus handoff.
+    /// The byte layout is yabai's reverse-engineered recipe.
+    pub fn SLPSPostEventRecordTo(psn: *const ProcessSerialNumber, bytes: *const u8) -> i32;
 }
+
+/// Carbon's process identity, needed only for `_SLPSSetFrontProcessWithMode`.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct ProcessSerialNumber {
+    pub high: u32,
+    pub low: u32,
+}
+
+/// `_SLPSSetFrontProcessWithMode` mode: behave like a user-initiated app
+/// switch (the value yabai and AeroSpace pass).
+pub const kCPSUserGenerated: u32 = 0x200;
 
 #[cfg_attr(
     target_os = "macos",
@@ -94,6 +146,10 @@ extern "C" {
     /// `AXUIElementRef` (passed as an opaque pointer) to its `CGWindowID`.
     /// Returns `kAXErrorSuccess` (0) on success.
     pub fn _AXUIElementGetWindow(element: *const c_void, out: *mut u32) -> i32;
+
+    /// Deprecated Carbon, but still the way to get the ProcessSerialNumber
+    /// that `_SLPSSetFrontProcessWithMode` requires. Returns 0 on success.
+    pub fn GetProcessForPID(pid: c_int, psn: *mut ProcessSerialNumber) -> i32;
 }
 
 /// The 16 raw bytes of a UUID, laid out identically to CoreFoundation's

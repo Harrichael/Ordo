@@ -39,6 +39,7 @@ objc2-core-foundation = { version = "0.3", features = [
     "CFDate",
     "CFUUID",
     "CFMachPort",
+    "CFNotificationCenter",
 ] }
 objc2-core-graphics = { version = "0.3", features = [
     "CGWindow",

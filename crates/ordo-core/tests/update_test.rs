@@ -563,6 +563,77 @@ fn rescue_makes_the_core_inert_but_still_observing() {
     assert_eq!(obs.state.monitor_ws[&mid(1)], ws(2));
 }
 
+#[test]
+fn engage_undoes_a_rescue_and_hotkeys_come_back() {
+    let s = booted(&[3, 2, 1]);
+    let rescued = update(&s, &Event::RescueEngaged { at: ts() });
+
+    // While rescued, a hotkey is dead; after Engaged, the same key acts again.
+    assert!(update(&rescued.state, &hotkey(HotkeyAction::WorkspaceNext))
+        .effects
+        .is_empty());
+
+    let engaged = update(&rescued.state, &Event::Engaged { at: ts() });
+    assert_eq!(engaged.state.mode, Mode::Active);
+    assert!(engaged
+        .effects
+        .contains(&Effect::SetIntercepting { enabled: true }));
+
+    let step = update(&engaged.state, &hotkey(HotkeyAction::WorkspaceNext));
+    assert_eq!(count_switches(&step.effects), 1);
+
+    // Engaging an already-active core is a harmless re-assertion, not a reset.
+    let again = update(&engaged.state, &Event::Engaged { at: ts() });
+    assert_eq!(again.state.mode, Mode::Active);
+    assert_eq!(again.state, engaged.state);
+}
+
+#[test]
+fn demote_banishes_the_focused_window_and_moves_on() {
+    // History (front-first): [1, 2, 3], focused 1.
+    let s = booted(&[3, 2, 1]);
+    let step = update(&s, &hotkey(HotkeyAction::MruDemote));
+
+    // Focus moves to the next MRU window, mouse in tow…
+    assert_eq!(focus_targets(&step.effects), vec![wid(2)]);
+    assert!(step
+        .effects
+        .iter()
+        .any(|e| matches!(e, Effect::WarpMouse { .. })));
+    // …and the demoted window sits at the very back of the history.
+    assert_eq!(step.state.focus_history.iter().last(), Some(wid(1)));
+
+    // Once the world confirms focus on 2, Alt+Tab toggles 2 <-> 3: the
+    // demoted window stopped being offered.
+    let confirmed = update(
+        &step.state,
+        &observed(
+            vec![mon_a(1), mon_b(1)],
+            std_windows(),
+            Some(2),
+            RescanTrigger::Periodic,
+        ),
+    );
+    let toggle = update(&confirmed.state, &hotkey(HotkeyAction::MruWorkspace));
+    assert_eq!(focus_targets(&toggle.effects), vec![wid(3)]);
+}
+
+#[test]
+fn demote_with_nowhere_to_go_does_nothing() {
+    // Only one window in the whole workspace: demoting it would be futile —
+    // it stays focused and the next scan would re-front it anyway.
+    let mut s = booted(&[1]);
+    s.windows.retain(|w, _| *w == wid(1));
+    s.focus_history = {
+        let mut h = ordo_core::FocusHistory::new();
+        h.touch(wid(1));
+        h
+    };
+    let step = update(&s, &hotkey(HotkeyAction::MruDemote));
+    assert!(step.effects.is_empty());
+    assert_eq!(step.state, s);
+}
+
 // --- move to other monitor -----------------------------------------------------
 
 #[test]

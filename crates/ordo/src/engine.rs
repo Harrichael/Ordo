@@ -31,6 +31,8 @@ pub enum Msg {
     Hotkey(HotkeyAction),
     Rescan(RescanTrigger),
     Rescue,
+    /// The engage chord (or a --paused run coming alive): leave Rescued mode.
+    Engage,
     /// Stop the loop and close the run. Needed because producer threads (the
     /// event tap) hold sender clones that outlive shutdown, so channel-close
     /// alone can't end the loop.
@@ -95,6 +97,9 @@ impl Engine {
                 }),
                 Msg::Rescan(trigger) => self.observe(trigger),
                 Msg::Rescue => self.pump(Event::RescueEngaged {
+                    at: self.clock.now(),
+                }),
+                Msg::Engage => self.pump(Event::Engaged {
                     at: self.clock.now(),
                 }),
                 Msg::Shutdown => break,

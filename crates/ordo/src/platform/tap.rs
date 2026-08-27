@@ -102,7 +102,7 @@ unsafe extern "C-unwind" fn callback(
     }
 
     let pass = event.as_ptr();
-    if ty != CGEventType::KeyDown || !ctx.intercepting.load(Ordering::Relaxed) {
+    if ty != CGEventType::KeyDown {
         return pass;
     }
 
@@ -116,16 +116,30 @@ unsafe extern "C-unwind" fn callback(
         ctrl: flags.contains(CGEventFlags::MaskControl),
     };
 
+    // The engage chord is checked before the interception gate — its whole job
+    // is to work while Ordo is disengaged (post-rescue, or a --paused start).
+    // Everything else is only ours when intercepting; while disengaged, all
+    // other keys (including our own hotkeys) belong to the apps again.
     match keys::match_chord(keycode, mods) {
-        Some(Chord::Hotkey(action)) => {
-            let _ = ctx.tx.send(Msg::Hotkey(action));
+        Some(Chord::Engage) => {
+            // Flip the flag here, symmetric with rescue's fast path, so
+            // engagement doesn't depend on the engine being responsive.
+            ctx.intercepting.store(true, Ordering::Relaxed);
+            let _ = ctx.tx.send(Msg::Engage);
             std::ptr::null_mut() // swallow
         }
-        Some(Chord::RescueCandidate) => {
-            handle_rescue(ctx);
-            std::ptr::null_mut()
-        }
-        None => pass,
+        Some(chord) if ctx.intercepting.load(Ordering::Relaxed) => match chord {
+            Chord::Hotkey(action) => {
+                let _ = ctx.tx.send(Msg::Hotkey(action));
+                std::ptr::null_mut()
+            }
+            Chord::RescueCandidate => {
+                handle_rescue(ctx);
+                std::ptr::null_mut()
+            }
+            Chord::Engage => unreachable!(),
+        },
+        _ => pass,
     }
 }
 

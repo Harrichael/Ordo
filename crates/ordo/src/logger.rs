@@ -192,7 +192,8 @@ fn event_time(e: &Event) -> (i64, i64) {
         Event::Hotkey { at, .. }
         | Event::WorldObserved { at, .. }
         | Event::EffectResult { at, .. }
-        | Event::RescueEngaged { at } => at,
+        | Event::RescueEngaged { at }
+        | Event::Engaged { at } => at,
     };
     (ts.wall_ms, ts.mono_ns as i64)
 }
@@ -203,6 +204,7 @@ fn event_kind(e: &Event) -> &'static str {
         Event::WorldObserved { .. } => "world_observed",
         Event::EffectResult { .. } => "effect_result",
         Event::RescueEngaged { .. } => "rescue_engaged",
+        Event::Engaged { .. } => "engaged",
     }
 }
 

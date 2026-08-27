@@ -16,9 +16,9 @@
 use std::ffi::c_void;
 use std::ptr::NonNull;
 
-use objc2_app_kit::{NSApplicationActivationOptions, NSApplicationActivationPolicy, NSWorkspace};
+use objc2_app_kit::{NSApplicationActivationPolicy, NSWorkspace};
 use objc2_application_services::{AXError, AXUIElement, AXValue, AXValueType};
-use objc2_core_foundation::{CFString, CFType, CGPoint, CGSize};
+use objc2_core_foundation::{CFBoolean, CFString, CFType, CGPoint, CGSize};
 use ordo_core::{Pid, Rect, WindowId};
 use ordo_skylight_sys as sys;
 
@@ -112,17 +112,37 @@ fn read_window(win: *const AXUIElement, app: Pid, bundle_id: Option<String>) -> 
 }
 
 fn focused_window() -> Option<WindowId> {
-    let front = NSWorkspace::sharedWorkspace().frontmostApplication()?;
-    let pid = front.processIdentifier();
-    if pid <= 0 {
-        return None;
+    // Find the front app by asking each app's live `AXFrontmost` attribute —
+    // NOT NSWorkspace.frontmostApplication, which is a cache that refreshes
+    // only when a run loop pumps (the engine thread never pumps one, so it
+    // would report the frontmost app from boot forever). The system-wide
+    // element's AXFocusedApplication would be cleaner but returns
+    // kAXErrorCannotComplete here (observed on Tahoe).
+    let apps = NSWorkspace::sharedWorkspace().runningApplications();
+    for app in apps.iter() {
+        if app.activationPolicy() != NSApplicationActivationPolicy::Regular {
+            continue;
+        }
+        let pid = app.processIdentifier();
+        if pid <= 0 {
+            continue;
+        }
+        let el = unsafe { AXUIElement::new_application(pid) };
+        unsafe { el.set_messaging_timeout(MESSAGING_TIMEOUT_SECS) };
+        let Some(front) = (unsafe { copy_attr(&el, "AXFrontmost") }) else {
+            continue;
+        };
+        let is_front = unsafe { &*(front as *const CFBoolean) }.value();
+        unsafe { sys::CFRelease(front) };
+        if !is_front {
+            continue;
+        }
+        let focused = unsafe { copy_attr(&el, "AXFocusedWindow") }?;
+        let id = window_id(focused as *const AXUIElement);
+        unsafe { sys::CFRelease(focused) };
+        return id;
     }
-    let el = unsafe { AXUIElement::new_application(pid) };
-    unsafe { el.set_messaging_timeout(MESSAGING_TIMEOUT_SECS) };
-    let focused = unsafe { copy_attr(&el, "AXFocusedWindow") }?;
-    let id = window_id(focused as *const AXUIElement);
-    unsafe { sys::CFRelease(focused) };
-    id
+    None
 }
 
 fn window_id(el: *const AXUIElement) -> Option<WindowId> {
@@ -184,11 +204,45 @@ unsafe fn copy_size(el: &AXUIElement, name: &str) -> Option<CGSize> {
 
 // --- writes ----------------------------------------------------------------
 
-/// Raise `target`, make it its app's main/focused window, and activate the app.
-/// Returns whether the window was found (its AX writes are best-effort — some
-/// apps refuse `kAXRaise` but still come forward on activation).
+/// The "make key window" half of the focus handoff: two raw WindowServer event
+/// records (yabai's reverse-engineered recipe — the 0x01/0x02 at offset 0x08
+/// are an activate/deactivate pair, the window id sits at 0x3c). Without them
+/// `SLPSSetFrontProcessWithOptions` fronts the app but the target window never
+/// becomes key, so keyboard focus stays where it was.
+fn make_key_window(psn: &sys::ProcessSerialNumber, wid: u32) {
+    let mut bytes = [0u8; 0xf8];
+    bytes[0x04] = 0xf8;
+    bytes[0x3a] = 0x10;
+    bytes[0x3c..0x40].copy_from_slice(&wid.to_le_bytes());
+    for b in &mut bytes[0x20..0x30] {
+        *b = 0xff;
+    }
+    unsafe {
+        bytes[0x08] = 0x01;
+        let _ = sys::SLPSPostEventRecordTo(psn, bytes.as_ptr());
+        bytes[0x08] = 0x02;
+        let _ = sys::SLPSPostEventRecordTo(psn, bytes.as_ptr());
+    }
+}
+
+/// Raise `target`, make it its app's main/focused window, and bring the app
+/// frontmost. Returns whether the window was found (its AX writes are
+/// best-effort — some apps refuse `kAXRaise` but still come forward).
+///
+/// Frontmosting uses the private `SLPSSetFrontProcessWithOptions`: AppKit's
+/// cooperative activation (Sonoma+) silently refuses activation from a
+/// background daemon, so the public `NSRunningApplication activate` raises the
+/// window without ever moving keyboard focus — cross-app Alt+Tab looked like
+/// "Slack pops up but focus stays put".
 pub fn focus(target: WindowId) -> bool {
     with_window(target, |_app, win, pid| {
+        unsafe {
+            let mut psn = sys::ProcessSerialNumber::default();
+            if sys::GetProcessForPID(pid, &mut psn) == 0 {
+                let _ = sys::SLPSSetFrontProcessWithOptions(&psn, target.0, sys::kCPSUserGenerated);
+                make_key_window(&psn, target.0);
+            }
+        }
         let win = unsafe { &*win };
         unsafe {
             set_bool(win, "AXMain", true);
@@ -196,7 +250,6 @@ pub fn focus(target: WindowId) -> bool {
             let raise = CFString::from_str("AXRaise");
             let _ = win.perform_action(&raise);
         }
-        activate_pid(pid);
     })
     .is_some()
 }
@@ -262,19 +315,6 @@ fn with_window<T>(
         unsafe { sys::CFRelease(raw) };
     }
     None
-}
-
-fn activate_pid(pid: i32) {
-    let apps = NSWorkspace::sharedWorkspace().runningApplications();
-    for app in apps.iter() {
-        if app.processIdentifier() == pid {
-            // Deprecated but still the reliable way to bring a background app's
-            // window forward with keyboard focus.
-            #[allow(deprecated)]
-            let _ = app.activateWithOptions(NSApplicationActivationOptions::ActivateAllWindows);
-            return;
-        }
-    }
 }
 
 unsafe fn set_bool(el: &AXUIElement, name: &str, value: bool) {

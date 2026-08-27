@@ -41,6 +41,16 @@ impl FocusHistory {
         }
     }
 
+    /// Send `w` to the back: "I'm done with this one, stop offering it".
+    /// Callers must also move focus off `w` — a still-focused window gets
+    /// touched straight back to the front by the next observation.
+    pub fn demote(&mut self, w: WindowId) {
+        if self.order.contains(&w) {
+            self.remove(w);
+            self.order.push(w);
+        }
+    }
+
     pub fn remove(&mut self, w: WindowId) {
         self.order.retain(|x| *x != w);
     }

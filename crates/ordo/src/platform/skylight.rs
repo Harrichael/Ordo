@@ -170,6 +170,28 @@ pub fn raw_space_of_window(cid: sys::CgsConnectionId, window: WindowId) -> Optio
     }
 }
 
+/// Point one display at a space. Verified working on Tahoe (the dock-swipe
+/// gesture synthesis it replaced was silently ignored there). Best-effort like
+/// every private call: callers re-read the topology and retry/report rather
+/// than trusting the return code.
+pub fn set_display_space(cid: sys::CgsConnectionId, identifier: &str, space: sys::CgsSpaceId) {
+    let Ok(c) = std::ffi::CString::new(identifier) else {
+        return;
+    };
+    unsafe {
+        let ident = sys::CFStringCreateWithCString(
+            std::ptr::null(),
+            c.as_ptr(),
+            sys::kCFStringEncodingUTF8,
+        );
+        if ident.is_null() {
+            return;
+        }
+        let _ = sys::SLSManagedDisplaySetCurrentSpace(cid, ident, space);
+        sys::CFRelease(ident);
+    }
+}
+
 /// Ask SkyLight to move one window to a space. Best-effort: on recent macOS
 /// this may be a no-op from a non-Dock process (see the sys declaration), which
 /// is why callers verify afterward.
@@ -183,8 +205,8 @@ pub fn move_window_to_space(cid: sys::CgsConnectionId, window: WindowId, space: 
     }
 }
 
-/// Public wrapper over the identifier->MonitorId resolution, so the backend can
-/// aim gestures at the right display.
+/// Public wrapper over the identifier->MonitorId resolution, so the backend
+/// can aim the pointer at the display a space list belongs to.
 pub fn resolve_monitor_id(identifier: &str, known: &[(MonitorId, bool)]) -> Option<MonitorId> {
     let main = known.iter().find(|(_, m)| *m).map(|(id, _)| *id);
     resolve_monitor(identifier, known, main)

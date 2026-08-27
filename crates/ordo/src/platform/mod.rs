@@ -17,7 +17,7 @@ pub mod cf;
 pub mod display;
 pub mod effector;
 pub mod emulated_backend;
-pub mod gesture;
+pub mod mission_control;
 pub mod mouse;
 pub mod native_backend;
 pub mod observer;

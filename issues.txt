@@ -1,0 +1,84 @@
+# Ordo — open issues
+
+## Polling gaps (belief staleness up to one rescan interval, default 2s)
+
+The architecture is "notifications are hints, scans are truth"; anything
+without a hint is only as fresh as the periodic scan. Closed so far: external
+focus changes (AXFocusedWindowChanged/AXApplicationActivated hints) and new
+windows (AXWindowCreated). Still scan-only:
+
+- External Space switches — MOSTLY CLOSED: a dedicated watcher thread polls
+  just the SkyLight topology (one WindowServer read, no AX) every 150ms and
+  hints the engine on change, so reaction is ~150ms instead of 2s. True push
+  was probed and is unreachable from a daemon on Tahoe: AX has no space
+  notification, NSWorkspaceActiveSpaceDidChangeNotification needs a real app
+  identity (tried NSApplication init + main-runloop pumping; never delivered),
+  and NO distributed notification fires on a switch (examples/notify_probe.rs
+  listened to all of them). Remaining zero-poll candidate: private
+  SLSRegisterConnectionNotifyProc event codes (yabai's route) — undocumented
+  magic numbers, needs its own probe session.
+- Window closes. Alt+Tab can target a window closed <2s ago; the focus op
+  fails honestly and the next scan cleans up. Fix if it ever annoys: per-window
+  AXUIElementDestroyed observers.
+- Window moves/resizes. Only affects frame beliefs and monitor attribution
+  (MruMonitor filter, move-to-other-monitor translation). Deliberately polled:
+  move/resize hints fire in storms during drags and would need debouncing to be
+  worth it.
+- App launches. The AX observer attaches to new apps on a 3s timer, so hints
+  from a freshly launched app can lag ~3s (its windows still appear via the
+  periodic scan). Fix: NSWorkspace launch notifications on a pumped run loop.
+
+## Native workspace switching — SOLVED via Mission Control's lever (notes)
+
+Mechanism shipped in platform/mission_control.rs + NativeBackend: synthesize
+the "Move left/right a space" shortcut, which the user rebound to
+Ctrl+Alt+Cmd+arrows (to stay out of Hammerspoon's Ctrl+arrow bindings). Two
+on-device facts make it work: the shortcut acts on the display UNDER THE
+POINTER (so Ordo warps the pointer per display and restores it), and the
+synthesized event needs a HIDSystemState source plus the exact stored flag
+mask (Ctrl+Alt+Cmd + the secondary-fn bit arrows carry).
+
+Graveyard, for the next macOS update (all probed on Tahoe 26.6, probes kept
+in crates/ordo/examples/):
+- Dock-swipe gesture synthesis (yabai/BTT trick): silently ignored.
+- SLSManagedDisplaySetCurrentSpace: HALF-switches — SkyLight's record and AX
+  visibility move, the compositor doesn't; focus hops, window scans go blind.
+- + SLSShowSpaces/SLSHideSpaces: record moves, pixels still don't (these
+  apparently drive the compositor only from inside the Dock, which is what
+  yabai's SIP-off scripting addition is for).
+
+Follow-ups:
+- The lever chord is hardcoded; read it from com.apple.symbolichotkeys
+  (parameters = [char, keycode, CGEventFlags-compatible mask]) so a user
+  rebind can't silently break switching — and fail loudly at startup if the
+  shortcut is disabled.
+- Multi-step switches (e.g. ws 1 -> 5) are N animated presses ~350ms apart;
+  if that grates, investigate "Switch to Desktop N" symbolic hotkeys
+  (per-desktop direct jumps, need enabling + per-display probing).
+- The pointer blips to each display's center mid-switch (restored after).
+  Cosmetic; revisit if it bothers.
+
+## Smaller open items
+
+- Alt+Tab is a strict two-window toggle (most-recent excluding current).
+  Michael wants Alt+arrows to CYCLE the MRU list — deliberately deferred
+  ("let's wait on the alt arrows thing"). Design questions when picked up:
+  does cycling commit focus at each step or only on release (release needs
+  key-up tracking in the tap), and does a cycle re-order history or peek it?
+- Emulated-mode switch animation (asked 2026-08-27): possible, two routes.
+  (a) Step AX SetWindowFrame along a path — works but sync-IPC per frame per
+  window; janky beyond a few windows, Electron apps worst. (b) Compositor-side
+  slide via private SLSSetWindowTransform (what yabai's --animate uses):
+  smooth and cheap, another SkyLight adventure to probe. Park until the
+  instant switch has been lived with — animation may not be missed.
+- Focus/write latency: every AX write re-finds its window by enumerating all
+  apps (deliberate no-stale-handles policy). If focus feels slow now that the
+  logic is right, the fix is the AXUIElement registry cache from the original
+  plan.
+- fold_topology is not spans-mode-aware: with "Displays have separate Spaces"
+  OFF, the single managed display resolves only to the main monitor and the
+  others fall back to workspace 1 (harmless: damped tear realign + log noise).
+  ~10-line fix in fold_topology if we ever want to support spans mode.
+- Deferred review findings F5/F6b/F7/F9/F10 — see the review-fix plan notes in
+  git history (fa426ca) for rationale; F6b (persist the emulated ledger across
+  restarts) matters if the emulated backend becomes the daily driver.

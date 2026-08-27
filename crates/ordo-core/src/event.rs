@@ -39,6 +39,13 @@ pub enum Event {
     RescueEngaged {
         at: Ts,
     },
+    /// The inverse of `RescueEngaged`: the user asked Ordo to (re)engage. Like
+    /// rescue, the tap has already flipped interception on its fast path; the
+    /// core's job is to leave `Rescued` and re-assert the intent. Also how a
+    /// `--paused` run comes alive for the first time.
+    Engaged {
+        at: Ts,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,6 +60,11 @@ pub enum HotkeyAction {
     MruMonitor,
     /// Alt+Backtick: MRU in the current workspace AND the focused app.
     MruApp,
+    /// Alt+End: banish the focused window to the back of the MRU history and
+    /// focus the next MRU window — "done with this one, stop offering it".
+    MruDemote,
+    /// Cmd+Shift+Left/Right: the window moves and the "view" moves with it —
+    /// focus stays on it and the mouse follows to its new center.
     MoveFocusedToOtherMonitor,
 }
 

@@ -71,6 +71,12 @@ pub fn update(state: &State, event: &Event) -> Step {
             // records the same intent from the core's side and is idempotent.
             effects.push(Effect::SetIntercepting { enabled: false });
         }
+        Event::Engaged { .. } => {
+            // The exact mirror of RescueEngaged. Belief needs no refresh:
+            // snapshots kept applying while Rescued, only actions were withheld.
+            s.mode = Mode::Active;
+            effects.push(Effect::SetIntercepting { enabled: true });
+        }
     }
 
     Step {
@@ -145,6 +151,40 @@ fn handle_hotkey(s: &mut State, action: HotkeyAction, fx: &mut Vec<Effect>) {
             // window by a rescan round-trip feels broken. The mouse follows
             // Ordo-initiated switches only; warping on external focus changes
             // (the user clicking a window!) would fight the pointer.
+            fx.push(Effect::WarpMouse { to: center });
+            s.pending.push(PendingOp {
+                op,
+                expect: Expectation::Focused(target),
+                rescans_left: EXPECTATION_RESCANS,
+            });
+            fx.push(Effect::RequestRescan {
+                reason: RescanTrigger::PostEffect { op },
+            });
+        }
+
+        HotkeyAction::MruDemote => {
+            let Some(cur_ws) = s.current_workspace() else {
+                return;
+            };
+            let Some(focused) = s.focused else {
+                return;
+            };
+            // Demoting is only meaningful if focus can actually leave the
+            // window — otherwise the next observation touches it straight back
+            // to the front. With nowhere else to go, do nothing.
+            let target = {
+                let windows = &s.windows;
+                s.focus_history.most_recent(Some(focused), |w| {
+                    windows.get(&w).is_some_and(|r| r.workspace == cur_ws)
+                })
+            };
+            let Some(target) = target else {
+                return;
+            };
+            s.focus_history.demote(focused);
+            let center = s.windows[&target].frame.center();
+            let op = s.mint_op();
+            fx.push(Effect::FocusWindow { op, window: target });
             fx.push(Effect::WarpMouse { to: center });
             s.pending.push(PendingOp {
                 op,
