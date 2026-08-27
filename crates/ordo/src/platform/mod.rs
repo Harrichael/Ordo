@@ -16,6 +16,7 @@ pub mod ax;
 pub mod cf;
 pub mod display;
 pub mod effector;
+pub mod emulated_backend;
 pub mod gesture;
 pub mod mouse;
 pub mod native_backend;
@@ -39,6 +40,12 @@ pub type SharedBackend = Rc<RefCell<dyn WorkspaceBackend>>;
 
 pub fn native_backend() -> SharedBackend {
     Rc::new(RefCell::new(native_backend::NativeBackend::new()))
+}
+
+pub fn emulated_backend(workspaces: u8) -> SharedBackend {
+    Rc::new(RefCell::new(emulated_backend::EmulatedBackend::new(
+        workspaces,
+    )))
 }
 
 /// Builds a full snapshot each call: displays + AX windows + backend workspace

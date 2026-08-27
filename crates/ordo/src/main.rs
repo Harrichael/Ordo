@@ -1,6 +1,12 @@
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum Backend {
+    Native,
+    Emulated,
+}
 
 #[derive(Parser)]
 #[command(name = "ordo", version, about = "macOS workspace navigator")]
@@ -11,8 +17,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run the daemon: intercept hotkeys and act on them (focus + mouse warp
-    /// now; workspace switching lands in a later milestone). Pass --observe to
+    /// Run the daemon: intercept hotkeys and act on them (workspace switching,
+    /// MRU focus, mouse-follows-focus, new-window placement). Pass --observe to
     /// decide-and-log without touching anything.
     Run {
         /// Log database path (defaults to ~/Library/Application Support/Ordo/log.db).
@@ -24,6 +30,14 @@ enum Command {
         /// Observe and log only; execute nothing and intercept no keys.
         #[arg(long)]
         observe: bool,
+        /// Workspace backend: native macOS Spaces, or Ordo-emulated
+        /// (park-off-screen) workspaces.
+        #[arg(long, value_enum, default_value_t = Backend::Native)]
+        backend: Backend,
+        /// Number of emulated workspaces (ignored for the native backend, which
+        /// uses the Spaces you created in Mission Control).
+        #[arg(long, default_value_t = 9)]
+        workspaces: u8,
     },
     /// Disengage Ordo and gather displaced windows back onto the visible area.
     /// Signals a running daemon to go inert, then gathers in this process too,
@@ -54,7 +68,9 @@ fn main() {
             db,
             interval,
             observe,
-        } => run(db, interval, observe),
+            backend,
+            workspaces,
+        } => run(db, interval, observe, backend, workspaces),
         Command::Rescue { db } => rescue(db),
         Command::Replay { db, run, from } => replay(db, run, from),
     }
@@ -73,7 +89,7 @@ fn pid_path(db: &std::path::Path) -> PathBuf {
 }
 
 #[cfg(target_os = "macos")]
-fn run(db: Option<PathBuf>, interval: f64, observe: bool) {
+fn run(db: Option<PathBuf>, interval: f64, observe: bool, backend: Backend, workspaces: u8) {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
@@ -81,7 +97,9 @@ fn run(db: Option<PathBuf>, interval: f64, observe: bool) {
     use ordo::clock::{Clock, SystemClock};
     use ordo::engine::{Engine, Msg};
     use ordo::logger::Logger;
-    use ordo::platform::{native_backend, observer, tap, MacEffector, MacWorldSource};
+    use ordo::platform::{
+        emulated_backend, native_backend, observer, tap, MacEffector, MacWorldSource,
+    };
     use ordo::ports::{Effector, NullEffector};
     use ordo_core::RescanTrigger;
 
@@ -118,7 +136,12 @@ fn run(db: Option<PathBuf>, interval: f64, observe: bool) {
     let engine_intercepting = intercepting.clone();
     let engine_thread = std::thread::spawn(move || {
         let clock = SystemClock::new();
-        let backend_label = if observe { "native(observe)" } else { "native" };
+        let backend_label = match (backend, observe) {
+            (Backend::Native, false) => "native",
+            (Backend::Native, true) => "native(observe)",
+            (Backend::Emulated, false) => "emulated",
+            (Backend::Emulated, true) => "emulated(observe)",
+        };
         let logger = match Logger::open(&path, ordo::VERSION, backend_label, clock.now().wall_ms) {
             Ok(l) => l,
             Err(e) => {
@@ -126,7 +149,10 @@ fn run(db: Option<PathBuf>, interval: f64, observe: bool) {
                 return;
             }
         };
-        let backend = native_backend();
+        let backend = match backend {
+            Backend::Native => native_backend(),
+            Backend::Emulated => emulated_backend(workspaces),
+        };
         let world = MacWorldSource::new(backend.clone());
         let effector: Box<dyn Effector> = if observe {
             Box::new(NullEffector)
@@ -162,7 +188,7 @@ fn run(db: Option<PathBuf>, interval: f64, observe: bool) {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn run(_db: Option<PathBuf>, _interval: f64) {
+fn run(_db: Option<PathBuf>, _interval: f64, _observe: bool, _backend: Backend, _workspaces: u8) {
     eprintln!("ordo run is only supported on macOS.");
 }
 
