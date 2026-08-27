@@ -174,7 +174,7 @@ fn effect_op(e: &Effect) -> Option<OpId> {
         | Effect::SetWindowFrame { op, .. }
         | Effect::FocusWindow { op, .. } => Some(*op),
         Effect::WarpMouse { .. }
-        | Effect::LowerWindow { .. }
+        | Effect::RestackWindows { .. }
         | Effect::RequestRescan { .. }
         | Effect::SetIntercepting { .. } => None,
     }

@@ -52,8 +52,8 @@ impl Effector for MacEffector {
                 mouse::warp_to(*to);
                 None
             }
-            Effect::LowerWindow { window } => {
-                super::zorder::send_to_back(*window);
+            Effect::RestackWindows { order } => {
+                super::zorder::reassert_stack(order);
                 None
             }
             Effect::SetIntercepting { enabled } => {

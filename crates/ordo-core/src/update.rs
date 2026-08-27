@@ -37,6 +37,12 @@ pub enum Note {
     OpFailed { op: OpId, detail: String },
     /// A change we didn't cause. Belief absorbed it.
     External { delta: Delta },
+    /// Focus moved externally to a window on a hidden workspace; we switched
+    /// there to follow it (the Cmd+Tab / Dock-click hole in emulation).
+    FollowedFocus {
+        window: WindowId,
+        target: WorkspaceId,
+    },
     /// Monitors disagreed on workspace without an in-flight switch of ours.
     TearDetected { target: WorkspaceId },
     /// Tear realignment hit the damping limit; we stopped re-aligning.
@@ -86,6 +92,24 @@ pub fn update(state: &State, event: &Event) -> Step {
     }
 }
 
+/// The workspace's visual stacking, front-to-back, as the MRU history implies
+/// it. Emitted alongside anything that reveals a workspace: parking and
+/// app-hiding scramble real z-order, and MRU is the single source of truth
+/// for what "on top" means here.
+fn mru_stack(s: &State, ws: WorkspaceId) -> Vec<WindowId> {
+    s.focus_history
+        .iter()
+        .filter(|w| s.windows.get(w).is_some_and(|r| r.workspace == ws))
+        .collect()
+}
+
+fn push_restack(s: &State, ws: WorkspaceId, fx: &mut Vec<Effect>) {
+    let order = mru_stack(s, ws);
+    if order.len() >= 2 {
+        fx.push(Effect::RestackWindows { order });
+    }
+}
+
 fn handle_hotkey(s: &mut State, action: HotkeyAction, fx: &mut Vec<Effect>) {
     match action {
         HotkeyAction::WorkspacePrev | HotkeyAction::WorkspaceNext => {
@@ -97,6 +121,27 @@ fn handle_hotkey(s: &mut State, action: HotkeyAction, fx: &mut Vec<Effect>) {
                 HotkeyAction::WorkspaceNext if cur.0 < s.workspace_count => WorkspaceId(cur.0 + 1),
                 _ => return, // clamped at the edge: nothing to do
             };
+            // Hand focus to the destination's MRU window BEFORE switching —
+            // otherwise the keyboard keeps typing into a window that just got
+            // parked off-screen, and the backend's app dimming (which spares
+            // the focused app) could never dim the workspace being left. No
+            // mouse warp: the core's frame belief for that window is its
+            // parked sliver position, so a warp would aim at the corner.
+            let focus_target = {
+                let windows = &s.windows;
+                s.focus_history.most_recent(s.focused, |w| {
+                    windows.get(&w).is_some_and(|r| r.workspace == target)
+                })
+            };
+            if let Some(fw) = focus_target {
+                let op = s.mint_op();
+                fx.push(Effect::FocusWindow { op, window: fw });
+                s.pending.push(PendingOp {
+                    op,
+                    expect: Expectation::Focused(fw),
+                    rescans_left: EXPECTATION_RESCANS,
+                });
+            }
             let op = s.mint_op();
             fx.push(Effect::SwitchWorkspace { op, target });
             s.pending.push(PendingOp {
@@ -104,6 +149,7 @@ fn handle_hotkey(s: &mut State, action: HotkeyAction, fx: &mut Vec<Effect>) {
                 expect: Expectation::AllMonitorsOn(target),
                 rescans_left: EXPECTATION_RESCANS,
             });
+            push_restack(s, target, fx);
             fx.push(Effect::RequestRescan {
                 reason: RescanTrigger::PostEffect { op },
             });
@@ -153,6 +199,7 @@ fn handle_hotkey(s: &mut State, action: HotkeyAction, fx: &mut Vec<Effect>) {
                 expect: Expectation::AllMonitorsOn(target),
                 rescans_left: EXPECTATION_RESCANS,
             });
+            push_restack(s, target, fx);
             fx.push(Effect::RequestRescan {
                 reason: RescanTrigger::PostEffect { op: switch_op },
             });
@@ -241,10 +288,11 @@ fn handle_hotkey(s: &mut State, action: HotkeyAction, fx: &mut Vec<Effect>) {
             let op = s.mint_op();
             fx.push(Effect::FocusWindow { op, window: target });
             fx.push(Effect::WarpMouse { to: center });
-            // Bury it visually too, AFTER the focus: lowering works by raising
-            // everything else, and raises land below the key window — so the
-            // new focus must already be key when the raises fire.
-            fx.push(Effect::LowerWindow { window: focused });
+            // Bury it visually too, AFTER the focus: restacking raises
+            // everything above the demoted window, and raises land below the
+            // key window — so the new focus must already be key. The history
+            // was demoted above, so the MRU order now ends with `focused`.
+            push_restack(s, cur_ws, fx);
             s.pending.push(PendingOp {
                 op,
                 expect: Expectation::Focused(target),
@@ -488,6 +536,45 @@ fn handle_snapshot(
                             },
                         );
                     }
+                }
+            }
+        }
+    }
+
+    // Follow-the-focus: macOS handed focus to a window on a hidden workspace
+    // (Cmd+Tab, a Dock click, an app self-activating) — the one hole the
+    // emulated backend leaves open, since the app switcher is machine-global.
+    // Mirror what native Spaces would do and bring that workspace over. Only
+    // an EXTERNAL focus change qualifies: our own switches legitimately leave
+    // focus sitting on a freshly parked window (parking doesn't defocus), and
+    // `explains` attributes those focus deltas to the pending switch.
+    if !s
+        .pending
+        .iter()
+        .any(|p| matches!(p.expect, Expectation::AllMonitorsOn(_)))
+    {
+        let external_focus = deltas.iter().any(|d| {
+            matches!(d, Delta::FocusChanged { .. })
+                && !entry_expectations.iter().any(|e| reconcile::explains(e, d))
+        });
+        if external_focus {
+            if let Some(rec) = s.focused.and_then(|w| s.windows.get(&w)).cloned() {
+                let target = rec.workspace;
+                let here = s.current_workspace();
+                if Some(target) != here && target.0 >= 1 && target.0 <= s.workspace_count {
+                    let op = s.mint_op();
+                    fx.push(Effect::SwitchWorkspace { op, target });
+                    s.pending.push(PendingOp {
+                        op,
+                        expect: Expectation::AllMonitorsOn(target),
+                        rescans_left: EXPECTATION_RESCANS,
+                    });
+                    push_restack(s, target, fx);
+                    notes.push(Note::FollowedFocus {
+                        window: rec.id,
+                        target,
+                    });
+                    last_op = Some(op);
                 }
             }
         }

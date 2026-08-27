@@ -95,6 +95,34 @@ impl EmulatedBackend {
         let f = self.saved.get(&window)?;
         Some((*pid, window, *f))
     }
+
+    /// Dock dimming: hide (Cmd+H-style) every app whose known windows are all
+    /// parked on hidden workspaces, unhide every app with a window here. With
+    /// the Dock's `showhidden` pref, "hidden" renders as a translucent icon —
+    /// the closest macOS gets to a per-workspace Dock.
+    ///
+    /// The app owning the focused window is never hidden: hiding the active
+    /// app makes macOS fling focus somewhere arbitrary. Core-side, switches
+    /// hand focus to the destination before this runs, so the exemption
+    /// almost never bites; when it does, the app just stays undimmed.
+    fn apply_app_visibility(&self, frames: &HashMap<WindowId, (Pid, Rect)>) {
+        let current = self.ledger.current();
+        let assignments = self.ledger.window_ws();
+        let mut here_by_app: HashMap<Pid, bool> = HashMap::new();
+        for (window, (pid, _)) in frames {
+            if let Some(ws) = assignments.get(window) {
+                *here_by_app.entry(*pid).or_insert(false) |= *ws == current;
+            }
+        }
+        let focused_app = ax::focused_window().and_then(|w| frames.get(&w).map(|(p, _)| *p));
+        for (pid, has_window_here) in here_by_app {
+            if has_window_here {
+                ax::set_app_hidden(pid, false);
+            } else if Some(pid) != focused_app {
+                ax::set_app_hidden(pid, true);
+            }
+        }
+    }
 }
 
 impl WorkspaceBackend for EmulatedBackend {
@@ -123,6 +151,9 @@ impl WorkspaceBackend for EmulatedBackend {
     }
 
     fn switch_workspace(&mut self, target: WorkspaceId) -> Result<()> {
+        // Stacking is NOT this backend's problem: the core follows every
+        // switch with a RestackWindows effect derived from the MRU history,
+        // which the effector reasserts after this returns.
         let plan = self.ledger.switch(target);
         if plan.park.is_empty() && plan.restore.is_empty() {
             return Ok(());
@@ -136,6 +167,7 @@ impl WorkspaceBackend for EmulatedBackend {
             writes.extend(self.restore(w, &frames));
         }
         ax::set_frames(&writes);
+        self.apply_app_visibility(&frames);
         Ok(())
     }
 
@@ -147,13 +179,20 @@ impl WorkspaceBackend for EmulatedBackend {
             None => return Err(BackendError(format!("workspace {} out of range", target.0))),
         };
         ax::set_frames(write.as_slice());
+        self.apply_app_visibility(&frames);
         Ok(())
     }
 
     fn rescue_window(&mut self, window: WindowId) -> Result<()> {
         // Claim it for the visible workspace and bring it back on-screen.
+        // No visibility pass here: rescue must only ever reveal, and the
+        // gather already unhides every app up front.
         let frames = Self::current_frames();
         self.ledger.assign_window(window, self.ledger.current());
+        ax::set_app_hidden(
+            frames.get(&window).map(|(p, _)| *p).unwrap_or(Pid(0)),
+            false,
+        );
         let write = self.restore(window, &frames);
         ax::set_frames(write.as_slice());
         Ok(())

@@ -52,6 +52,11 @@ pub fn gather(db_path: &Path, now_wall_ms: i64) -> usize {
         .unwrap_or(&displays[0])
         .frame;
 
+    // The emulated backend dims workspaces by hiding apps; a rescue must undo
+    // that unconditionally — a wedged daemon can't, and invisible apps are
+    // exactly the kind of wreckage the kill switch exists to clean up.
+    ax::unhide_all_apps();
+
     let mut backend = NativeBackend::new();
     let scan = ax::scan();
 

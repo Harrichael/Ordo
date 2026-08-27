@@ -118,7 +118,7 @@ fn read_window(win: *const AXUIElement, app: Pid, bundle_id: Option<String>) -> 
     })
 }
 
-fn focused_window() -> Option<WindowId> {
+pub fn focused_window() -> Option<WindowId> {
     // Find the front app by asking each app's live `AXFrontmost` attribute —
     // NOT NSWorkspace.frontmostApplication, which is a cache that refreshes
     // only when a run loop pumps (the engine thread never pumps one, so it
@@ -272,6 +272,41 @@ pub fn raise(target: WindowId) -> bool {
         let _ = (*win).perform_action(&raise);
     })
     .is_some()
+}
+
+/// Hide or unhide an app (the Cmd+H kind of hidden), by pid, via the app
+/// element's live `AXHidden` attribute. Used for Dock dimming: with `defaults
+/// write com.apple.dock showhidden -bool true`, hidden apps render translucent
+/// in the Dock, giving parked-elsewhere apps a "not on this workspace" cue.
+///
+/// Deliberately NOT `NSRunningApplication.hide()/unhide()/isHidden`: those are
+/// KVO-backed caches that refresh only when a run loop pumps, so from the
+/// engine thread `isHidden` reports the boot-time value forever. That exact
+/// bug shipped once — hides fired (false -> true looked like a change) but
+/// every unhide was skipped as "already visible", stranding whole workspaces
+/// invisible. Same lesson as `frontmostApplication` in `focused_window`.
+pub fn set_app_hidden(pid: Pid, hidden: bool) {
+    let el = unsafe { AXUIElement::new_application(pid.0) };
+    unsafe {
+        el.set_messaging_timeout(MESSAGING_TIMEOUT_SECS);
+        set_bool(&el, "AXHidden", hidden);
+    }
+}
+
+/// Unhide every regular app — the rescue path's counterpart to dimming, so a
+/// kill switch never leaves apps invisible behind a dead daemon. Unconditional
+/// writes: reading hidden-ness first would just add a failure mode.
+pub fn unhide_all_apps() {
+    let apps = NSWorkspace::sharedWorkspace().runningApplications();
+    for app in apps.iter() {
+        if app.activationPolicy() != NSApplicationActivationPolicy::Regular {
+            continue;
+        }
+        let pid = app.processIdentifier();
+        if pid > 0 {
+            set_app_hidden(Pid(pid), false);
+        }
+    }
 }
 
 /// Raise many windows in exactly the given order (the last one ends up

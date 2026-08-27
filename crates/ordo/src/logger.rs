@@ -215,7 +215,7 @@ fn effect_kind(e: &Effect) -> &'static str {
         Effect::SetWindowFrame { .. } => "set_window_frame",
         Effect::FocusWindow { .. } => "focus_window",
         Effect::WarpMouse { .. } => "warp_mouse",
-        Effect::LowerWindow { .. } => "lower_window",
+        Effect::RestackWindows { .. } => "restack_windows",
         Effect::RequestRescan { .. } => "request_rescan",
         Effect::SetIntercepting { .. } => "set_intercepting",
     }
@@ -228,7 +228,7 @@ fn effect_op(e: &Effect) -> Option<OpId> {
         | Effect::SetWindowFrame { op, .. }
         | Effect::FocusWindow { op, .. } => Some(*op),
         Effect::WarpMouse { .. }
-        | Effect::LowerWindow { .. }
+        | Effect::RestackWindows { .. }
         | Effect::RequestRescan { .. }
         | Effect::SetIntercepting { .. } => None,
     }
@@ -240,6 +240,7 @@ fn note_kind(n: &Note) -> &'static str {
         Note::OpLost { .. } => "op_lost",
         Note::OpFailed { .. } => "op_failed",
         Note::External { .. } => "external",
+        Note::FollowedFocus { .. } => "followed_focus",
         Note::TearDetected { .. } => "tear_detected",
         Note::TearPersisting => "tear_persisting",
         Note::Diverged { .. } => "diverged",

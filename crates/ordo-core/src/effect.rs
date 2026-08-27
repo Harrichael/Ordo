@@ -39,11 +39,15 @@ pub enum Effect {
     WarpMouse {
         to: Point,
     },
-    /// Push a window to the visual back of the z-stack. Fire-and-forget like
-    /// `WarpMouse`: z-order is not part of the core's belief (snapshots don't
-    /// carry it), so there is no op and no expectation — nothing to verify.
-    LowerWindow {
-        window: WindowId,
+    /// Impose this relative z-order (front-to-back) on the listed windows.
+    /// The order is always derived from the MRU focus history — raising a
+    /// window on macOS IS focusing it, so visual stacking and MRU are the
+    /// same fact, and keeping a separate stacking memory would just be a
+    /// second copy that drifts. Fire-and-forget like `WarpMouse`: z-order is
+    /// not part of the core's belief, so there is no op and no expectation
+    /// (the shell self-verifies against async apps).
+    RestackWindows {
+        order: Vec<WindowId>,
     },
     /// Ask the shell to enumerate and deliver a fresh `WorldObserved`. Emitted
     /// after every mutation so ops get confirmed promptly instead of waiting

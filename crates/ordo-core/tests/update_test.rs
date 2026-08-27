@@ -357,6 +357,140 @@ fn workspace_next_switches_and_prev_clamps_at_the_edge() {
 }
 
 #[test]
+fn switching_hands_focus_to_the_destinations_mru_window() {
+    // w2 lives on workspace 2; it should be focused BEFORE the switch lands
+    // (typing must never keep flowing into a freshly parked window).
+    let mut wins = std_windows();
+    wins[1].workspace = ws(2);
+    let s = update(
+        &booted(&[2, 1]),
+        &observed(
+            vec![mon_a(1), mon_b(1)],
+            wins,
+            Some(1),
+            RescanTrigger::Periodic,
+        ),
+    )
+    .state;
+
+    let step = update(&s, &hotkey(HotkeyAction::WorkspaceNext));
+    let focus_pos = step
+        .effects
+        .iter()
+        .position(|e| matches!(e, Effect::FocusWindow { window, .. } if *window == wid(2)))
+        .expect("focus effect");
+    let switch_pos = step
+        .effects
+        .iter()
+        .position(|e| matches!(e, Effect::SwitchWorkspace { target, .. } if *target == ws(2)))
+        .expect("switch effect");
+    assert!(focus_pos < switch_pos);
+    assert_eq!(step.state.pending.len(), 2, "focus + switch both expected");
+    // No warp: the core's frame belief for a parked window is its sliver.
+    assert!(!step
+        .effects
+        .iter()
+        .any(|e| matches!(e, Effect::WarpMouse { .. })));
+}
+
+#[test]
+fn switching_restacks_the_destination_by_mru() {
+    // w2 and w3 both live on workspace 2; w3 was focused more recently, so
+    // the switch must reassert w3-on-top — stacking IS the MRU order.
+    let mut wins = std_windows();
+    wins[1].workspace = ws(2);
+    wins[2].workspace = ws(2);
+    let s = update(
+        &booted(&[2, 3, 1]), // history: [1, 3, 2]
+        &observed(
+            vec![mon_a(1), mon_b(1)],
+            wins,
+            Some(1),
+            RescanTrigger::Periodic,
+        ),
+    )
+    .state;
+
+    let step = update(&s, &hotkey(HotkeyAction::WorkspaceNext));
+    let restack = step
+        .effects
+        .iter()
+        .find_map(|e| match e {
+            Effect::RestackWindows { order } => Some(order.clone()),
+            _ => None,
+        })
+        .expect("restack effect");
+    assert_eq!(restack, vec![wid(3), wid(2)]);
+    let switch_pos = step
+        .effects
+        .iter()
+        .position(|e| matches!(e, Effect::SwitchWorkspace { .. }))
+        .unwrap();
+    let restack_pos = step
+        .effects
+        .iter()
+        .position(|e| matches!(e, Effect::RestackWindows { .. }))
+        .unwrap();
+    assert!(
+        switch_pos < restack_pos,
+        "restack lands after the reveal it orders"
+    );
+}
+
+#[test]
+fn external_focus_on_a_hidden_workspaces_window_is_followed() {
+    // The user Cmd+Tabbed to w2, which is parked on workspace 2: Ordo brings
+    // workspace 2 over, mirroring native Spaces.
+    let mut wins = std_windows();
+    wins[1].workspace = ws(2);
+    let step = update(
+        &booted(&[1]),
+        &observed(
+            vec![mon_a(1), mon_b(1)],
+            wins,
+            Some(2),
+            RescanTrigger::Periodic,
+        ),
+    );
+    assert!(step
+        .effects
+        .iter()
+        .any(|e| matches!(e, Effect::SwitchWorkspace { target, .. } if *target == ws(2))));
+    assert!(step
+        .notes
+        .iter()
+        .any(|n| matches!(n, Note::FollowedFocus { window, target }
+            if *window == wid(2) && *target == ws(2))));
+
+    // But a focus change we caused ourselves is not followed: mid-switch,
+    // focus lands on the destination window while the monitors still show
+    // the old workspace — that's our own op's echo, not a Cmd+Tab.
+    let mut wins = std_windows();
+    wins[1].workspace = ws(2);
+    let mid = update(
+        &booted(&[2, 1]),
+        &observed(
+            vec![mon_a(1), mon_b(1)],
+            wins.clone(),
+            Some(1),
+            RescanTrigger::Periodic,
+        ),
+    )
+    .state;
+    let issued = update(&mid, &hotkey(HotkeyAction::WorkspaceNext));
+    let obs = update(
+        &issued.state,
+        &observed(
+            vec![mon_a(1), mon_b(1)],
+            wins,
+            Some(2),
+            RescanTrigger::PostEffect { op: OpId(2) },
+        ),
+    );
+    assert_eq!(count_switches(&obs.effects), 0, "no follow of our own echo");
+}
+
+#[test]
 fn confirmed_switch_is_attributed_to_ourselves() {
     let s = booted(&[1]);
     let step = update(&s, &hotkey(HotkeyAction::WorkspaceNext)); // op 1
@@ -635,13 +769,16 @@ fn demote_banishes_the_focused_window_and_moves_on() {
     // …and the demoted window sits at the very back of the history.
     assert_eq!(step.state.focus_history.iter().last(), Some(wid(1)));
 
-    // It's buried visually too — and only after the focus handoff, because
-    // lowering raises everything else, and raises land below the key window.
+    // It's buried visually too — the restack order is the demoted MRU, so w1
+    // comes last — and only after the focus handoff, because raises land
+    // below the key window.
     let lower_pos = step
         .effects
         .iter()
-        .position(|e| matches!(e, Effect::LowerWindow { window } if *window == wid(1)))
-        .expect("lower effect");
+        .position(
+            |e| matches!(e, Effect::RestackWindows { order } if order.last() == Some(&wid(1))),
+        )
+        .expect("restack effect with w1 at the back");
     let focus_pos = step
         .effects
         .iter()

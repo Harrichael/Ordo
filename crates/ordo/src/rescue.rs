@@ -57,14 +57,15 @@ fn window_id_of(effect_payload: &str) -> Option<WindowId> {
     Some(WindowId(id as u32))
 }
 
-/// Whether a window's frame lies entirely outside the union of display bounds —
-/// i.e. it has been parked somewhere the user can't reach it.
+/// Whether a window is parked somewhere the user can't meaningfully reach it.
+/// Judged by the frame's CENTER, not intersection: the emulated backend's
+/// parked windows deliberately keep a 1px sliver on-screen (macOS re-homes
+/// fully off-screen windows), and a rescue that walks past those slivers
+/// gathers nothing. A window whose center is off every display is lost to the
+/// user even if an edge technically shows.
 pub fn is_offscreen(frame: &Rect, displays: &[Rect]) -> bool {
-    !displays.iter().any(|d| intersects(frame, d))
-}
-
-fn intersects(a: &Rect, b: &Rect) -> bool {
-    a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y
+    let c = frame.center();
+    !displays.iter().any(|d| d.contains(c))
 }
 
 /// Re-home a frame fully inside `visible`, shrinking it if it's larger and
@@ -118,8 +119,11 @@ mod tests {
         let displays = vec![r(0.0, 0.0, 1920.0, 1080.0), r(1920.0, 0.0, 1920.0, 1080.0)];
         assert!(is_offscreen(&r(-5000.0, 0.0, 400.0, 300.0), &displays));
         assert!(!is_offscreen(&r(100.0, 100.0, 400.0, 300.0), &displays));
-        // Straddling the seam still counts as on-screen.
+        // Straddling the seam still counts as on-screen (center on display 1).
         assert!(!is_offscreen(&r(1800.0, 100.0, 400.0, 300.0), &displays));
+        // A parked sliver — 1px on-screen, center far off the edge — is
+        // exactly what a rescue must gather.
+        assert!(is_offscreen(&r(3839.0, 1079.0, 1400.0, 900.0), &displays));
     }
 
     #[test]
