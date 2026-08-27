@@ -80,6 +80,20 @@ Follow-ups:
   across 7 windows incl. Chrome). Already-ordered bottom suffixes are
   skipped. If it ever feels slow, the lever is raising fewer windows (e.g.
   only the top K of the MRU), not more parallelism.
+  - Michael's overlap idea (2026-08-27, deliberately NOT implemented yet —
+    full plan, physics, queries, and decision criteria in
+    docs/raise-overlap.md):
+    pipeline the raises optimistically — issue raise N+1 before N's landing
+    is confirmed when per-app latency stats say it lands in order with
+    p >= 99.9% — then detect misorder on the final read-back and fall back
+    to the serialized pass (which already exists as the second/absorb pass).
+    Same-app raises are FIFO in the app's AX queue, so those can ALWAYS
+    overlap; only cross-app boundaries need the heuristic. Gated on data:
+    the `restacks`/`raises` tables now log every reassert's phase breakdown
+    (presence wait vs handoff wait vs per-raise landing wait, per pid, with
+    burial depth) precisely so this can be designed from real distributions
+    after a few weeks of use — including checking whether raise landings are
+    even the dominant cost vs the presence wait.
 - Stacking research notes (from alt-tab-macos / yabai / Hammerspoon source
   dive, 2026-08-27): no WindowServer-side reorder of foreign windows exists
   with SIP on — yabai injects into Dock for SLSTransactionOrderWindowGroup,

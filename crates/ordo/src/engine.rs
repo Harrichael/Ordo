@@ -153,7 +153,13 @@ impl Engine {
                 });
             }
             other => {
-                if let Some(outcome) = self.effector.execute(other) {
+                let outcome = self.effector.execute(other);
+                if let Some(stats) = self.effector.take_restack_stats() {
+                    let _ = self
+                        .logger
+                        .log_restack_stats(&stats, self.clock.now().wall_ms);
+                }
+                if let Some(outcome) = outcome {
                     if let Some(op) = effect_op(other) {
                         queue.push_back(Event::EffectResult {
                             at: self.clock.now(),

@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use ordo_core::{Effect, OpOutcome};
 
-use crate::ports::Effector;
+use crate::ports::{Effector, RestackStats};
 
 use super::{ax, mouse, SharedBackend};
 
@@ -19,6 +19,9 @@ pub struct MacEffector {
     /// Shared with the event tap: flipping this is how interception is turned
     /// off (e.g. when rescue is engaged via the CLI rather than the hotkey).
     intercepting: Arc<AtomicBool>,
+    /// Parked here until the engine drains it, because the effect itself is
+    /// fire-and-forget: telemetry rides beside the outcome, not in it.
+    last_restack: Option<RestackStats>,
 }
 
 impl MacEffector {
@@ -26,6 +29,7 @@ impl MacEffector {
         MacEffector {
             backend,
             intercepting,
+            last_restack: None,
         }
     }
 }
@@ -53,7 +57,7 @@ impl Effector for MacEffector {
                 None
             }
             Effect::RestackWindows { order } => {
-                super::zorder::reassert_stack(order);
+                self.last_restack = super::zorder::reassert_stack(order);
                 None
             }
             Effect::SetIntercepting { enabled } => {
@@ -63,6 +67,10 @@ impl Effector for MacEffector {
             // The engine interprets this one itself (it owns the world source).
             Effect::RequestRescan { .. } => None,
         }
+    }
+
+    fn take_restack_stats(&mut self) -> Option<RestackStats> {
+        self.last_restack.take()
     }
 }
 

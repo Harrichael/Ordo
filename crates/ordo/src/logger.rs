@@ -15,9 +15,14 @@
 //! Executor results land in `op_results`. Snapshots live inline in the event
 //! payload rather than a side table: it keeps replay a single read, and a
 //! personal-scale DB does not need the denormalization.
+//!
+//! One side channel is telemetry, not record: `restacks`/`raises` hold the
+//! z-order reassert's timing breakdown (see [`crate::ports::RestackStats`]),
+//! there to answer a future statistics question, not to replay.
 
 use std::path::{Path, PathBuf};
 
+use crate::ports::RestackStats;
 use ordo_core::{Effect, Event, Note, OpId, OpOutcome, State};
 use rusqlite::{params, Connection};
 
@@ -172,6 +177,52 @@ impl Logger {
         Ok(())
     }
 
+    pub fn log_restack_stats(
+        &mut self,
+        s: &RestackStats,
+        now_wall_ms: i64,
+    ) -> rusqlite::Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO restacks (run_id, wall_ms, total_ms, presence_wait_ms,
+                 handoff_wait_ms, desired, missing, skipped_suffix, second_pass, converged)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                self.run_id,
+                now_wall_ms,
+                s.total_ms as i64,
+                s.presence_wait_ms as i64,
+                s.handoff_wait_ms as i64,
+                s.desired,
+                s.missing,
+                s.skipped_suffix,
+                s.second_pass,
+                s.converged,
+            ],
+        )?;
+        let restack_id = tx.last_insert_rowid();
+        for (ord, r) in s.raises.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO raises (restack_id, ord, window, pid, kind, pass,
+                     above_scope, above_all, wait_ms, timed_out)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    restack_id,
+                    ord as i64,
+                    r.window.0,
+                    r.pid,
+                    r.kind.as_str(),
+                    r.pass,
+                    r.above_scope,
+                    r.above_all,
+                    r.wait_ms as i64,
+                    r.timed_out,
+                ],
+            )?;
+        }
+        tx.commit()
+    }
+
     pub fn close(&mut self, now_wall_ms: i64) -> rusqlite::Result<()> {
         self.conn.execute(
             "UPDATE runs SET ended_wall = ?1 WHERE run_id = ?2",
@@ -294,6 +345,32 @@ CREATE TABLE IF NOT EXISTS checkpoints (
     seq     INTEGER NOT NULL,
     payload TEXT NOT NULL,
     PRIMARY KEY (run_id, seq)
+);
+CREATE TABLE IF NOT EXISTS restacks (
+    restack_id       INTEGER PRIMARY KEY,
+    run_id           INTEGER NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+    wall_ms          INTEGER NOT NULL,
+    total_ms         INTEGER NOT NULL,
+    presence_wait_ms INTEGER NOT NULL,
+    handoff_wait_ms  INTEGER NOT NULL,
+    desired          INTEGER NOT NULL,
+    missing          INTEGER NOT NULL,
+    skipped_suffix   INTEGER NOT NULL,
+    second_pass      INTEGER NOT NULL,
+    converged        INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS raises (
+    restack_id  INTEGER NOT NULL REFERENCES restacks(restack_id) ON DELETE CASCADE,
+    ord         INTEGER NOT NULL,
+    window      INTEGER NOT NULL,
+    pid         INTEGER NOT NULL,
+    kind        TEXT NOT NULL,
+    pass        INTEGER NOT NULL,
+    above_scope INTEGER NOT NULL,
+    above_all   INTEGER NOT NULL,
+    wait_ms     INTEGER NOT NULL,
+    timed_out   INTEGER NOT NULL,
+    PRIMARY KEY (restack_id, ord)
 );
 CREATE INDEX IF NOT EXISTS events_by_time ON events(wall_ms);
 CREATE INDEX IF NOT EXISTS events_by_kind ON events(run_id, kind);

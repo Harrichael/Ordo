@@ -12,8 +12,12 @@
 //! window, so callers should hand focus to the intended top window *before*
 //! restacking — the raises then slot in under it.
 
+use std::time::Instant;
+
 use ordo_core::WindowId;
 use ordo_skylight_sys as sys;
+
+use crate::ports::{RaiseKind, RaiseStat, RestackStats};
 
 use super::{ax, cf};
 
@@ -106,7 +110,7 @@ pub fn stack_front_to_back() -> Vec<WindowId> {
 /// then the top window ping-pongs each round trip" bug. Intent is the
 /// authority; the actual key window, whichever it transiently is, sits in no
 /// gate's scope and settles on top by itself.
-pub fn reassert_stack(desired: &[WindowId]) {
+pub fn reassert_stack(desired: &[WindowId]) -> Option<RestackStats> {
     const PRESENCE_TIMEOUT_MS: u64 = 600;
     // Generous on purpose: a landed gate exits in single-digit ms, so this is
     // paid only by an app genuinely slower than it — and a timeout means an
@@ -115,11 +119,10 @@ pub fn reassert_stack(desired: &[WindowId]) {
     const LANDING_TIMEOUT_MS: u64 = 1000;
     const POLL_MS: u64 = 5;
 
-    let Some((&top, rest)) = desired.split_first() else {
-        return;
-    };
+    let t_total = Instant::now();
+    let (&top, rest) = desired.split_first()?;
     if rest.is_empty() {
-        return;
+        return None;
     }
 
     let observed = |scope: &[WindowId]| -> Vec<WindowId> {
@@ -131,21 +134,24 @@ pub fn reassert_stack(desired: &[WindowId]) {
 
     // Wait for un-hides to finish resurfacing every window we're about to
     // order; a window that pops back mid-pass would land wherever it left off.
+    let t_presence = Instant::now();
     let mut waited = 0;
     while observed(desired).len() < desired.len() && waited < PRESENCE_TIMEOUT_MS {
         std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
         waited += POLL_MS;
     }
+    let presence_wait_ms = t_presence.elapsed().as_millis() as u64;
     // Anything still missing isn't coming (closed, or a stuck app): order
     // what's actually there.
     let present = observed(desired);
+    let missing = (desired.len() - present.len()) as u32;
     let mut want: Vec<WindowId> = rest
         .iter()
         .copied()
         .filter(|w| present.contains(w))
         .collect();
     if want.is_empty() {
-        return;
+        return None;
     }
 
     // While a window we must order HOLDS key status, nothing can be raised
@@ -155,6 +161,7 @@ pub fn reassert_stack(desired: &[WindowId]) {
     // (once the handoff lands it stays landed), unlike the racing "who's
     // focused" read this function used to key its physics on. Alt+End is the
     // flow that needs it: the demoted window stays key until the handoff.
+    let t_handoff = Instant::now();
     let mut waited = 0;
     let mut key_in_want = None;
     while waited < LANDING_TIMEOUT_MS {
@@ -170,6 +177,7 @@ pub fn reassert_stack(desired: &[WindowId]) {
             }
         }
     }
+    let handoff_wait_ms = t_handoff.elapsed().as_millis() as u64;
     // Still key after the wait — the handoff isn't coming (an external focus
     // grab, or a caller whose desired[0] isn't the window it focused).
     // Physics wins: nothing can be raised above the key window, so exempt it
@@ -178,7 +186,7 @@ pub fn reassert_stack(desired: &[WindowId]) {
     if let Some(f) = key_in_want {
         want.retain(|w| *w != f);
         if want.is_empty() {
-            return;
+            return None;
         }
     }
     let scope: Vec<WindowId> = std::iter::once(top).chain(want.iter().copied()).collect();
@@ -188,25 +196,50 @@ pub fn reassert_stack(desired: &[WindowId]) {
     // after the pass finished, breaking the order behind our back. The settle
     // sleep gives such a straggler time to land where the re-pass can see it;
     // the suffix-skip keeps the re-pass to just the windows it displaced.
-    for pass in 0..2 {
+    let mut raises = Vec::new();
+    let mut skipped_suffix = 0;
+    let mut second_pass = false;
+    for pass in 0..2u8 {
         if pass > 0 {
             std::thread::sleep(std::time::Duration::from_millis(150));
         }
         if observed(&scope) == scope {
-            return; // exact (also the common repeated-switch case: zero raises)
+            break; // exact (also the common repeated-switch case: zero raises)
         }
-        raise_pass(top, &want, &scope, &observed);
+        if pass > 0 {
+            second_pass = true;
+        }
+        let keep = raise_pass(top, &want, &scope, &observed, pass, &mut raises);
+        if pass == 0 {
+            skipped_suffix = keep as u32;
+        }
     }
+
+    Some(RestackStats {
+        total_ms: t_total.elapsed().as_millis() as u64,
+        presence_wait_ms,
+        handoff_wait_ms,
+        desired: desired.len() as u32,
+        missing,
+        skipped_suffix,
+        second_pass,
+        converged: observed(&scope) == scope,
+        raises,
+    })
 }
 
 /// One sequenced, landing-gated raise pass. See [`reassert_stack`] for why
-/// this shape is the only deterministic one available.
+/// this shape is the only deterministic one available. Returns the length of
+/// the already-correct suffix it skipped, and appends one [`RaiseStat`] per
+/// issued raise.
 fn raise_pass(
     top: WindowId,
     want: &[WindowId],
     scope: &[WindowId],
     observed: &dyn Fn(&[WindowId]) -> Vec<WindowId>,
-) {
+    pass: u8,
+    raises: &mut Vec<RaiseStat>,
+) -> usize {
     const LANDING_TIMEOUT_MS: u64 = 1000;
     const POLL_MS: u64 = 5;
 
@@ -245,16 +278,43 @@ fn raise_pass(
         keep += 1;
     }
 
-    let mut sequence: Vec<WindowId> = Vec::new();
+    let mut sequence: Vec<(WindowId, RaiseKind)> = Vec::new();
     for i in (0..want.len() - keep).rev() {
-        sequence.push(want[i]);
-        if is_sibling(want[i]) {
-            sequence.push(top);
+        let kind = if is_sibling(want[i]) {
+            RaiseKind::Sibling
+        } else {
+            RaiseKind::Background
+        };
+        sequence.push((want[i], kind));
+        if kind == RaiseKind::Sibling {
+            sequence.push((top, RaiseKind::Top));
         }
     }
-    if sequence.last() != Some(&top) {
-        sequence.push(top);
+    if sequence.last().map(|&(w, _)| w) != Some(top) {
+        sequence.push((top, RaiseKind::Top));
     }
+
+    // Per-raise stats use this pass-start read (same one the sibling
+    // classification is from): "how buried was it", not exact hop counts.
+    let pid_of = |w: WindowId| {
+        with_pids
+            .iter()
+            .find(|(x, _)| *x == w.0)
+            .map(|&(_, p)| p)
+            .unwrap_or(-1)
+    };
+    let above = |w: WindowId| -> (u32, u32) {
+        let mut in_scope = 0;
+        for (i, (x, _)) in with_pids.iter().enumerate() {
+            if *x == w.0 {
+                return (in_scope, i as u32);
+            }
+            if scope.iter().any(|s| s.0 == *x) {
+                in_scope += 1;
+            }
+        }
+        (in_scope, with_pids.len() as u32)
+    };
 
     // One landing at a time. Landed is the raise's own observable, never a
     // vacuous ordering check (the first window's "suffix in order" is
@@ -264,7 +324,11 @@ fn raise_pass(
     // reads back above every other window in its scope. The designated top's
     // scope includes everything; the others' excludes the designated top,
     // which legitimately sits above them.
-    ax::raise_sequenced(&sequence, |w| {
+    let ids: Vec<WindowId> = sequence.iter().map(|&(w, _)| w).collect();
+    let mut step = 0;
+    ax::raise_sequenced(&ids, |w| {
+        let kind = sequence[step].1;
+        step += 1;
         let landed = |w: WindowId| {
             if w == top {
                 observed(scope).first() == Some(&w)
@@ -272,10 +336,23 @@ fn raise_pass(
                 observed(want).first() == Some(&w)
             }
         };
+        let t = Instant::now();
         let mut waited = 0;
         while !landed(w) && waited < LANDING_TIMEOUT_MS {
             std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
             waited += POLL_MS;
         }
+        let (above_scope, above_all) = above(w);
+        raises.push(RaiseStat {
+            window: w,
+            pid: pid_of(w),
+            kind,
+            pass,
+            above_scope,
+            above_all,
+            wait_ms: t.elapsed().as_millis() as u64,
+            timed_out: waited >= LANDING_TIMEOUT_MS,
+        });
     });
+    keep
 }
