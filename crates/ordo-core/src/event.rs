@@ -54,6 +54,10 @@ pub enum HotkeyAction {
     /// wrap-around — matches how macOS's own ctrl-arrow switching feels).
     WorkspacePrev,
     WorkspaceNext,
+    /// Jump straight to a workspace. No key binding mints this today; it is
+    /// what a queued run of Prev/Next coalesces into (see
+    /// [`crate::coalesce_hotkeys`]), so a burst of presses costs one switch.
+    WorkspaceSwitchTo(WorkspaceId),
     /// Alt+Tab: most-recently-used window in the current workspace.
     MruWorkspace,
     /// Alt+Shift+Tab: MRU in the current workspace AND the focused monitor.

@@ -79,6 +79,17 @@ impl Logger {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(SCHEMA)?;
+        // Columns added after a table shipped: CREATE IF NOT EXISTS won't grow
+        // an existing table, and the telemetry history is worth keeping (the
+        // raise-overlap decision wants weeks of it), so alter in place.
+        let has_aborted = conn
+            .prepare("SELECT 1 FROM pragma_table_info('restacks') WHERE name = 'aborted'")?
+            .exists([])?;
+        if !has_aborted {
+            conn.execute_batch(
+                "ALTER TABLE restacks ADD COLUMN aborted INTEGER NOT NULL DEFAULT 0;",
+            )?;
+        }
 
         let cutoff = now_wall_ms - RETENTION_DAYS * 24 * 60 * 60 * 1000;
         conn.execute("DELETE FROM runs WHERE started_wall < ?1", params![cutoff])?;
@@ -185,8 +196,9 @@ impl Logger {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
             "INSERT INTO restacks (run_id, wall_ms, total_ms, presence_wait_ms,
-                 handoff_wait_ms, desired, missing, skipped_suffix, second_pass, converged)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                 handoff_wait_ms, desired, missing, skipped_suffix, second_pass, converged,
+                 aborted)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 self.run_id,
                 now_wall_ms,
@@ -198,6 +210,7 @@ impl Logger {
                 s.skipped_suffix,
                 s.second_pass,
                 s.converged,
+                s.aborted,
             ],
         )?;
         let restack_id = tx.last_insert_rowid();
@@ -358,7 +371,8 @@ CREATE TABLE IF NOT EXISTS restacks (
     missing          INTEGER NOT NULL,
     skipped_suffix   INTEGER NOT NULL,
     second_pass      INTEGER NOT NULL,
-    converged        INTEGER NOT NULL
+    converged        INTEGER NOT NULL,
+    aborted          INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS raises (
     restack_id  INTEGER NOT NULL REFERENCES restacks(restack_id) ON DELETE CASCADE,

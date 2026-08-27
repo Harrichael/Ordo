@@ -27,14 +27,6 @@ pub trait WorldSource {
 /// dropping the effect); `Some` is logged as an `EffectResult` event.
 pub trait Effector {
     fn execute(&mut self, effect: &Effect) -> Option<OpOutcome>;
-
-    /// Drain telemetry from the last `RestackWindows` execution, if any.
-    /// Separate from the outcome because it is measurement, not judgment:
-    /// the engine logs it to the `restacks`/`raises` tables and the core
-    /// never sees it.
-    fn take_restack_stats(&mut self) -> Option<RestackStats> {
-        None
-    }
 }
 
 /// One restack's timing breakdown. The point is the question it exists to
@@ -62,6 +54,10 @@ pub struct RestackStats {
     pub second_pass: bool,
     /// Final read-back matched the desired order exactly.
     pub converged: bool,
+    /// A newer desired order arrived mid-reassert and this one yielded to it.
+    /// Aborted rows are expected under rapid switching and are NOT failures;
+    /// exclude them when aggregating latency distributions.
+    pub aborted: bool,
     pub raises: Vec<RaiseStat>,
 }
 

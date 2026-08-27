@@ -48,4 +48,4 @@ pub use ids::{MonitorId, OpId, Pid, Point, Rect, WindowId, WorkspaceId, FRAME_EP
 pub use mru::FocusHistory;
 pub use reconcile::Delta;
 pub use state::{Mode, MonitorRecord, PendingOp, State, WindowRecord};
-pub use update::{update, Note, Step};
+pub use update::{coalesce_hotkeys, update, Note, Step};

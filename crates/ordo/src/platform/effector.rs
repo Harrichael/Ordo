@@ -10,8 +10,9 @@ use std::sync::Arc;
 
 use ordo_core::{Effect, OpOutcome};
 
-use crate::ports::{Effector, RestackStats};
+use crate::ports::Effector;
 
+use super::restack_worker::RestackHandle;
 use super::{ax, mouse, SharedBackend};
 
 pub struct MacEffector {
@@ -19,17 +20,21 @@ pub struct MacEffector {
     /// Shared with the event tap: flipping this is how interception is turned
     /// off (e.g. when rescue is engaged via the CLI rather than the hotkey).
     intercepting: Arc<AtomicBool>,
-    /// Parked here until the engine drains it, because the effect itself is
-    /// fire-and-forget: telemetry rides beside the outcome, not in it.
-    last_restack: Option<RestackStats>,
+    /// Z-order is enforced off-thread: submitting is instant, and a newer
+    /// order preempts an in-flight one instead of queueing behind it.
+    restack: RestackHandle,
 }
 
 impl MacEffector {
-    pub fn new(backend: SharedBackend, intercepting: Arc<AtomicBool>) -> Self {
+    pub fn new(
+        backend: SharedBackend,
+        intercepting: Arc<AtomicBool>,
+        restack: RestackHandle,
+    ) -> Self {
         MacEffector {
             backend,
             intercepting,
-            last_restack: None,
+            restack,
         }
     }
 }
@@ -57,7 +62,7 @@ impl Effector for MacEffector {
                 None
             }
             Effect::RestackWindows { order } => {
-                self.last_restack = super::zorder::reassert_stack(order);
+                self.restack.submit(order.clone());
                 None
             }
             Effect::SetIntercepting { enabled } => {
@@ -67,10 +72,6 @@ impl Effector for MacEffector {
             // The engine interprets this one itself (it owns the world source).
             Effect::RequestRescan { .. } => None,
         }
-    }
-
-    fn take_restack_stats(&mut self) -> Option<RestackStats> {
-        self.last_restack.take()
     }
 }
 

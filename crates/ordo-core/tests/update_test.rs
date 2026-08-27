@@ -1311,3 +1311,164 @@ fn update_is_a_pure_function() {
     let e = hotkey(HotkeyAction::MruWorkspace);
     assert_eq!(update(&s, &e), update(&s, &e));
 }
+
+// --- hotkey coalescing ------------------------------------------------------
+// A queued burst of presses is one user gesture: runs of Prev/Next fold into
+// a single direct jump, walked with clamping (net arithmetic is wrong at the
+// edges), and a net-zero bounce vanishes entirely.
+
+#[test]
+fn coalescing_folds_a_run_into_one_direct_jump() {
+    let s = booted(&[1]);
+    let folded = coalesce_hotkeys(
+        &s,
+        &[HotkeyAction::WorkspaceNext, HotkeyAction::WorkspaceNext],
+    );
+    assert_eq!(folded, vec![HotkeyAction::WorkspaceSwitchTo(ws(3))]);
+
+    let fx = update(&s, &hotkey(HotkeyAction::WorkspaceSwitchTo(ws(3)))).effects;
+    assert_eq!(count_switches(&fx), 1);
+    assert!(fx
+        .iter()
+        .any(|e| matches!(e, Effect::SwitchWorkspace { target, .. } if *target == ws(3))));
+}
+
+#[test]
+fn coalescing_annihilates_a_bounce() {
+    let s = booted(&[1]);
+    let folded = coalesce_hotkeys(
+        &s,
+        &[HotkeyAction::WorkspaceNext, HotkeyAction::WorkspacePrev],
+    );
+    assert_eq!(folded, Vec::new());
+}
+
+#[test]
+fn coalescing_walks_the_clamped_edges_instead_of_summing() {
+    // From ws1 with 3 workspaces: Next,Next,Next,Prev walks 2,3,3(clamped),2.
+    // Net arithmetic (+3-1 from 1) would land on 3 — the walk must not.
+    let s = booted(&[1]);
+    let folded = coalesce_hotkeys(
+        &s,
+        &[
+            HotkeyAction::WorkspaceNext,
+            HotkeyAction::WorkspaceNext,
+            HotkeyAction::WorkspaceNext,
+            HotkeyAction::WorkspacePrev,
+        ],
+    );
+    assert_eq!(folded, vec![HotkeyAction::WorkspaceSwitchTo(ws(2))]);
+}
+
+#[test]
+fn coalescing_passes_single_and_fenced_actions_through() {
+    let s = booted(&[1]);
+    // A lone press keeps its exact shape (the common unqueued case).
+    assert_eq!(
+        coalesce_hotkeys(&s, &[HotkeyAction::WorkspaceNext]),
+        vec![HotkeyAction::WorkspaceNext]
+    );
+    // A non-switch action fences the fold on both sides, order preserved.
+    let folded = coalesce_hotkeys(
+        &s,
+        &[
+            HotkeyAction::WorkspaceNext,
+            HotkeyAction::MruWorkspace,
+            HotkeyAction::WorkspaceNext,
+        ],
+    );
+    assert_eq!(
+        folded,
+        vec![
+            HotkeyAction::WorkspaceSwitchTo(ws(2)),
+            HotkeyAction::MruWorkspace,
+            HotkeyAction::WorkspaceSwitchTo(ws(3)),
+        ]
+    );
+}
+
+#[test]
+fn direct_jump_ignores_the_current_and_out_of_range_workspaces() {
+    let s = booted(&[1]);
+    assert_eq!(
+        update(&s, &hotkey(HotkeyAction::WorkspaceSwitchTo(ws(1)))).effects,
+        Vec::new()
+    );
+    assert_eq!(
+        update(&s, &hotkey(HotkeyAction::WorkspaceSwitchTo(ws(9)))).effects,
+        Vec::new()
+    );
+}
+
+#[test]
+fn follow_the_focus_holds_while_a_focus_handoff_is_in_flight() {
+    // w2 lives on ws2; everything else on ws1. Get w2 into the MRU history
+    // legitimately (focused while ws2 was up), then return to ws1.
+    let wins = || {
+        vec![
+            win(1, 100, 1, rect(10.0, 10.0)),
+            win(2, 200, 2, rect(500.0, 10.0)),
+            win(3, 100, 1, rect(900.0, 10.0)),
+        ]
+    };
+    let mut s = update(
+        &State::new(),
+        &observed(
+            vec![mon_a(1), mon_b(1)],
+            wins(),
+            Some(3),
+            RescanTrigger::Startup,
+        ),
+    )
+    .state;
+    for (active, focused) in [(2, 2), (1, 1)] {
+        s = update(
+            &s,
+            &observed(
+                vec![mon_a(active), mon_b(active)],
+                wins(),
+                Some(focused),
+                RescanTrigger::Periodic,
+            ),
+        )
+        .state;
+    }
+
+    // Switch toward ws2: mints a Focused(w2) handoff that macOS will land on
+    // w2's app's own schedule.
+    let step = update(&s, &hotkey(HotkeyAction::WorkspaceNext));
+    assert_eq!(focus_targets(&step.effects), vec![wid(2)]);
+    let s = step.state;
+
+    // First snapshot: the switch itself is already confirmed (the emulated
+    // backend echoes it instantly) but focus still sits on w1 — the handoff
+    // is in flight.
+    let s = update(
+        &s,
+        &observed(
+            vec![mon_a(2), mon_b(2)],
+            wins(),
+            Some(1),
+            RescanTrigger::Periodic,
+        ),
+    )
+    .state;
+
+    // Mid-handoff, focus transiently re-keys onto w3 — a hidden-ws1 window
+    // (Dock dimming's app-hide can fling focus anywhere). Following it would
+    // spontaneously bounce the user back to ws1.
+    let step = update(
+        &s,
+        &observed(
+            vec![mon_a(2), mon_b(2)],
+            wins(),
+            Some(3),
+            RescanTrigger::Periodic,
+        ),
+    );
+    assert_eq!(count_switches(&step.effects), 0);
+    assert!(!step
+        .notes
+        .iter()
+        .any(|n| matches!(n, Note::FollowedFocus { .. })));
+}

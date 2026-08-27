@@ -115,14 +115,21 @@ fn push_restack(s: &State, ws: WorkspaceId, fx: &mut Vec<Effect>) {
 
 fn handle_hotkey(s: &mut State, action: HotkeyAction, fx: &mut Vec<Effect>) {
     match action {
-        HotkeyAction::WorkspacePrev | HotkeyAction::WorkspaceNext => {
+        HotkeyAction::WorkspacePrev
+        | HotkeyAction::WorkspaceNext
+        | HotkeyAction::WorkspaceSwitchTo(_) => {
             let Some(cur) = s.current_workspace() else {
                 return;
             };
             let target = match action {
                 HotkeyAction::WorkspacePrev if cur.0 > 1 => WorkspaceId(cur.0 - 1),
                 HotkeyAction::WorkspaceNext if cur.0 < s.workspace_count => WorkspaceId(cur.0 + 1),
-                _ => return, // clamped at the edge: nothing to do
+                HotkeyAction::WorkspaceSwitchTo(t)
+                    if t != cur && t.0 >= 1 && t.0 <= s.workspace_count =>
+                {
+                    t
+                }
+                _ => return, // clamped at the edge (or already there): nothing to do
             };
             // Hand focus to the destination's MRU window BEFORE switching —
             // otherwise the keyboard keeps typing into a window that just got
@@ -359,6 +366,53 @@ fn handle_hotkey(s: &mut State, action: HotkeyAction, fx: &mut Vec<Effect>) {
     }
 }
 
+/// Collapse a burst of queued hotkeys into what the user meant by the LAST of
+/// them. Hotkeys only queue while the engine is busy carrying out an earlier
+/// one; replaying the backlog literally re-fights switches the user has
+/// already visually moved past (a logged stale press once fired a whole extra
+/// switch 1.7s late). Runs of Prev/Next fold into one direct jump via a
+/// clamp-simulated walk — NOT net arithmetic, which is wrong at the edges
+/// (at the top workspace, Next-then-Prev must land one BELOW, not stay put).
+/// Non-switch actions pass through in order and fence the folding; a
+/// single-action batch passes through untouched, so the common unqueued press
+/// keeps its exact logged shape.
+///
+/// Lives in the core because "what a run of commands is equivalent to" is
+/// command semantics; the engine only decides when a batch exists.
+pub fn coalesce_hotkeys(s: &State, actions: &[HotkeyAction]) -> Vec<HotkeyAction> {
+    if actions.len() <= 1 {
+        return actions.to_vec();
+    }
+    let Some(cur) = s.current_workspace() else {
+        return actions.to_vec();
+    };
+    let mut out = Vec::new();
+    // `sim` walks the workspace the queued presses would have landed on;
+    // `walk_start` is where the current fold began, so a net-zero bounce
+    // (including bounces off a clamped edge) emits nothing at all.
+    let mut sim = cur;
+    let mut walk_start = cur;
+    let flush = |sim: WorkspaceId, walk_start: &mut WorkspaceId, out: &mut Vec<HotkeyAction>| {
+        if sim != *walk_start {
+            out.push(HotkeyAction::WorkspaceSwitchTo(sim));
+            *walk_start = sim;
+        }
+    };
+    for &a in actions {
+        match a {
+            HotkeyAction::WorkspacePrev => sim = WorkspaceId(sim.0.max(2) - 1),
+            HotkeyAction::WorkspaceNext => sim = WorkspaceId((sim.0 + 1).min(s.workspace_count)),
+            HotkeyAction::WorkspaceSwitchTo(t) if t.0 >= 1 && t.0 <= s.workspace_count => sim = t,
+            other => {
+                flush(sim, &mut walk_start, &mut out);
+                out.push(other);
+            }
+        }
+    }
+    flush(sim, &mut walk_start, &mut out);
+    out
+}
+
 fn handle_snapshot(
     pre: &State,
     s: &mut State,
@@ -574,11 +628,22 @@ fn handle_snapshot(
     // an EXTERNAL focus change qualifies: our own switches legitimately leave
     // focus sitting on a freshly parked window (parking doesn't defocus), and
     // `explains` attributes those focus deltas to the pending switch.
-    if !s
-        .pending
-        .iter()
-        .any(|p| matches!(p.expect, Expectation::AllMonitorsOn(_)))
-    {
+    //
+    // A pending Focused expectation also holds this off: a switch's focus
+    // handoff is fire-and-forget and lands on the target app's schedule,
+    // while the switch itself (ledger-backed on the emulated backend)
+    // self-confirms on the very first snapshot — so AllMonitorsOn alone
+    // stopped guarding the handoff window once the restack moved off-thread
+    // and snapshots got fast. A transient re-key onto some hidden-workspace
+    // window mid-handoff (Dock dimming's app-hide can fling focus) must not
+    // read as the user navigating away; the expectation resolves or expires
+    // within EXPECTATION_RESCANS, so a genuine follow is deferred, not lost.
+    if !s.pending.iter().any(|p| {
+        matches!(
+            p.expect,
+            Expectation::AllMonitorsOn(_) | Expectation::Focused(_)
+        )
+    }) {
         let external_focus = deltas.iter().any(|d| {
             matches!(d, Delta::FocusChanged { .. })
                 && !entry_expectations.iter().any(|e| reconcile::explains(e, d))

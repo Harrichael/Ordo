@@ -17,11 +17,13 @@
 use std::collections::VecDeque;
 
 use crossbeam_channel::Receiver;
-use ordo_core::{update, Effect, Event, HotkeyAction, OpId, RescanTrigger, State};
+use ordo_core::{
+    coalesce_hotkeys, update, Effect, Event, HotkeyAction, OpId, RescanTrigger, State,
+};
 
 use crate::clock::Clock;
 use crate::logger::Logger;
-use crate::ports::{Effector, WorldSource};
+use crate::ports::{Effector, RestackStats, WorldSource};
 
 /// What the outside world sends the engine. Producers (the tap thread, the
 /// periodic timer, later the AX observer and the rescue signal) speak this;
@@ -33,6 +35,9 @@ pub enum Msg {
     Rescue,
     /// The engage chord (or a --paused run coming alive): leave Rescued mode.
     Engage,
+    /// Telemetry from the restack worker, delivered as a message because the
+    /// SQLite logger is engine-thread-only. Never becomes a core event.
+    RestackStats(RestackStats),
     /// Stop the loop and close the run. Needed because producer threads (the
     /// event tap) hold sender clones that outlive shutdown, so channel-close
     /// alone can't end the loop.
@@ -87,25 +92,65 @@ impl Engine {
     /// Process messages until the channel closes (all senders dropped), then
     /// close out the run. Opens with a startup scan so the model reflects
     /// reality before the first hotkey.
+    ///
+    /// Messages are taken in batches — everything already queued is drained
+    /// before processing — so that hotkeys which piled up while the engine was
+    /// busy are seen TOGETHER and coalesced (`coalesce_hotkeys`) instead of
+    /// replayed one by one: a queued backlog is one user gesture, not a
+    /// script. Non-hotkey messages fence the coalescing and keep their order.
     pub fn run(mut self, rx: Receiver<Msg>) {
         self.observe(RescanTrigger::Startup);
-        while let Ok(msg) = rx.recv() {
-            match msg {
-                Msg::Hotkey(action) => self.pump(Event::Hotkey {
-                    at: self.clock.now(),
-                    action,
-                }),
-                Msg::Rescan(trigger) => self.observe(trigger),
-                Msg::Rescue => self.pump(Event::RescueEngaged {
-                    at: self.clock.now(),
-                }),
-                Msg::Engage => self.pump(Event::Engaged {
-                    at: self.clock.now(),
-                }),
-                Msg::Shutdown => break,
+        'recv: while let Ok(msg) = rx.recv() {
+            let mut batch = vec![msg];
+            while let Ok(m) = rx.try_recv() {
+                batch.push(m);
             }
+            let mut hotkeys: Vec<HotkeyAction> = Vec::new();
+            for m in batch {
+                match m {
+                    Msg::Hotkey(action) => hotkeys.push(action),
+                    // Deliberately NOT a coalescing fence: worker stats land
+                    // mid-burst by construction (each burst switch aborts its
+                    // predecessor's reassert, which reports back during the
+                    // very key repeats being folded), and letting telemetry
+                    // split a run would re-execute the stale intermediate
+                    // switch the folding exists to skip.
+                    Msg::RestackStats(stats) => {
+                        let _ = self
+                            .logger
+                            .log_restack_stats(&stats, self.clock.now().wall_ms);
+                    }
+                    other => {
+                        self.flush_hotkeys(&mut hotkeys);
+                        match other {
+                            Msg::Rescan(trigger) => self.observe(trigger),
+                            Msg::Rescue => self.pump(Event::RescueEngaged {
+                                at: self.clock.now(),
+                            }),
+                            Msg::Engage => self.pump(Event::Engaged {
+                                at: self.clock.now(),
+                            }),
+                            Msg::Shutdown => break 'recv,
+                            Msg::Hotkey(_) | Msg::RestackStats(_) => {
+                                unreachable!("handled above")
+                            }
+                        }
+                    }
+                }
+            }
+            self.flush_hotkeys(&mut hotkeys);
         }
         let _ = self.logger.close(self.clock.now().wall_ms);
+    }
+
+    fn flush_hotkeys(&mut self, hotkeys: &mut Vec<HotkeyAction>) {
+        for action in coalesce_hotkeys(&self.state, hotkeys) {
+            self.pump(Event::Hotkey {
+                at: self.clock.now(),
+                action,
+            });
+        }
+        hotkeys.clear();
     }
 
     /// Fully react to one external event, including any internal rescans and
@@ -154,11 +199,6 @@ impl Engine {
             }
             other => {
                 let outcome = self.effector.execute(other);
-                if let Some(stats) = self.effector.take_restack_stats() {
-                    let _ = self
-                        .logger
-                        .log_restack_stats(&stats, self.clock.now().wall_ms);
-                }
                 if let Some(outcome) = outcome {
                     if let Some(op) = effect_op(other) {
                         queue.push_back(Event::EffectResult {

@@ -102,11 +102,20 @@ named the symptom yet — candidates, ranked:
   ordering is deterministic, since apps apply raises on their own schedule
   and no WindowServer-side bulk ordering survives SIP (probed: SLSOrderWindow
   refused; SLPS bursts coalesce to the last call — slps_order_probe.rs).
-  Cost: a switch pays the true AX latency of each misordered window's app,
-  serially (measured: ~10ms/window typical, ~370ms worst-case full reversal
-  across 7 windows incl. Chrome). Already-ordered bottom suffixes are
-  skipped. If it ever feels slow, the lever is raising fewer windows (e.g.
-  only the top K of the MRU), not more parallelism.
+  Since 2026-08-27 the reassert runs on a dedicated worker thread
+  (platform/restack_worker.rs) with generation preemption: submitting is
+  instant, a newer order cancels an in-flight one at the next 5ms gate tick,
+  and the engine is never blocked by landing waits (it used to be deaf up to
+  ~1.9s on a ghosted raise). Queued hotkey bursts are coalesced at dequeue
+  (core's coalesce_hotkeys — clamp-walked fold into WorkspaceSwitchTo), so a
+  rapid bounce annihilates instead of replaying stale. Two accepted residuals:
+  a cancelled generation's in-flight raise can land during its successor
+  (absorbed by the successor's second pass, same as any ghost), and a
+  mid-handoff snapshot can transiently touch the wrong MRU head (focus
+  follow-through is guarded by the pending Focused expectation; MRU-order
+  pollution self-corrects on the next real focus). If stacking ever still
+  feels slow, the lever is raising fewer windows (e.g. only the top K of
+  the MRU) or the data-gated overlap plan below, not more threads.
   - Michael's overlap idea (2026-08-27, deliberately NOT implemented yet —
     full plan, physics, queries, and decision criteria in
     docs/raise-overlap.md):

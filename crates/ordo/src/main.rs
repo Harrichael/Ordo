@@ -159,6 +159,10 @@ fn run(
 
     // The engine and all macOS handles live entirely on this one thread.
     let engine_intercepting = intercepting.clone();
+    // The restack worker outlives everything but the process (tap-thread
+    // lifetime contract); it reports its telemetry back through the engine's
+    // channel, so it needs a sender before the engine thread consumes rx.
+    let restack = ordo::platform::restack_worker::spawn(tx.clone());
     let engine_thread = std::thread::spawn(move || {
         let clock = SystemClock::new();
         let backend_label = match (backend, observe) {
@@ -182,7 +186,7 @@ fn run(
         let effector: Box<dyn Effector> = if observe {
             Box::new(NullEffector)
         } else {
-            Box::new(MacEffector::new(backend, engine_intercepting))
+            Box::new(MacEffector::new(backend, engine_intercepting, restack))
         };
         let engine = Engine::new(logger, Box::new(world), effector, Box::new(clock));
         engine.run(rx);

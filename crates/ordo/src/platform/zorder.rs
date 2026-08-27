@@ -100,6 +100,13 @@ pub fn stack_front_to_back() -> Vec<WindowId> {
 /// position at the bottom are skipped entirely — the common round trip
 /// raises only what actually moved.
 ///
+/// `cancel` is polled at every gate tick and between raises: when it turns
+/// true (a newer desired order exists), this reassert yields mid-flight and
+/// reports `aborted` — finishing an order the user has already switched away
+/// from is pure wasted latency, and the newer reassert re-reads the world
+/// anyway. A raise already issued cannot be recalled; its late landing is
+/// absorbed by the successor's passes exactly like any other ghost.
+///
 /// `desired[0]` is the DESIGNATED top — the window the core wants focused —
 /// not whatever AX says is focused right now. Asking AX mid-reveal races the
 /// focus effect's own landing (and the outgoing app may already be hidden),
@@ -110,7 +117,7 @@ pub fn stack_front_to_back() -> Vec<WindowId> {
 /// then the top window ping-pongs each round trip" bug. Intent is the
 /// authority; the actual key window, whichever it transiently is, sits in no
 /// gate's scope and settles on top by itself.
-pub fn reassert_stack(desired: &[WindowId]) -> Option<RestackStats> {
+pub fn reassert_stack(desired: &[WindowId], cancel: &dyn Fn() -> bool) -> Option<RestackStats> {
     const PRESENCE_TIMEOUT_MS: u64 = 600;
     // Generous on purpose: a landed gate exits in single-digit ms, so this is
     // paid only by an app genuinely slower than it — and a timeout means an
@@ -125,6 +132,21 @@ pub fn reassert_stack(desired: &[WindowId]) -> Option<RestackStats> {
         return None;
     }
 
+    // Latch abort at the checks that steer execution: a fully-converged
+    // reassert whose successor merely arrived microseconds later is a valid
+    // latency sample, and re-sampling the raw flag at stats time would
+    // mislabel it (biasing the very distributions the telemetry feeds).
+    let aborted = std::cell::Cell::new(false);
+    let raw_cancel = cancel;
+    let cancel = || -> bool {
+        if raw_cancel() {
+            aborted.set(true);
+            true
+        } else {
+            false
+        }
+    };
+
     let observed = |scope: &[WindowId]| -> Vec<WindowId> {
         stack_front_to_back()
             .into_iter()
@@ -136,7 +158,7 @@ pub fn reassert_stack(desired: &[WindowId]) -> Option<RestackStats> {
     // order; a window that pops back mid-pass would land wherever it left off.
     let t_presence = Instant::now();
     let mut waited = 0;
-    while observed(desired).len() < desired.len() && waited < PRESENCE_TIMEOUT_MS {
+    while observed(desired).len() < desired.len() && waited < PRESENCE_TIMEOUT_MS && !cancel() {
         std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
         waited += POLL_MS;
     }
@@ -164,7 +186,7 @@ pub fn reassert_stack(desired: &[WindowId]) -> Option<RestackStats> {
     let t_handoff = Instant::now();
     let mut waited = 0;
     let mut key_in_want = None;
-    while waited < LANDING_TIMEOUT_MS {
+    while waited < LANDING_TIMEOUT_MS && !cancel() {
         match ax::focused_window() {
             Some(f) if want.contains(&f) => {
                 key_in_want = Some(f);
@@ -201,7 +223,16 @@ pub fn reassert_stack(desired: &[WindowId]) -> Option<RestackStats> {
     let mut second_pass = false;
     for pass in 0..2u8 {
         if pass > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(150));
+            // The settle sleep is the longest uninterruptible stretch left if
+            // done in one call — tick it so a preemption isn't blind for 150ms.
+            let mut slept = 0;
+            while slept < 150 && !cancel() {
+                std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
+                slept += POLL_MS;
+            }
+        }
+        if cancel() {
+            break;
         }
         if observed(&scope) == scope {
             break; // exact (also the common repeated-switch case: zero raises)
@@ -209,7 +240,7 @@ pub fn reassert_stack(desired: &[WindowId]) -> Option<RestackStats> {
         if pass > 0 {
             second_pass = true;
         }
-        let keep = raise_pass(top, &want, &scope, &observed, pass, &mut raises);
+        let keep = raise_pass(top, &want, &scope, &observed, pass, &mut raises, &cancel);
         if pass == 0 {
             skipped_suffix = keep as u32;
         }
@@ -224,6 +255,7 @@ pub fn reassert_stack(desired: &[WindowId]) -> Option<RestackStats> {
         skipped_suffix,
         second_pass,
         converged: observed(&scope) == scope,
+        aborted: aborted.get(),
         raises,
     })
 }
@@ -239,6 +271,7 @@ fn raise_pass(
     observed: &dyn Fn(&[WindowId]) -> Vec<WindowId>,
     pass: u8,
     raises: &mut Vec<RaiseStat>,
+    cancel: &dyn Fn() -> bool,
 ) -> usize {
     const LANDING_TIMEOUT_MS: u64 = 1000;
     const POLL_MS: u64 = 5;
@@ -338,7 +371,7 @@ fn raise_pass(
         };
         let t = Instant::now();
         let mut waited = 0;
-        while !landed(w) && waited < LANDING_TIMEOUT_MS {
+        while !landed(w) && waited < LANDING_TIMEOUT_MS && !cancel() {
             std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
             waited += POLL_MS;
         }
@@ -353,6 +386,7 @@ fn raise_pass(
             wait_ms: t.elapsed().as_millis() as u64,
             timed_out: waited >= LANDING_TIMEOUT_MS,
         });
+        !cancel()
     });
     keep
 }

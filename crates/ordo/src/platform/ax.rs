@@ -313,9 +313,12 @@ pub fn unhide_all_apps() {
 /// raises. The callback is the caller's chance to WAIT for the raise to
 /// actually land (AXRaise is acknowledged by the app but applied on its own
 /// schedule — issuing the next raise before the previous landed is how
-/// cross-app stacking turns into a race). One walk collects every element up
-/// front; the borrowed arrays stay alive for the whole sequence.
-pub fn raise_sequenced(targets: &[WindowId], mut after_each: impl FnMut(WindowId)) {
+/// cross-app stacking turns into a race), and its return value decides
+/// whether the sequence continues — `false` stops before the next raise, so a
+/// preempted caller never issues raises for an order it has abandoned. One
+/// walk collects every element up front; the borrowed arrays stay alive for
+/// the whole sequence.
+pub fn raise_sequenced(targets: &[WindowId], mut after_each: impl FnMut(WindowId) -> bool) {
     // The window elements are borrowed from their app's AXWindows array, so
     // every array stays alive until all raises are done.
     let mut arrays: Vec<*const c_void> = Vec::new();
@@ -352,7 +355,9 @@ pub fn raise_sequenced(targets: &[WindowId], mut after_each: impl FnMut(WindowId
             unsafe {
                 let _ = (**win).perform_action(&raise);
             }
-            after_each(*t);
+            if !after_each(*t) {
+                break;
+            }
         }
     }
     for raw in arrays {
