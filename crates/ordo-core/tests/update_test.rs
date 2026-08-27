@@ -874,6 +874,115 @@ fn move_focused_window_to_other_monitor_brings_the_mouse() {
 }
 
 #[test]
+fn clamped_landing_on_the_target_monitor_confirms_the_move() {
+    // macOS clamps frames into a display's visible area (the requested y at
+    // the top of monitor B's bounds lands a menu-bar-height lower). The op's
+    // intent is the MONITOR, so the clamped landing must confirm it — the
+    // old exact-rect check could never be satisfied and re-asserted the
+    // doomed frame until damping, fighting the user the whole way.
+    let s = booted(&[1]);
+    let step = update(&s, &hotkey(HotkeyAction::MoveFocusedToOtherMonitor));
+    let f = set_frame_for(&step.effects, 1).expect("frame effect");
+
+    let mut wins = std_windows();
+    wins[0].frame = Rect { y: f.y + 33.0, ..f }; // clamped below the menu bar
+    let landed = update(
+        &step.state,
+        &observed(
+            vec![mon_a(1), mon_b(1)],
+            wins.clone(),
+            Some(1),
+            RescanTrigger::Periodic,
+        ),
+    );
+    assert!(
+        landed
+            .notes
+            .iter()
+            .any(|n| matches!(n, Note::SelfConfirmed { .. })),
+        "clamped landing is our own echo: {:?}",
+        landed.notes
+    );
+    let next = update(
+        &landed.state,
+        &observed(
+            vec![mon_a(1), mon_b(1)],
+            wins,
+            Some(1),
+            RescanTrigger::Periodic,
+        ),
+    );
+    assert_eq!(
+        count_set_frames(&next.effects, 1),
+        0,
+        "no retry against the clamp"
+    );
+}
+
+#[test]
+fn expired_placement_yields_to_a_window_being_dragged() {
+    // A retry that fires while the user is dragging the window teleports it
+    // out of their hand. An unexplained frame change in the expiry snapshot
+    // means someone is actively placing the window: the op stays lost.
+    let s = booted(&[1]);
+    let mut wins = std_windows();
+    wins.push(win(9, 300, 1, rect(2100.0, 300.0))); // new window on monitor B
+    let mut step = update(
+        &s,
+        &observed(
+            vec![mon_a(1), mon_b(1)],
+            wins.clone(),
+            Some(9),
+            RescanTrigger::AxHint {
+                pid: Some(Pid(300)),
+                kind: AxHintKind::WindowCreated,
+            },
+        ),
+    );
+    assert!(
+        set_frame_for(&step.effects, 9).is_some(),
+        "corral places the new window on the focused monitor"
+    );
+    // The corral never sticks (the snapshot keeps the old frame) …
+    for _ in 0..2 {
+        step = update(
+            &step.state,
+            &observed(
+                vec![mon_a(1), mon_b(1)],
+                wins.clone(),
+                Some(9),
+                RescanTrigger::Periodic,
+            ),
+        );
+    }
+    // … and in the expiry snapshot the user is dragging it (still on B).
+    let mut dragged = std_windows();
+    dragged.push(win(9, 300, 1, rect(2400.0, 500.0)));
+    let expiry = update(
+        &step.state,
+        &observed(
+            vec![mon_a(1), mon_b(1)],
+            dragged,
+            Some(9),
+            RescanTrigger::Periodic,
+        ),
+    );
+    assert!(
+        expiry
+            .notes
+            .iter()
+            .any(|n| matches!(n, Note::OpLost { .. })),
+        "op expires: {:?}",
+        expiry.notes
+    );
+    assert_eq!(
+        count_set_frames(&expiry.effects, 9),
+        0,
+        "no retry while the user's hands are on the window"
+    );
+}
+
+#[test]
 fn carry_moves_the_focused_window_and_switches_with_it() {
     let s = booted(&[1]);
     let step = update(&s, &hotkey(HotkeyAction::CarryFocusedToWorkspaceNext));

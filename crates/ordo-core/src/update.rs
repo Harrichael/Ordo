@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::effect::{CorrectionAxis, Effect, Expectation};
 use crate::event::{AxHintKind, Event, HotkeyAction, OpOutcome, RescanTrigger, WorldSnapshot};
-use crate::ids::{OpId, WindowId, WorkspaceId, FRAME_EPSILON};
+use crate::ids::{OpId, Rect, WindowId, WorkspaceId, FRAME_EPSILON};
 use crate::reconcile::{self, Delta};
 use crate::state::{Mode, PendingOp, State};
 
@@ -421,6 +421,21 @@ fn handle_snapshot(
 
     let mut last_op: Option<OpId> = None;
 
+    // The user's hands outrank stale intent: an unexplained frame change on
+    // a window in THIS snapshot means someone is actively placing it (a drag
+    // in progress, most likely) — a retry would yank it out from under them
+    // mid-gesture. The op stays lost; a re-press is cheaper than a fight.
+    let hands_on = |w: WindowId| {
+        deltas.iter().any(|d| {
+            let same_window = match d {
+                Delta::WindowFrameChanged { window, .. }
+                | Delta::WindowMonitorChanged { window, .. } => *window == w,
+                _ => false,
+            };
+            same_window && !entry_expectations.iter().any(|e| reconcile::explains(e, d))
+        })
+    };
+
     // A placement op that expired while the window still sits in violation
     // gets retried — apps often re-apply their own autosaved frame after we
     // move them — but only under the damping limit.
@@ -451,9 +466,7 @@ fn handle_snapshot(
                 );
             }
             Expectation::WindowFramed { window, frame }
-                if s.windows
-                    .get(&window)
-                    .is_some_and(|r| !r.frame.approx_eq(&frame, FRAME_EPSILON)) =>
+                if !framed_satisfied(s, window, &frame) && !hands_on(window) =>
             {
                 correct_window(
                     s,
@@ -694,10 +707,26 @@ fn expectation_satisfied(e: &Expectation, s: &State) -> bool {
             .windows
             .get(window)
             .is_some_and(|r| r.workspace == *workspace),
-        Expectation::WindowFramed { window, frame } => s
-            .windows
-            .get(window)
-            .is_some_and(|r| r.frame.approx_eq(frame, FRAME_EPSILON)),
+        Expectation::WindowFramed { window, frame } => framed_satisfied(s, *window, frame),
         Expectation::Focused(w) => s.focused == Some(*w),
+    }
+}
+
+/// A frame op's observable post-condition is ARRIVAL ON THE INTENDED
+/// MONITOR, not the exact rect: macOS clamps frames into a display's
+/// visible area (a requested y at the top of the second monitor's bounds
+/// lands a menu-bar-height lower), so demanding the pixels made the
+/// expectation unsatisfiable and turned every cross-monitor move into a
+/// doomed retry fight — lived as "the rescan keeps yanking the window".
+/// The exact rect matters only when the target frame is on no known
+/// monitor and there is nothing better to check against.
+fn framed_satisfied(s: &State, window: WindowId, frame: &Rect) -> bool {
+    let Some(r) = s.windows.get(&window) else {
+        return false;
+    };
+    let c = frame.center();
+    match s.monitors.values().find(|m| m.frame.contains(c)) {
+        Some(m) => r.monitor == m.id,
+        None => r.frame.approx_eq(frame, FRAME_EPSILON),
     }
 }
