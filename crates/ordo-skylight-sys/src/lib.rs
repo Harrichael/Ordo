@@ -70,6 +70,19 @@ extern "C" {
         mask: c_int,
         windows: CFArrayRef,
     ) -> CFArrayRef;
+
+    /// Move the given windows to a managed space. This is the historically
+    /// simple move path; Apple restricted it from non-Dock processes across
+    /// 12.7 / 13.6 / 14.5 / 15+, so on recent macOS it may silently no-op —
+    /// which is why the backend verifies the result and reports honestly rather
+    /// than trusting the call. (The SIP-free replacement is the non-exported
+    /// SLSPerformAsynchronousBridgedWindowManagementOperation, deferred: it
+    /// needs a Mach-O symbol scan to locate.)
+    pub fn SLSMoveWindowsToManagedSpace(
+        cid: CgsConnectionId,
+        windows: CFArrayRef,
+        space: CgsSpaceId,
+    );
 }
 
 #[cfg_attr(

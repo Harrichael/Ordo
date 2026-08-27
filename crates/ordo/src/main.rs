@@ -65,7 +65,7 @@ fn run(db: Option<PathBuf>, interval: f64, observe: bool) {
     use ordo::clock::{Clock, SystemClock};
     use ordo::engine::{Engine, Msg};
     use ordo::logger::Logger;
-    use ordo::platform::{native_backend, tap, MacEffector, MacWorldSource};
+    use ordo::platform::{native_backend, observer, tap, MacEffector, MacWorldSource};
     use ordo::ports::{Effector, NullEffector};
     use ordo_core::RescanTrigger;
 
@@ -88,6 +88,8 @@ fn run(db: Option<PathBuf>, interval: f64, observe: bool) {
 
     if !observe {
         tap::spawn(tx.clone(), intercepting.clone());
+        // New-window corralling depends on the WindowCreated hint this emits.
+        observer::spawn(tx.clone());
     }
 
     // The engine and all macOS handles live entirely on this one thread.

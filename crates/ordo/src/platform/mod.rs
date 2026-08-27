@@ -16,8 +16,10 @@ pub mod ax;
 pub mod cf;
 pub mod display;
 pub mod effector;
+pub mod gesture;
 pub mod mouse;
 pub mod native_backend;
+pub mod observer;
 pub mod skylight;
 pub mod tap;
 

@@ -56,10 +56,24 @@ pub fn scan() -> AxScan {
         let el = unsafe { AXUIElement::new_application(pid) };
         unsafe { el.set_messaging_timeout(MESSAGING_TIMEOUT_SECS) };
 
-        for win in app_windows(&el) {
-            if let Some(w) = read_window(win, Pid(pid), bundle_id.clone()) {
-                windows.push(w);
+        // The window elements are borrowed from this array, so every read must
+        // happen before it's released — releasing first would leave dangling
+        // AXUIElement pointers (a use-after-free that only surfaces once the
+        // app actually has windows to enumerate).
+        let Some(raw) = (unsafe { copy_attr(&el, "AXWindows") }) else {
+            continue;
+        };
+        unsafe {
+            for i in 0..super::cf::array_len(raw) {
+                let win = super::cf::array_get(raw, i) as *const AXUIElement;
+                if win.is_null() {
+                    continue;
+                }
+                if let Some(w) = read_window(win, Pid(pid), bundle_id.clone()) {
+                    windows.push(w);
+                }
             }
+            sys::CFRelease(raw);
         }
     }
 
@@ -67,26 +81,6 @@ pub fn scan() -> AxScan {
         focused: focused_window(),
         windows,
     }
-}
-
-/// The AXUIElement pointers for an app's windows. Borrowed from the copied
-/// array, which is released before return — callers use them only within the
-/// loop body, which they do.
-fn app_windows(app: &AXUIElement) -> Vec<*const AXUIElement> {
-    let Some(raw) = (unsafe { copy_attr(app, "AXWindows") }) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    unsafe {
-        for i in 0..super::cf::array_len(raw) {
-            let el = super::cf::array_get(raw, i) as *const AXUIElement;
-            if !el.is_null() {
-                out.push(el);
-            }
-        }
-        sys::CFRelease(raw);
-    }
-    out
 }
 
 fn read_window(win: *const AXUIElement, app: Pid, bundle_id: Option<String>) -> Option<AxWindow> {

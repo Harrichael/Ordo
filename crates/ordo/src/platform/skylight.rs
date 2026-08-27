@@ -150,6 +150,46 @@ pub fn window_workspaces(
     out
 }
 
+/// The raw space id a window currently lives on (not translated to an
+/// ordinal), needed to find which display's space list it belongs to before a
+/// move.
+pub fn raw_space_of_window(cid: sys::CgsConnectionId, window: WindowId) -> Option<sys::CgsSpaceId> {
+    unsafe {
+        let cf_windows = make_number_array(&[window])?;
+        let result = sys::SLSCopySpacesForWindows(cid, sys::kCgsAllSpacesMask, cf_windows);
+        sys::CFRelease(cf_windows);
+        if result.is_null() {
+            return None;
+        }
+        let entry = cf::array_get(result, 0);
+        let sid = cf::number_i64(entry)
+            .or_else(|| cf::number_i64(cf::array_get(entry, 0)))
+            .map(|v| v as sys::CgsSpaceId);
+        sys::CFRelease(result);
+        sid
+    }
+}
+
+/// Ask SkyLight to move one window to a space. Best-effort: on recent macOS
+/// this may be a no-op from a non-Dock process (see the sys declaration), which
+/// is why callers verify afterward.
+pub fn move_window_to_space(cid: sys::CgsConnectionId, window: WindowId, space: sys::CgsSpaceId) {
+    unsafe {
+        let Some(cf_windows) = make_number_array(&[window]) else {
+            return;
+        };
+        sys::SLSMoveWindowsToManagedSpace(cid, cf_windows, space);
+        sys::CFRelease(cf_windows);
+    }
+}
+
+/// Public wrapper over the identifier->MonitorId resolution, so the backend can
+/// aim gestures at the right display.
+pub fn resolve_monitor_id(identifier: &str, known: &[(MonitorId, bool)]) -> Option<MonitorId> {
+    let main = known.iter().find(|(_, m)| *m).map(|(id, _)| *id);
+    resolve_monitor(identifier, known, main)
+}
+
 unsafe fn space_id(space_dict: *const c_void) -> Option<sys::CgsSpaceId> {
     if space_dict.is_null() {
         return None;
