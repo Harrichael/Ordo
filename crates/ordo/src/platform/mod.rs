@@ -20,6 +20,7 @@ pub mod gesture;
 pub mod mouse;
 pub mod native_backend;
 pub mod observer;
+pub mod rescue_gather;
 pub mod skylight;
 pub mod tap;
 

@@ -25,6 +25,13 @@ enum Command {
         #[arg(long)]
         observe: bool,
     },
+    /// Disengage Ordo and gather displaced windows back onto the visible area.
+    /// Signals a running daemon to go inert, then gathers in this process too,
+    /// so it works even if the daemon is wedged or gone.
+    Rescue {
+        #[arg(long)]
+        db: Option<PathBuf>,
+    },
     /// Replay a logged run through the core and report any effect-stream
     /// divergence — the tool for "what happened, and does the current core
     /// still agree".
@@ -48,12 +55,21 @@ fn main() {
             interval,
             observe,
         } => run(db, interval, observe),
+        Command::Rescue { db } => rescue(db),
         Command::Replay { db, run, from } => replay(db, run, from),
     }
 }
 
 fn db_path(db: Option<PathBuf>) -> PathBuf {
     db.unwrap_or_else(ordo::logger::default_db_path)
+}
+
+/// The pidfile lives next to the log, so the rescue CLI can find a running
+/// daemon given the same (default or explicit) db path.
+fn pid_path(db: &std::path::Path) -> PathBuf {
+    db.parent()
+        .unwrap_or(std::path::Path::new("."))
+        .join("ordo.pid")
 }
 
 #[cfg(target_os = "macos")]
@@ -81,6 +97,12 @@ fn run(db: Option<PathBuf>, interval: f64, observe: bool) {
 
     let stop = Arc::new(AtomicBool::new(false));
     install_sigint(stop.clone());
+    let rescue_requested = Arc::new(AtomicBool::new(false));
+    install_sigusr1(rescue_requested.clone());
+
+    // Record our pid so `ordo rescue` can signal us; clean it up on exit.
+    let pidfile = pid_path(&path);
+    let _ = std::fs::write(&pidfile, std::process::id().to_string());
 
     // Intercepting starts on for an active run; the tap and effector share it.
     let intercepting = Arc::new(AtomicBool::new(!observe));
@@ -119,6 +141,13 @@ fn run(db: Option<PathBuf>, interval: f64, observe: bool) {
     // engine's channel, which ends its loop and writes the run's end time.
     let period = Duration::from_secs_f64(interval.max(0.1));
     while !stop.load(Ordering::Relaxed) {
+        // A SIGUSR1 (from `ordo rescue`) disengages interception immediately —
+        // the same effect as the hotkey fast path — and tells the core to go
+        // inert. The gather itself runs in the rescue CLI's own process.
+        if rescue_requested.swap(false, Ordering::Relaxed) {
+            intercepting.store(false, Ordering::Relaxed);
+            let _ = tx.send(Msg::Rescue);
+        }
         if tx.send(Msg::Rescan(RescanTrigger::Periodic)).is_err() {
             break;
         }
@@ -128,6 +157,7 @@ fn run(db: Option<PathBuf>, interval: f64, observe: bool) {
     // would otherwise keep the engine's channel open forever.
     let _ = tx.send(Msg::Shutdown);
     let _ = engine_thread.join();
+    let _ = std::fs::remove_file(&pidfile);
     println!("ordo: stopped.");
 }
 
@@ -151,6 +181,53 @@ fn install_sigint(stop: std::sync::Arc<std::sync::atomic::AtomicBool>) {
     unsafe {
         libc::signal(libc::SIGINT, ptr as libc::sighandler_t);
     }
+}
+
+#[cfg(target_os = "macos")]
+fn install_sigusr1(flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    use std::sync::atomic::Ordering;
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<std::sync::Arc<std::sync::atomic::AtomicBool>> = OnceLock::new();
+    let _ = FLAG.set(flag);
+    extern "C" fn handler(_sig: libc::c_int) {
+        if let Some(f) = FLAG.get() {
+            f.store(true, Ordering::Relaxed);
+        }
+    }
+    let ptr = handler as extern "C" fn(libc::c_int);
+    unsafe {
+        libc::signal(libc::SIGUSR1, ptr as libc::sighandler_t);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn rescue(db: Option<PathBuf>) {
+    let path = db_path(db);
+    // Signal a running daemon to go inert (best-effort; it may not be running).
+    let pidfile = pid_path(&path);
+    if let Ok(text) = std::fs::read_to_string(&pidfile) {
+        if let Ok(pid) = text.trim().parse::<i32>() {
+            let sent = unsafe { libc::kill(pid, libc::SIGUSR1) } == 0;
+            if sent {
+                println!("ordo rescue: signaled daemon (pid {pid}) to disengage.");
+                // Give it a moment to flip interception off before we move windows.
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            }
+        }
+    }
+    // Gather regardless — this must succeed against a hung or dead daemon.
+    let now = ordo::clock::SystemClock::new();
+    let wall = {
+        use ordo::clock::Clock;
+        now.now().wall_ms
+    };
+    let count = ordo::platform::rescue_gather::gather(&path, wall);
+    println!("ordo rescue: gathered {count} window(s) onto the visible area.");
+}
+
+#[cfg(not(target_os = "macos"))]
+fn rescue(_db: Option<PathBuf>) {
+    eprintln!("ordo rescue is only supported on macOS.");
 }
 
 fn replay(db: Option<PathBuf>, run: Option<i64>, from: Option<u64>) {
