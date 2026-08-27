@@ -529,6 +529,51 @@ fn external_focus_on_a_hidden_workspaces_window_is_followed() {
 }
 
 #[test]
+fn closing_a_window_never_follows_focus_to_another_workspace() {
+    // Closing a window makes macOS hand focus to the app's next window,
+    // wherever it lives — including a hidden workspace. That's fallout, not
+    // navigation: the user asked to close something, not to go somewhere.
+    // Hold the workspace and pull focus back to its MRU window instead.
+    let mut wins = std_windows();
+    wins[1].workspace = ws(2); // w2 parked on workspace 2
+    let s = update(
+        &booted(&[2, 3, 1]), // history: [1, 3, 2]; focused w1
+        &observed(
+            vec![mon_a(1), mon_b(1)],
+            wins.clone(),
+            Some(1),
+            RescanTrigger::Periodic,
+        ),
+    )
+    .state;
+
+    // w3 closes; macOS gives focus to w2 (on hidden workspace 2).
+    wins.retain(|w| w.id != wid(3));
+    let step = update(
+        &s,
+        &observed(
+            vec![mon_a(1), mon_b(1)],
+            wins,
+            Some(2),
+            RescanTrigger::AxHint {
+                pid: Some(Pid(100)),
+                kind: AxHintKind::Other("AXFocusedWindowChanged".into()),
+            },
+        ),
+    );
+    assert_eq!(count_switches(&step.effects), 0, "no yank on close");
+    assert_eq!(
+        focus_targets(&step.effects),
+        vec![wid(1)],
+        "focus returns to this workspace's MRU window"
+    );
+    assert!(step
+        .notes
+        .iter()
+        .any(|n| matches!(n, Note::HeldFocusOnClose { window } if *window == wid(1))));
+}
+
+#[test]
 fn confirmed_switch_is_attributed_to_ourselves() {
     let s = booted(&[1]);
     let step = update(&s, &hotkey(HotkeyAction::WorkspaceNext)); // op 1

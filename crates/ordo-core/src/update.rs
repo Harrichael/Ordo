@@ -43,6 +43,9 @@ pub enum Note {
         window: WindowId,
         target: WorkspaceId,
     },
+    /// Focus fell onto a hidden workspace as fallout from a window closing;
+    /// instead of following, focus was pulled back to this window here.
+    HeldFocusOnClose { window: WindowId },
     /// Monitors disagreed on workspace without an in-flight switch of ours.
     TearDetected { target: WorkspaceId },
     /// Tear realignment hit the damping limit; we stopped re-aligning.
@@ -585,19 +588,45 @@ fn handle_snapshot(
                 let target = rec.workspace;
                 let here = s.current_workspace();
                 if Some(target) != here && target.0 >= 1 && target.0 <= s.workspace_count {
-                    let op = s.mint_op();
-                    fx.push(Effect::SwitchWorkspace { op, target });
-                    s.pending.push(PendingOp {
-                        op,
-                        expect: Expectation::AllMonitorsOn(target),
-                        rescans_left: EXPECTATION_RESCANS,
-                    });
-                    push_restack(s, target, fx);
-                    notes.push(Note::FollowedFocus {
-                        window: rec.id,
-                        target,
-                    });
-                    last_op = Some(op);
+                    // Close fallout is not navigation: when a window dies,
+                    // macOS hands focus to the app's next window wherever it
+                    // lives — the user asked to close something, not to go
+                    // somewhere. Any destroy in this snapshot marks the focus
+                    // change as suspect; hold the workspace and pull focus
+                    // back to its MRU window (typing into a hidden window is
+                    // the alternative). A genuine Cmd+Tab landing in the same
+                    // snapshot as an unrelated close loses one follow — the
+                    // user re-presses; a wrong yank costs far more.
+                    let close_fallout = deltas
+                        .iter()
+                        .any(|d| matches!(d, Delta::WindowDestroyed(_)));
+                    if close_fallout {
+                        if let Some(back) = here.and_then(|h| mru_stack(s, h).into_iter().next()) {
+                            let op = s.mint_op();
+                            fx.push(Effect::FocusWindow { op, window: back });
+                            s.pending.push(PendingOp {
+                                op,
+                                expect: Expectation::Focused(back),
+                                rescans_left: EXPECTATION_RESCANS,
+                            });
+                            notes.push(Note::HeldFocusOnClose { window: back });
+                            last_op = Some(op);
+                        }
+                    } else {
+                        let op = s.mint_op();
+                        fx.push(Effect::SwitchWorkspace { op, target });
+                        s.pending.push(PendingOp {
+                            op,
+                            expect: Expectation::AllMonitorsOn(target),
+                            rescans_left: EXPECTATION_RESCANS,
+                        });
+                        push_restack(s, target, fx);
+                        notes.push(Note::FollowedFocus {
+                            window: rec.id,
+                            target,
+                        });
+                        last_op = Some(op);
+                    }
                 }
             }
         }

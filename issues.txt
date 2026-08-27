@@ -58,6 +58,33 @@ Follow-ups:
 - The pointer blips to each display's center mid-switch (restored after).
   Cosmetic; revisit if it bothers.
 
+## New-window handling — reviewed 2026-08-27, oddities to pick from
+
+Current behavior: the app's AXWindowCreated hint triggers a rescan; a new
+window that TOOK FOCUS is corralled to the pre-existing focus context
+(moved to the current workspace; translated to the focused monitor if it
+opened on the other one). A window that opens without stealing focus is
+left where the app put it. New windows enter MRU history at the back
+unless focused. Michael flagged the area as "a little odd" but hasn't
+named the symptom yet — candidates, ranked:
+
+1. Fresh-app blind spot: the AX observer attaches to newly launched apps on
+   a 3s timer, so the FIRST window of a just-launched app usually misses
+   the created-hint — no corral, invisible to the model until the next
+   periodic scan (up to 2s). Already-running apps get ~50ms handling; the
+   inconsistency reads as flakiness. Fix: NSWorkspace launch notifications
+   on a pumped run loop (also listed under polling gaps).
+2. Cross-monitor teleport blink: an app that remembers its position opens
+   on monitor B; if focus is on A, the window appears on B then jumps to A
+   a beat later. Corral working as designed ("new windows come to you") —
+   softening options: corral workspace-only (drop the monitor translate),
+   or drop the corral entirely.
+3. Non-focused new windows sink on the next switch: they sit at the MRU
+   back, so a workspace round trip's restack buries them — "the window I
+   just opened vanished". Consistent with MRU-is-stacking; if it grates,
+   enter new windows mid-history (e.g. just below the focused window)
+   instead of last.
+
 ## Smaller open items
 
 - Dock dimming only re-evaluates at backend mutation points (switch / move /

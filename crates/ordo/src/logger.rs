@@ -292,6 +292,7 @@ fn note_kind(n: &Note) -> &'static str {
         Note::OpFailed { .. } => "op_failed",
         Note::External { .. } => "external",
         Note::FollowedFocus { .. } => "followed_focus",
+        Note::HeldFocusOnClose { .. } => "held_focus_on_close",
         Note::TearDetected { .. } => "tear_detected",
         Note::TearPersisting => "tear_persisting",
         Note::Diverged { .. } => "diverged",
