@@ -9,8 +9,10 @@
 | Alt + Tab | Focus most-recently-used window in the current workspace |
 | Alt + Shift + Tab | Focus MRU window in the current workspace and monitor |
 | Alt + Backtick (`) | Focus MRU window in the current workspace and app |
+| Ctrl + Alt + Tab | Focus MRU window on the other monitor |
 | Cmd + Shift + Left / Right | Move the focused window to the other monitor (focus and mouse go with it) |
-| Alt + End | Demote the focused window to the back of the MRU history and focus the next one |
+| Ctrl + Cmd + Left / Right | Carry the focused window to the previous / next workspace and switch there with it |
+| Alt + End | Demote the focused window: back of the MRU history, back of the visual stack, focus moves to the next one |
 | Ctrl + Alt + Cmd + Esc (twice within 2s) | Rescue / kill switch: disengage and gather windows back on-screen |
 | Ctrl + Alt + Cmd + O | Engage: undo a rescue, or bring a `--paused` run alive |
 

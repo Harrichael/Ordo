@@ -5,9 +5,12 @@
 //!   - Cmd+Left / Cmd+Right      → previous / next workspace
 //!   - Cmd+Shift+Left / Right    → move the focused window to the other
 //!     monitor, dragging focus and mouse along with it
+//!   - Ctrl+Cmd+Left / Right     → carry the focused window to the adjacent
+//!     workspace and switch there with it
 //!   - Alt+Tab                   → MRU window in the workspace
 //!   - Alt+Shift+Tab             → MRU window in the workspace + monitor
 //!   - Alt+Backtick              → MRU window in the workspace + app
+//!   - Ctrl+Alt+Tab              → MRU window on the OTHER monitor
 //!   - Alt+End                   → demote the focused window to the back of
 //!     the MRU history and focus the next one
 //!   - Ctrl+Alt+Cmd+Escape       → rescue candidate (engages on a double-press;
@@ -70,6 +73,9 @@ pub fn match_chord(keycode: u16, m: Mods) -> Option<Chord> {
         code::LEFT if only_cmd(m) => Some(Chord::Hotkey(WorkspacePrev)),
         code::RIGHT if only_cmd(m) => Some(Chord::Hotkey(WorkspaceNext)),
         code::LEFT | code::RIGHT if cmd_shift(m) => Some(Chord::Hotkey(MoveFocusedToOtherMonitor)),
+        code::LEFT if cmd_ctrl(m) => Some(Chord::Hotkey(CarryFocusedToWorkspacePrev)),
+        code::RIGHT if cmd_ctrl(m) => Some(Chord::Hotkey(CarryFocusedToWorkspaceNext)),
+        code::TAB if m.ctrl && m.alt && !m.cmd && !m.shift => Some(Chord::Hotkey(MruOtherMonitor)),
         code::TAB if m.alt && m.shift && !m.cmd && !m.ctrl => Some(Chord::Hotkey(MruMonitor)),
         code::TAB if m.alt && !m.shift && !m.cmd && !m.ctrl => Some(Chord::Hotkey(MruWorkspace)),
         code::GRAVE if m.alt && !m.cmd && !m.ctrl => Some(Chord::Hotkey(MruApp)),
@@ -86,6 +92,13 @@ fn only_cmd(m: Mods) -> bool {
 /// Cmd+Shift exactly.
 fn cmd_shift(m: Mods) -> bool {
     m.cmd && m.shift && !m.alt && !m.ctrl
+}
+
+/// Ctrl+Cmd exactly. `!alt` is load-bearing beyond strictness: the native
+/// backend synthesizes Ctrl+Alt+Cmd+arrows (the Mission Control lever), and
+/// those must sail through our own tap untouched.
+fn cmd_ctrl(m: Mods) -> bool {
+    m.cmd && m.ctrl && !m.alt && !m.shift
 }
 
 #[cfg(test)]
@@ -124,6 +137,13 @@ mod tests {
             match_chord(code::GRAVE, mods(false, true, false, false)),
             Some(Chord::Hotkey(MruApp))
         );
+        assert_eq!(
+            match_chord(code::TAB, mods(false, true, false, true)),
+            Some(Chord::Hotkey(MruOtherMonitor))
+        );
+        // Ctrl+Alt+Cmd+Tab is nobody's chord — the full-triple family is
+        // reserved for rescue/engage keys only.
+        assert_eq!(match_chord(code::TAB, mods(true, true, false, true)), None);
     }
 
     #[test]
@@ -143,6 +163,30 @@ mod tests {
             None
         );
         assert_eq!(match_chord(code::LEFT, mods(true, true, true, false)), None);
+    }
+
+    #[test]
+    fn ctrl_cmd_arrows_carry_and_the_mission_control_lever_passes_through() {
+        assert_eq!(
+            match_chord(code::LEFT, mods(true, false, false, true)),
+            Some(Chord::Hotkey(CarryFocusedToWorkspacePrev))
+        );
+        assert_eq!(
+            match_chord(code::RIGHT, mods(true, false, false, true)),
+            Some(Chord::Hotkey(CarryFocusedToWorkspaceNext))
+        );
+        // Ctrl+Alt+Cmd+arrow is the synthesized Mission Control lever chord;
+        // swallowing it would deadlock the native backend's own switch.
+        assert_eq!(match_chord(code::LEFT, mods(true, true, false, true)), None);
+        assert_eq!(
+            match_chord(code::RIGHT, mods(true, true, false, true)),
+            None
+        );
+        // Plain Ctrl+arrows belong to Hammerspoon.
+        assert_eq!(
+            match_chord(code::LEFT, mods(false, false, false, true)),
+            None
+        );
     }
 
     #[test]

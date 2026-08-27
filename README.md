@@ -37,13 +37,16 @@ The two rules that make it work:
 
 - **Workspace switching**: `Cmd+Left` / `Cmd+Right` to the adjacent workspace.
 - **MRU window focus**: `Alt+Tab` (in workspace), `Alt+Shift+Tab` (+ monitor),
-  `Alt+Backtick` (+ app). The mouse warps to the focused window's center.
+  `Alt+Backtick` (+ app), `Ctrl+Alt+Tab` (the *other* monitor). The mouse warps
+  to the focused window's center.
 - **New-window placement**: a newly created window is corralled onto the focused
   workspace and monitor.
 - **Move window to the other monitor**: `Cmd+Shift+Left/Right` — focus and
   mouse travel with the window.
+- **Carry window to another workspace**: `Ctrl+Cmd+Left/Right` — the focused
+  window moves to the adjacent workspace and the view switches with it.
 - **MRU demote**: `Alt+End` sends the focused window to the back of the MRU
-  history and focuses the next one.
+  history *and* the back of the visual stack, then focuses the next one.
 - **Structured SQLite log** at `~/Library/Application Support/Ordo/log.db`.
 - **Kill switch**: `Ctrl+Alt+Cmd+Escape` twice within 2s, or `ordo rescue` —
   disengages interception and gathers displaced windows back on-screen.

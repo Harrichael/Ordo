@@ -117,6 +117,13 @@ extern "C" {
         mode: u32,
     ) -> i32;
 
+    /// Reorder a window in its level's z-stack: `mode` 1 = above `relative`,
+    /// -1 = below, 0 = order out; `relative` 0 means the absolute front/back
+    /// of the level. Historically WindowServer only honors this from the
+    /// window's own connection (yabai routes it through its Dock payload) —
+    /// probe before trusting it from a daemon.
+    pub fn SLSOrderWindow(cid: CgsConnectionId, window: u32, mode: c_int, relative: u32) -> i32;
+
     /// Post a raw 0xf8-byte WindowServer event record to a process. Paired
     /// with `SLPSSetFrontProcessWithOptions`: the front-process call alone
     /// does not hand the target window key status (verified on Tahoe); the

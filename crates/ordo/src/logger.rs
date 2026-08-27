@@ -215,6 +215,7 @@ fn effect_kind(e: &Effect) -> &'static str {
         Effect::SetWindowFrame { .. } => "set_window_frame",
         Effect::FocusWindow { .. } => "focus_window",
         Effect::WarpMouse { .. } => "warp_mouse",
+        Effect::LowerWindow { .. } => "lower_window",
         Effect::RequestRescan { .. } => "request_rescan",
         Effect::SetIntercepting { .. } => "set_intercepting",
     }
@@ -227,6 +228,7 @@ fn effect_op(e: &Effect) -> Option<OpId> {
         | Effect::SetWindowFrame { op, .. }
         | Effect::FocusWindow { op, .. } => Some(*op),
         Effect::WarpMouse { .. }
+        | Effect::LowerWindow { .. }
         | Effect::RequestRescan { .. }
         | Effect::SetIntercepting { .. } => None,
     }

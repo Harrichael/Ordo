@@ -13,6 +13,7 @@
 //! `_AXUIElementGetWindow`; elements without one (sheets, transient overlays)
 //! are skipped and never enter the model.
 
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ptr::NonNull;
 
@@ -42,6 +43,15 @@ pub struct AxScan {
 /// Enumerate every standard window of every regular (Dock-visible) app, plus
 /// which window currently has focus.
 pub fn scan() -> AxScan {
+    AxScan {
+        focused: focused_window(),
+        windows: windows(),
+    }
+}
+
+/// The window half of [`scan`], for callers who don't need focus (asking every
+/// app "are you frontmost?" is a second full round of IPC).
+pub fn windows() -> Vec<AxWindow> {
     let mut windows = Vec::new();
     let apps = NSWorkspace::sharedWorkspace().runningApplications();
     for app in apps.iter() {
@@ -77,10 +87,7 @@ pub fn scan() -> AxScan {
         }
     }
 
-    AxScan {
-        focused: focused_window(),
-        windows,
-    }
+    windows
 }
 
 fn read_window(win: *const AXUIElement, app: Pid, bundle_id: Option<String>) -> Option<AxWindow> {
@@ -254,6 +261,67 @@ pub fn focus(target: WindowId) -> bool {
     .is_some()
 }
 
+/// Raise `target` in the global z-order without touching focus or app
+/// activation — the building block for "send to back", which WindowServer
+/// won't do directly for foreign windows (SLSOrderWindow → error 1000 from a
+/// daemon connection): raising everything else above a window is the same
+/// thing, one raise at a time.
+pub fn raise(target: WindowId) -> bool {
+    with_window(target, |_app, win, _pid| unsafe {
+        let raise = CFString::from_str("AXRaise");
+        let _ = (*win).perform_action(&raise);
+    })
+    .is_some()
+}
+
+/// Raise many windows in exactly the given order (the last one ends up
+/// top-most among them). One walk over every app's window list instead of a
+/// re-enumeration per raise — the raises themselves must stay serial because
+/// each one's meaning depends on global order, unlike `set_frames`.
+pub fn raise_ordered(targets: &[WindowId]) {
+    // The window elements are borrowed from their app's AXWindows array, so
+    // every array stays alive until all raises are done.
+    let mut arrays: Vec<*const c_void> = Vec::new();
+    let mut found: HashMap<WindowId, *const AXUIElement> = HashMap::new();
+    let apps = NSWorkspace::sharedWorkspace().runningApplications();
+    for app in apps.iter() {
+        if app.activationPolicy() != NSApplicationActivationPolicy::Regular {
+            continue;
+        }
+        let pid = app.processIdentifier();
+        if pid <= 0 {
+            continue;
+        }
+        let el = unsafe { AXUIElement::new_application(pid) };
+        unsafe { el.set_messaging_timeout(MESSAGING_TIMEOUT_SECS) };
+        let Some(raw) = (unsafe { copy_attr(&el, "AXWindows") }) else {
+            continue;
+        };
+        arrays.push(raw);
+        unsafe {
+            for i in 0..super::cf::array_len(raw) {
+                let win = super::cf::array_get(raw, i) as *const AXUIElement;
+                if let Some(id) = window_id(win) {
+                    if targets.contains(&id) {
+                        found.insert(id, win);
+                    }
+                }
+            }
+        }
+    }
+    let raise = CFString::from_str("AXRaise");
+    for t in targets {
+        if let Some(win) = found.get(t) {
+            unsafe {
+                let _ = (**win).perform_action(&raise);
+            }
+        }
+    }
+    for raw in arrays {
+        unsafe { sys::CFRelease(raw) };
+    }
+}
+
 /// Move/resize `target` to `frame`. Uses the position -> size -> position idiom
 /// (apps clamp size to the *current* screen before a cross-display move lands,
 /// so a single set often misses) and brackets the writes with
@@ -273,6 +341,54 @@ pub fn set_frame(target: WindowId, frame: Rect) -> bool {
         }
     })
     .is_some()
+}
+
+/// Apply a batch of frame writes, grouped by owning app, one thread per app.
+///
+/// This exists because a switch is only as instant as its slowest serialization:
+/// one `set_frame` per window re-walks every app's window list per write, so a
+/// multi-window switch rippled visibly across the screen (and across monitors,
+/// one after the other). Grouping gives one walk per app; the per-app threads
+/// make the whole batch land in the time of the slowest *app*, not the sum of
+/// all writes. AX is just Mach IPC and safe off the main thread — each thread
+/// builds its own app element rather than sharing one.
+pub fn set_frames(writes: &[(Pid, WindowId, Rect)]) {
+    let mut by_app: HashMap<i32, Vec<(WindowId, Rect)>> = HashMap::new();
+    for (pid, w, f) in writes {
+        by_app.entry(pid.0).or_default().push((*w, *f));
+    }
+    std::thread::scope(|scope| {
+        for (pid, wins) in by_app {
+            scope.spawn(move || apply_app_frames(pid, &wins));
+        }
+    });
+}
+
+fn apply_app_frames(pid: i32, wins: &[(WindowId, Rect)]) {
+    let el = unsafe { AXUIElement::new_application(pid) };
+    unsafe { el.set_messaging_timeout(MESSAGING_TIMEOUT_SECS) };
+    let Some(raw) = (unsafe { copy_attr(&el, "AXWindows") }) else {
+        return;
+    };
+    // One EUI bracket around the whole app's batch, not one per window.
+    let restore_eui = unsafe { disable_enhanced_ui(&el) };
+    unsafe {
+        for i in 0..super::cf::array_len(raw) {
+            let win = super::cf::array_get(raw, i) as *const AXUIElement;
+            let Some(id) = window_id(win) else { continue };
+            let Some((_, frame)) = wins.iter().find(|(w, _)| *w == id) else {
+                continue;
+            };
+            let win = &*win;
+            set_point(win, "AXPosition", frame.x, frame.y);
+            set_size_attr(win, frame.w, frame.h);
+            set_point(win, "AXPosition", frame.x, frame.y);
+        }
+        if restore_eui {
+            set_bool(&el, "AXEnhancedUserInterface", true);
+        }
+        sys::CFRelease(raw);
+    }
 }
 
 /// Walk regular apps, and when the window whose id is `target` is found, run

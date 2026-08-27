@@ -24,6 +24,7 @@ pub mod observer;
 pub mod rescue_gather;
 pub mod skylight;
 pub mod tap;
+pub mod zorder;
 
 pub use effector::MacEffector;
 

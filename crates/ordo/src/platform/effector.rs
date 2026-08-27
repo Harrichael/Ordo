@@ -52,6 +52,10 @@ impl Effector for MacEffector {
                 mouse::warp_to(*to);
                 None
             }
+            Effect::LowerWindow { window } => {
+                super::zorder::send_to_back(*window);
+                None
+            }
             Effect::SetIntercepting { enabled } => {
                 self.intercepting.store(*enabled, Ordering::Relaxed);
                 None

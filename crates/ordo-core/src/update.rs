@@ -109,7 +109,59 @@ fn handle_hotkey(s: &mut State, action: HotkeyAction, fx: &mut Vec<Effect>) {
             });
         }
 
-        HotkeyAction::MruWorkspace | HotkeyAction::MruMonitor | HotkeyAction::MruApp => {
+        HotkeyAction::CarryFocusedToWorkspacePrev | HotkeyAction::CarryFocusedToWorkspaceNext => {
+            let Some(focused) = s.focused else {
+                return;
+            };
+            if !s.windows.contains_key(&focused) {
+                return;
+            }
+            let Some(cur) = s.current_workspace() else {
+                return;
+            };
+            let target = match action {
+                HotkeyAction::CarryFocusedToWorkspacePrev if cur.0 > 1 => WorkspaceId(cur.0 - 1),
+                HotkeyAction::CarryFocusedToWorkspaceNext if cur.0 < s.workspace_count => {
+                    WorkspaceId(cur.0 + 1)
+                }
+                _ => return, // clamped at the edge: nothing to do
+            };
+            // Reassign first, then switch: when the switch lands, the carried
+            // window is already a resident of the destination and comes along.
+            // Focus and frame don't change, so no FocusWindow and no WarpMouse.
+            let move_op = s.mint_op();
+            fx.push(Effect::MoveWindowToWorkspace {
+                op: move_op,
+                window: focused,
+                target,
+            });
+            s.pending.push(PendingOp {
+                op: move_op,
+                expect: Expectation::WindowOn {
+                    window: focused,
+                    workspace: target,
+                },
+                rescans_left: EXPECTATION_RESCANS,
+            });
+            let switch_op = s.mint_op();
+            fx.push(Effect::SwitchWorkspace {
+                op: switch_op,
+                target,
+            });
+            s.pending.push(PendingOp {
+                op: switch_op,
+                expect: Expectation::AllMonitorsOn(target),
+                rescans_left: EXPECTATION_RESCANS,
+            });
+            fx.push(Effect::RequestRescan {
+                reason: RescanTrigger::PostEffect { op: switch_op },
+            });
+        }
+
+        HotkeyAction::MruWorkspace
+        | HotkeyAction::MruMonitor
+        | HotkeyAction::MruApp
+        | HotkeyAction::MruOtherMonitor => {
             let Some(cur_ws) = s.current_workspace() else {
                 return;
             };
@@ -132,6 +184,9 @@ fn handle_hotkey(s: &mut State, action: HotkeyAction, fx: &mut Vec<Effect>) {
                         HotkeyAction::MruWorkspace => true,
                         HotkeyAction::MruMonitor => {
                             focused_rec.as_ref().is_some_and(|f| r.monitor == f.monitor)
+                        }
+                        HotkeyAction::MruOtherMonitor => {
+                            focused_rec.as_ref().is_some_and(|f| r.monitor != f.monitor)
                         }
                         HotkeyAction::MruApp => {
                             focused_rec.as_ref().is_some_and(|f| r.app == f.app)
@@ -186,6 +241,10 @@ fn handle_hotkey(s: &mut State, action: HotkeyAction, fx: &mut Vec<Effect>) {
             let op = s.mint_op();
             fx.push(Effect::FocusWindow { op, window: target });
             fx.push(Effect::WarpMouse { to: center });
+            // Bury it visually too, AFTER the focus: lowering works by raising
+            // everything else, and raises land below the key window — so the
+            // new focus must already be key when the raises fire.
+            fx.push(Effect::LowerWindow { window: focused });
             s.pending.push(PendingOp {
                 op,
                 expect: Expectation::Focused(target),

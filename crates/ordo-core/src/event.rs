@@ -60,12 +60,22 @@ pub enum HotkeyAction {
     MruMonitor,
     /// Alt+Backtick: MRU in the current workspace AND the focused app.
     MruApp,
+    /// Ctrl+Alt+Tab: MRU in the current workspace on any monitor EXCEPT the
+    /// focused one — "jump to what I was last doing over there".
+    MruOtherMonitor,
     /// Alt+End: banish the focused window to the back of the MRU history and
-    /// focus the next MRU window — "done with this one, stop offering it".
+    /// the back of the visual stack, and focus the next MRU window — "done
+    /// with this one, stop offering it (or showing it)".
     MruDemote,
     /// Cmd+Shift+Left/Right: the window moves and the "view" moves with it —
     /// focus stays on it and the mouse follows to its new center.
     MoveFocusedToOtherMonitor,
+    /// Ctrl+Cmd+Left/Right: carry the focused window to the adjacent workspace
+    /// and switch there with it. The window keeps its frame and its focus, so
+    /// the mouse has nowhere to follow — nothing on screen moves except the
+    /// scenery.
+    CarryFocusedToWorkspacePrev,
+    CarryFocusedToWorkspaceNext,
 }
 
 /// Why a rescan ran. Purely diagnostic except for `AxHint(WindowCreated)`,

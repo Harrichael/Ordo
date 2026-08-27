@@ -13,7 +13,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use ordo_core::{Rect, WindowId, WorkspaceId};
+use ordo_core::{Pid, Rect, WindowId, WorkspaceId};
 
 use crate::backend::{
     BackendError, BackendTopology, Capabilities, MonitorWorkspace, Result, WorkspaceBackend,
@@ -46,11 +46,10 @@ impl EmulatedBackend {
         }
     }
 
-    fn current_frames() -> HashMap<WindowId, Rect> {
-        ax::scan()
-            .windows
+    fn current_frames() -> HashMap<WindowId, (Pid, Rect)> {
+        ax::windows()
             .into_iter()
-            .map(|w| (w.id, w.frame))
+            .map(|w| (w.id, (w.app, w.frame)))
             .collect()
     }
 
@@ -66,25 +65,35 @@ impl EmulatedBackend {
         }
     }
 
-    fn park(&mut self, window: WindowId, frames: &HashMap<WindowId, Rect>) {
+    /// Bookkeep a park and return the frame write it requires, so a switch can
+    /// batch every write into one parallel pass instead of moving windows one
+    /// by one (which made multi-monitor switches visibly ripple).
+    fn park(
+        &mut self,
+        window: WindowId,
+        frames: &HashMap<WindowId, (Pid, Rect)>,
+    ) -> Option<(Pid, WindowId, Rect)> {
         // Save the real frame only on the transition onto-screen -> parked; a
         // window already parked keeps its original saved frame rather than
         // recording the sliver position.
         if self.parked.contains(&window) {
-            return;
+            return None;
         }
-        if let Some(f) = frames.get(&window) {
-            self.saved.insert(window, *f);
-            self.parked.insert(window);
-            ax::set_frame(window, Self::park_frame(*f));
-        }
+        let (pid, f) = frames.get(&window)?;
+        self.saved.insert(window, *f);
+        self.parked.insert(window);
+        Some((*pid, window, Self::park_frame(*f)))
     }
 
-    fn restore(&mut self, window: WindowId) {
+    fn restore(
+        &mut self,
+        window: WindowId,
+        frames: &HashMap<WindowId, (Pid, Rect)>,
+    ) -> Option<(Pid, WindowId, Rect)> {
         self.parked.remove(&window);
-        if let Some(f) = self.saved.get(&window) {
-            ax::set_frame(window, *f);
-        }
+        let (pid, _) = frames.get(&window)?;
+        let f = self.saved.get(&window)?;
+        Some((*pid, window, *f))
     }
 }
 
@@ -119,34 +128,34 @@ impl WorkspaceBackend for EmulatedBackend {
             return Ok(());
         }
         let frames = Self::current_frames();
+        let mut writes = Vec::new();
         for w in plan.park {
-            self.park(w, &frames);
+            writes.extend(self.park(w, &frames));
         }
         for w in plan.restore {
-            self.restore(w);
+            writes.extend(self.restore(w, &frames));
         }
+        ax::set_frames(&writes);
         Ok(())
     }
 
     fn move_window_to_workspace(&mut self, window: WindowId, target: WorkspaceId) -> Result<()> {
-        match self.ledger.assign_window(window, target) {
-            Some(MoveAction::Park) => {
-                let frames = Self::current_frames();
-                self.park(window, &frames);
-                Ok(())
-            }
-            Some(MoveAction::Restore) => {
-                self.restore(window);
-                Ok(())
-            }
-            None => Err(BackendError(format!("workspace {} out of range", target.0))),
-        }
+        let frames = Self::current_frames();
+        let write = match self.ledger.assign_window(window, target) {
+            Some(MoveAction::Park) => self.park(window, &frames),
+            Some(MoveAction::Restore) => self.restore(window, &frames),
+            None => return Err(BackendError(format!("workspace {} out of range", target.0))),
+        };
+        ax::set_frames(write.as_slice());
+        Ok(())
     }
 
     fn rescue_window(&mut self, window: WindowId) -> Result<()> {
         // Claim it for the visible workspace and bring it back on-screen.
+        let frames = Self::current_frames();
         self.ledger.assign_window(window, self.ledger.current());
-        self.restore(window);
+        let write = self.restore(window, &frames);
+        ax::set_frames(write.as_slice());
         Ok(())
     }
 

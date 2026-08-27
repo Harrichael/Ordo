@@ -274,6 +274,38 @@ fn alt_shift_tab_stays_on_the_focused_monitor() {
 }
 
 #[test]
+fn ctrl_alt_tab_jumps_to_the_mru_window_on_the_other_monitor() {
+    let s = booted(&[3, 2, 1]); // focused w1 on A; w2 lives on B, w3 on A
+    let step = update(&s, &hotkey(HotkeyAction::MruOtherMonitor));
+    assert_eq!(focus_targets(&step.effects), vec![wid(2)]);
+    // The mouse crosses over with the focus, to w2's center.
+    assert!(step
+        .effects
+        .iter()
+        .any(|e| matches!(e, Effect::WarpMouse { to } if to.x == 2200.0 && to.y == 250.0)));
+
+    // With every window on the focused monitor there's nowhere to jump.
+    let all_on_a = vec![
+        win(1, 100, 1, rect(100.0, 100.0)),
+        win(2, 200, 1, rect(500.0, 100.0)), // w2 moved over to A
+        win(3, 100, 1, rect(600.0, 500.0)),
+    ];
+    let same_side = update(
+        &booted(&[1]),
+        &observed(
+            vec![mon_a(1), mon_b(1)],
+            all_on_a,
+            Some(1),
+            RescanTrigger::Periodic,
+        ),
+    )
+    .state;
+    assert!(update(&same_side, &hotkey(HotkeyAction::MruOtherMonitor))
+        .effects
+        .is_empty());
+}
+
+#[test]
 fn alt_backtick_stays_in_the_focused_app() {
     let s = booted(&[3, 2, 1]); // focused w1 (pid 100); w2 is MRU but pid 200
     let step = update(&s, &hotkey(HotkeyAction::MruApp));
@@ -603,6 +635,20 @@ fn demote_banishes_the_focused_window_and_moves_on() {
     // …and the demoted window sits at the very back of the history.
     assert_eq!(step.state.focus_history.iter().last(), Some(wid(1)));
 
+    // It's buried visually too — and only after the focus handoff, because
+    // lowering raises everything else, and raises land below the key window.
+    let lower_pos = step
+        .effects
+        .iter()
+        .position(|e| matches!(e, Effect::LowerWindow { window } if *window == wid(1)))
+        .expect("lower effect");
+    let focus_pos = step
+        .effects
+        .iter()
+        .position(|e| matches!(e, Effect::FocusWindow { .. }))
+        .unwrap();
+    assert!(focus_pos < lower_pos);
+
     // Once the world confirms focus on 2, Alt+Tab toggles 2 <-> 3: the
     // demoted window stopped being offered.
     let confirmed = update(
@@ -650,6 +696,73 @@ fn move_focused_window_to_other_monitor_brings_the_mouse() {
         .effects
         .iter()
         .any(|e| matches!(e, Effect::WarpMouse { to } if *to == center)));
+}
+
+#[test]
+fn carry_moves_the_focused_window_and_switches_with_it() {
+    let s = booted(&[1]);
+    let step = update(&s, &hotkey(HotkeyAction::CarryFocusedToWorkspaceNext));
+
+    // The window is reassigned, then the view follows: move before switch.
+    let kinds: Vec<&Effect> = step.effects.iter().collect();
+    let move_pos = kinds
+        .iter()
+        .position(|e| {
+            matches!(e, Effect::MoveWindowToWorkspace { window, target, .. }
+                if *window == wid(1) && *target == ws(2))
+        })
+        .expect("move effect");
+    let switch_pos = kinds
+        .iter()
+        .position(|e| matches!(e, Effect::SwitchWorkspace { target, .. } if *target == ws(2)))
+        .expect("switch effect");
+    assert!(move_pos < switch_pos, "reassign before the view follows");
+
+    // The window stays put on screen and keeps focus: no frame write, no
+    // focus effect, no mouse warp.
+    assert_eq!(count_set_frames(&step.effects, 1), 0);
+    assert!(focus_targets(&step.effects).is_empty());
+    assert!(!step
+        .effects
+        .iter()
+        .any(|e| matches!(e, Effect::WarpMouse { .. })));
+    assert_eq!(step.state.pending.len(), 2, "move + switch both expected");
+
+    // Both expectations confirm from one snapshot of the settled world.
+    let settled = vec![
+        win(1, 100, 2, rect(100.0, 100.0)),
+        win(2, 200, 1, rect(2000.0, 100.0)),
+        win(3, 100, 1, rect(600.0, 500.0)),
+    ];
+    let obs = update(
+        &step.state,
+        &observed(
+            vec![mon_a(2), mon_b(2)],
+            settled,
+            Some(1),
+            RescanTrigger::PostEffect { op: OpId(2) },
+        ),
+    );
+    assert!(obs.state.pending.is_empty());
+    assert!(!obs.notes.iter().any(|n| matches!(n, Note::External { .. })));
+}
+
+#[test]
+fn carry_at_the_edge_or_with_nothing_focused_does_nothing() {
+    let s = booted(&[1]); // on workspace 1: prev is clamped
+    assert!(
+        update(&s, &hotkey(HotkeyAction::CarryFocusedToWorkspacePrev))
+            .effects
+            .is_empty()
+    );
+
+    let unfocused = booted(&[]);
+    assert!(update(
+        &unfocused,
+        &hotkey(HotkeyAction::CarryFocusedToWorkspaceNext)
+    )
+    .effects
+    .is_empty());
 }
 
 // --- review fixes --------------------------------------------------------------

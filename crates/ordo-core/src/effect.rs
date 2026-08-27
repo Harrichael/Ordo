@@ -39,6 +39,12 @@ pub enum Effect {
     WarpMouse {
         to: Point,
     },
+    /// Push a window to the visual back of the z-stack. Fire-and-forget like
+    /// `WarpMouse`: z-order is not part of the core's belief (snapshots don't
+    /// carry it), so there is no op and no expectation — nothing to verify.
+    LowerWindow {
+        window: WindowId,
+    },
     /// Ask the shell to enumerate and deliver a fresh `WorldObserved`. Emitted
     /// after every mutation so ops get confirmed promptly instead of waiting
     /// for the periodic tick.
