@@ -1,0 +1,443 @@
+use serde::{Deserialize, Serialize};
+
+use crate::effect::{Effect, Expectation};
+use crate::event::{AxHintKind, Event, HotkeyAction, OpOutcome, RescanTrigger, WorldSnapshot};
+use crate::ids::{OpId, WindowId, WorkspaceId, FRAME_EPSILON};
+use crate::reconcile::{self, Delta};
+use crate::state::{Mode, PendingOp, State};
+
+/// Snapshots an expectation survives unmet before it's declared lost. Three
+/// covers the post-effect rescan plus slop for a slow executor without letting
+/// a dead op suppress external-change attribution for long.
+const EXPECTATION_RESCANS: u8 = 3;
+
+/// Correctives per window (and per tear episode) before we stop fighting and
+/// log instead. An app that re-places its own window wins after this many
+/// rounds — divergence becomes a loud log line, never an effect loop.
+const DAMPING_LIMIT: u8 = 3;
+
+/// The result of one pure step. `notes` are deterministic diagnostics — the
+/// core's explanation of what it concluded (echo vs external, ops lost,
+/// divergence). They exist for the log and for replay assertions; the shell
+/// executes nothing from them.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Step {
+    pub state: State,
+    pub effects: Vec<Effect>,
+    pub notes: Vec<Note>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum Note {
+    /// A snapshot confirmed the post-condition of our own op.
+    SelfConfirmed { op: OpId },
+    /// An op's expectation expired unconfirmed.
+    OpLost { op: OpId },
+    /// The executor reported failure; the pending expectation was dropped.
+    OpFailed { op: OpId, detail: String },
+    /// A change we didn't cause. Belief absorbed it.
+    External { delta: Delta },
+    /// Monitors disagreed on workspace without an in-flight switch of ours.
+    TearDetected { target: WorkspaceId },
+    /// Tear realignment hit the damping limit; we stopped re-aligning.
+    TearPersisting,
+    /// Placement of this window hit the damping limit; we stopped correcting.
+    Diverged { window: WindowId },
+}
+
+pub fn update(state: &State, event: &Event) -> Step {
+    let mut s = state.clone();
+    let mut effects = Vec::new();
+    let mut notes = Vec::new();
+
+    match event {
+        Event::Hotkey { action, .. } => {
+            if s.mode == Mode::Active {
+                handle_hotkey(&mut s, *action, &mut effects);
+            }
+        }
+        Event::WorldObserved { trigger, snap, .. } => {
+            handle_snapshot(state, &mut s, trigger, snap, &mut effects, &mut notes);
+        }
+        Event::EffectResult { op, outcome, .. } => {
+            handle_effect_result(&mut s, *op, outcome, &mut notes);
+        }
+        Event::RescueEngaged { .. } => {
+            s.mode = Mode::Rescued;
+            // Ops in flight will never be verified or retried again; keeping
+            // them would only misattribute their late echoes.
+            s.pending.clear();
+            // The tap already stopped intercepting on its own fast path; this
+            // records the same intent from the core's side and is idempotent.
+            effects.push(Effect::SetIntercepting { enabled: false });
+        }
+    }
+
+    Step {
+        state: s,
+        effects,
+        notes,
+    }
+}
+
+fn handle_hotkey(s: &mut State, action: HotkeyAction, fx: &mut Vec<Effect>) {
+    match action {
+        HotkeyAction::WorkspacePrev | HotkeyAction::WorkspaceNext => {
+            let Some(cur) = s.current_workspace() else {
+                return;
+            };
+            let target = match action {
+                HotkeyAction::WorkspacePrev if cur.0 > 1 => WorkspaceId(cur.0 - 1),
+                HotkeyAction::WorkspaceNext if cur.0 < s.workspace_count => WorkspaceId(cur.0 + 1),
+                _ => return, // clamped at the edge: nothing to do
+            };
+            let op = s.mint_op();
+            fx.push(Effect::SwitchWorkspace { op, target });
+            s.pending.push(PendingOp {
+                op,
+                expect: Expectation::AllMonitorsOn(target),
+                rescans_left: EXPECTATION_RESCANS,
+            });
+            fx.push(Effect::RequestRescan {
+                reason: RescanTrigger::PostEffect { op },
+            });
+        }
+
+        HotkeyAction::MruWorkspace | HotkeyAction::MruMonitor | HotkeyAction::MruApp => {
+            let Some(cur_ws) = s.current_workspace() else {
+                return;
+            };
+            let focused_rec = s.focused.and_then(|w| s.windows.get(&w)).cloned();
+            // The scoped variants are relative to the focused window; with
+            // nothing focused there is no "same monitor/app" to speak of.
+            if focused_rec.is_none() && action != HotkeyAction::MruWorkspace {
+                return;
+            }
+            let target = {
+                let windows = &s.windows;
+                s.focus_history.most_recent(s.focused, |w| {
+                    let Some(r) = windows.get(&w) else {
+                        return false;
+                    };
+                    if r.workspace != cur_ws {
+                        return false;
+                    }
+                    match action {
+                        HotkeyAction::MruWorkspace => true,
+                        HotkeyAction::MruMonitor => {
+                            focused_rec.as_ref().is_some_and(|f| r.monitor == f.monitor)
+                        }
+                        HotkeyAction::MruApp => {
+                            focused_rec.as_ref().is_some_and(|f| r.app == f.app)
+                        }
+                        _ => unreachable!(),
+                    }
+                })
+            };
+            let Some(target) = target else {
+                return;
+            };
+            let center = s.windows[&target].frame.center();
+            let op = s.mint_op();
+            fx.push(Effect::FocusWindow { op, window: target });
+            // Warp optimistically off our own belief of the frame rather than
+            // waiting for the focus to be observed — a mouse that lags its
+            // window by a rescan round-trip feels broken. The mouse follows
+            // Ordo-initiated switches only; warping on external focus changes
+            // (the user clicking a window!) would fight the pointer.
+            fx.push(Effect::WarpMouse { to: center });
+            s.pending.push(PendingOp {
+                op,
+                expect: Expectation::Focused(target),
+                rescans_left: EXPECTATION_RESCANS,
+            });
+            fx.push(Effect::RequestRescan {
+                reason: RescanTrigger::PostEffect { op },
+            });
+        }
+
+        HotkeyAction::MoveFocusedToOtherMonitor => {
+            let Some(focused) = s.focused else {
+                return;
+            };
+            let Some(rec) = s.windows.get(&focused).cloned() else {
+                return;
+            };
+            let order = s.monitors_by_position();
+            if order.len() < 2 {
+                return;
+            }
+            let Some(i) = order.iter().position(|m| *m == rec.monitor) else {
+                return;
+            };
+            let to_id = order[(i + 1) % order.len()];
+            let (Some(from_mon), Some(to_mon)) =
+                (s.monitors.get(&rec.monitor), s.monitors.get(&to_id))
+            else {
+                return;
+            };
+            let frame = rec.frame.translate_between(&from_mon.frame, &to_mon.frame);
+            let op = s.mint_op();
+            fx.push(Effect::SetWindowFrame {
+                op,
+                window: focused,
+                frame,
+            });
+            fx.push(Effect::WarpMouse { to: frame.center() });
+            s.pending.push(PendingOp {
+                op,
+                expect: Expectation::WindowFramed {
+                    window: focused,
+                    frame,
+                },
+                rescans_left: EXPECTATION_RESCANS,
+            });
+            fx.push(Effect::RequestRescan {
+                reason: RescanTrigger::PostEffect { op },
+            });
+        }
+    }
+}
+
+fn handle_snapshot(
+    pre: &State,
+    s: &mut State,
+    trigger: &RescanTrigger,
+    snap: &WorldSnapshot,
+    fx: &mut Vec<Effect>,
+    notes: &mut Vec<Note>,
+) {
+    // The user's focus context from BEFORE this observation: a new window that
+    // steals focus must not get to define where it "should" be.
+    let anchor_ws = pre.current_workspace();
+    let anchor_mon = pre.focused_monitor();
+    let entry_expectations: Vec<Expectation> =
+        pre.pending.iter().map(|p| p.expect.clone()).collect();
+
+    let deltas = reconcile::diff(pre, snap);
+    reconcile::apply_snapshot(s, snap);
+
+    // Resolve or age expectations against the fresh belief.
+    let mut expired: Vec<PendingOp> = Vec::new();
+    let mut still_pending: Vec<PendingOp> = Vec::new();
+    for mut p in std::mem::take(&mut s.pending) {
+        if expectation_satisfied(&p.expect, s) {
+            notes.push(Note::SelfConfirmed { op: p.op });
+            // The world accepted this placement: the fight (if any) is over.
+            if let Some(w) = p.expect.window() {
+                if let Some(r) = s.windows.get_mut(&w) {
+                    r.corrections = 0;
+                }
+            }
+        } else {
+            p.rescans_left = p.rescans_left.saturating_sub(1);
+            if p.rescans_left == 0 {
+                notes.push(Note::OpLost { op: p.op });
+                expired.push(p);
+            } else {
+                still_pending.push(p);
+            }
+        }
+    }
+    s.pending = still_pending;
+
+    for d in &deltas {
+        // Title churn is constant (terminals, browsers) and never actionable;
+        // it lives in the snapshot itself if anyone needs it.
+        if matches!(d, Delta::TitleChanged(_)) {
+            continue;
+        }
+        if entry_expectations.iter().any(|e| reconcile::explains(e, d)) {
+            continue;
+        }
+        notes.push(Note::External { delta: d.clone() });
+    }
+
+    if s.mode == Mode::Rescued {
+        return;
+    }
+
+    let mut last_op: Option<OpId> = None;
+
+    // A placement op that expired while the window still sits in violation
+    // gets retried — apps often re-apply their own autosaved frame after we
+    // move them — but only under the damping limit.
+    for p in expired {
+        match p.expect {
+            Expectation::WindowOn { window, workspace }
+                if s.windows
+                    .get(&window)
+                    .is_some_and(|r| r.workspace != workspace) =>
+            {
+                correct_window(s, window, notes, &mut last_op, fx, |op| {
+                    (
+                        Effect::MoveWindowToWorkspace {
+                            op,
+                            window,
+                            target: workspace,
+                        },
+                        Expectation::WindowOn { window, workspace },
+                    )
+                });
+            }
+            Expectation::WindowFramed { window, frame }
+                if s.windows
+                    .get(&window)
+                    .is_some_and(|r| !r.frame.approx_eq(&frame, FRAME_EPSILON)) =>
+            {
+                correct_window(s, window, notes, &mut last_op, fx, |op| {
+                    (
+                        Effect::SetWindowFrame { op, window, frame },
+                        Expectation::WindowFramed { window, frame },
+                    )
+                });
+            }
+            _ => {}
+        }
+    }
+
+    // New-window corralling: only the creation hint authorizes it (a plain
+    // rescan can't tell "new" from "previously missed" — see RescanTrigger).
+    if let RescanTrigger::AxHint {
+        pid,
+        kind: AxHintKind::WindowCreated,
+    } = trigger
+    {
+        if let (Some(anchor_ws), Some(anchor_mon)) = (anchor_ws, anchor_mon) {
+            for d in &deltas {
+                let Delta::WindowCreated(w) = d else { continue };
+                let Some(rec) = s.windows.get(w).cloned() else {
+                    continue;
+                };
+                if pid.is_some_and(|p| rec.app != p) {
+                    continue;
+                }
+                if rec.workspace != anchor_ws {
+                    let window = *w;
+                    correct_window(s, window, notes, &mut last_op, fx, |op| {
+                        (
+                            Effect::MoveWindowToWorkspace {
+                                op,
+                                window,
+                                target: anchor_ws,
+                            },
+                            Expectation::WindowOn {
+                                window,
+                                workspace: anchor_ws,
+                            },
+                        )
+                    });
+                }
+                if rec.monitor != anchor_mon {
+                    if let (Some(from_mon), Some(to_mon)) =
+                        (s.monitors.get(&rec.monitor), s.monitors.get(&anchor_mon))
+                    {
+                        let frame = rec.frame.translate_between(&from_mon.frame, &to_mon.frame);
+                        let window = *w;
+                        correct_window(s, window, notes, &mut last_op, fx, |op| {
+                            (
+                                Effect::SetWindowFrame { op, window, frame },
+                                Expectation::WindowFramed { window, frame },
+                            )
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // Tear re-alignment: the product invariant is that a workspace spans all
+    // monitors, so an externally-swiped display gets pulled back to the
+    // focused monitor's workspace. In-flight switches legitimately tear for a
+    // snapshot or two — the pending guard keeps us from double-switching.
+    if !s.is_torn() {
+        s.tear_corrections = 0;
+    } else if !s
+        .pending
+        .iter()
+        .any(|p| matches!(p.expect, Expectation::AllMonitorsOn(_)))
+    {
+        if s.tear_corrections < DAMPING_LIMIT {
+            if let Some(target) = s.current_workspace() {
+                let op = s.mint_op();
+                fx.push(Effect::SwitchWorkspace { op, target });
+                s.pending.push(PendingOp {
+                    op,
+                    expect: Expectation::AllMonitorsOn(target),
+                    rescans_left: EXPECTATION_RESCANS,
+                });
+                notes.push(Note::TearDetected { target });
+                s.tear_corrections += 1;
+                last_op = Some(op);
+            }
+        } else if s.tear_corrections == DAMPING_LIMIT {
+            notes.push(Note::TearPersisting);
+            // Saturate so the note fires once per episode, not per snapshot.
+            s.tear_corrections += 1;
+        }
+    }
+
+    if let Some(op) = last_op {
+        fx.push(Effect::RequestRescan {
+            reason: RescanTrigger::PostEffect { op },
+        });
+    }
+}
+
+/// Emit a placement corrective for `window` unless it has hit the damping
+/// limit, in which case note the divergence and stand down.
+fn correct_window(
+    s: &mut State,
+    window: WindowId,
+    notes: &mut Vec<Note>,
+    last_op: &mut Option<OpId>,
+    fx: &mut Vec<Effect>,
+    build: impl FnOnce(OpId) -> (Effect, Expectation),
+) {
+    let corrections = s.windows.get(&window).map_or(0, |r| r.corrections);
+    if corrections >= DAMPING_LIMIT {
+        notes.push(Note::Diverged { window });
+        return;
+    }
+    let op = s.mint_op();
+    let (effect, expect) = build(op);
+    fx.push(effect);
+    s.pending.push(PendingOp {
+        op,
+        expect,
+        rescans_left: EXPECTATION_RESCANS,
+    });
+    if let Some(r) = s.windows.get_mut(&window) {
+        r.corrections += 1;
+    }
+    *last_op = Some(op);
+}
+
+fn handle_effect_result(s: &mut State, op: OpId, outcome: &OpOutcome, notes: &mut Vec<Note>) {
+    let detail = match outcome {
+        OpOutcome::Ok => return, // success is confirmed by observation, not by the executor
+        OpOutcome::Failed { detail } => detail.clone(),
+        OpOutcome::Timeout => "timeout".to_string(),
+    };
+    if let Some(i) = s.pending.iter().position(|p| p.op == op) {
+        s.pending.remove(i);
+    }
+    notes.push(Note::OpFailed { op, detail });
+}
+
+fn expectation_satisfied(e: &Expectation, s: &State) -> bool {
+    match e {
+        Expectation::AllMonitorsOn(t) => {
+            !s.monitor_ws.is_empty() && s.monitor_ws.values().all(|w| w == t)
+        }
+        Expectation::WindowOn { window, workspace } => s
+            .windows
+            .get(window)
+            .is_some_and(|r| r.workspace == *workspace),
+        Expectation::WindowFramed { window, frame } => s
+            .windows
+            .get(window)
+            .is_some_and(|r| r.frame.approx_eq(frame, FRAME_EPSILON)),
+        Expectation::Focused(w) => s.focused == Some(*w),
+    }
+}

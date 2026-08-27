@@ -1,0 +1,7 @@
+[package]
+name = "ordo"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ordo-core = { path = "../ordo-core" }
