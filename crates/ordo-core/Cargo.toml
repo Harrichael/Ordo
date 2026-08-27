@@ -1,0 +1,12 @@
+[package]
+name = "ordo-core"
+version = "0.1.0"
+edition = "2021"
+
+# PURE crate: no OS bindings, no clock, no threads, no I/O. The pure/impure
+# boundary of the project is this crate boundary — see src/lib.rs.
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"
