@@ -70,10 +70,28 @@ Follow-ups:
   belief for a parked window is its sliver position, so the warp would aim at
   the bottom-right corner. Fix: warp on the post-switch confirmation snapshot,
   once the restored frame is believed.
-- The switch's stacking reassert raises every restored window serially (one
-  AXRaise per window, order-dependent so unparallelizable). If big workspaces
-  make switches feel sluggish, compute the minimal raise set instead: keep the
-  longest already-ordered subsequence, raise only the rest.
+- The switch's stacking reassert is sequenced: each AXRaise is confirmed
+  landed (CG read-back) before the next is issued — the only way cross-app
+  ordering is deterministic, since apps apply raises on their own schedule
+  and no WindowServer-side bulk ordering survives SIP (probed: SLSOrderWindow
+  refused; SLPS bursts coalesce to the last call — slps_order_probe.rs).
+  Cost: a switch pays the true AX latency of each misordered window's app,
+  serially (measured: ~10ms/window typical, ~370ms worst-case full reversal
+  across 7 windows incl. Chrome). Already-ordered bottom suffixes are
+  skipped. If it ever feels slow, the lever is raising fewer windows (e.g.
+  only the top K of the MRU), not more parallelism.
+- Stacking research notes (from alt-tab-macos / yabai / Hammerspoon source
+  dive, 2026-08-27): no WindowServer-side reorder of foreign windows exists
+  with SIP on — yabai injects into Dock for SLSTransactionOrderWindowGroup,
+  alt-tab probed CGSOrderWindow ("does nothing"), Hammerspoon's sendToBack is
+  focus-each + 80ms sleeps. Only windows OUR connection creates can be
+  ordered relative to foreign ones (JankyBorders pattern) — the route to
+  proxy-window switch animations if ever wanted. Zero-poll upgrade for both
+  the reassert's landing gates and the space watcher:
+  SLSRequestNotificationsForWindows (event ids 804/1325/1326, alt-tab's
+  WindowServerEvents.swift). If Ordo ever drives native Spaces again:
+  SLPSSetFrontProcessWithOptions clobbers other Spaces' front-process memory
+  (alt-tab #4507, repair = SLSSpaceSetFrontPSN).
 - Follow-the-focus is unconditional: an app self-activating on a hidden
   workspace (Slack notification, Xcode build-done) yanks the user over, same
   as native Spaces does. If that annoys, add damping or an allowlist.

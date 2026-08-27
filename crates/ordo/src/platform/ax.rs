@@ -309,11 +309,13 @@ pub fn unhide_all_apps() {
     }
 }
 
-/// Raise many windows in exactly the given order (the last one ends up
-/// top-most among them). One walk over every app's window list instead of a
-/// re-enumeration per raise — the raises themselves must stay serial because
-/// each one's meaning depends on global order, unlike `set_frames`.
-pub fn raise_ordered(targets: &[WindowId]) {
+/// Raise `targets` in exactly the given order, invoking `after_each` between
+/// raises. The callback is the caller's chance to WAIT for the raise to
+/// actually land (AXRaise is acknowledged by the app but applied on its own
+/// schedule — issuing the next raise before the previous landed is how
+/// cross-app stacking turns into a race). One walk collects every element up
+/// front; the borrowed arrays stay alive for the whole sequence.
+pub fn raise_sequenced(targets: &[WindowId], mut after_each: impl FnMut(WindowId)) {
     // The window elements are borrowed from their app's AXWindows array, so
     // every array stays alive until all raises are done.
     let mut arrays: Vec<*const c_void> = Vec::new();
@@ -350,6 +352,7 @@ pub fn raise_ordered(targets: &[WindowId]) {
             unsafe {
                 let _ = (**win).perform_action(&raise);
             }
+            after_each(*t);
         }
     }
     for raw in arrays {
