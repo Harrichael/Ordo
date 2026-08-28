@@ -27,6 +27,10 @@ use super::{ax, display};
 /// manual escape hatch if Ordo dies mid-park.
 const SLIVER: f64 = 1.0;
 
+/// Re-parks of a phantom before we stop fighting it (mirrors the core's
+/// correction damping): an app that insists on being visible wins, loudly.
+const ENFORCE_LIMIT: u8 = 3;
+
 pub struct EmulatedBackend {
     ledger: Ledger,
     /// On-screen frame to restore each parked window to.
@@ -35,6 +39,8 @@ pub struct EmulatedBackend {
     /// already-parked window (a hidden->hidden move) doesn't overwrite its real
     /// saved frame with the sliver position.
     parked: HashSet<WindowId>,
+    /// Phantom re-parks issued per window since it last sat parked correctly.
+    enforce_attempts: HashMap<WindowId, u8>,
 }
 
 impl EmulatedBackend {
@@ -43,6 +49,7 @@ impl EmulatedBackend {
             ledger: Ledger::new(count),
             saved: HashMap::new(),
             parked: HashSet::new(),
+            enforce_attempts: HashMap::new(),
         }
     }
 
@@ -82,6 +89,7 @@ impl EmulatedBackend {
         let (pid, f) = frames.get(&window)?;
         self.saved.insert(window, *f);
         self.parked.insert(window);
+        self.enforce_attempts.remove(&window);
         Some((*pid, window, Self::park_frame(*f)))
     }
 
@@ -91,6 +99,7 @@ impl EmulatedBackend {
         frames: &HashMap<WindowId, (Pid, Rect)>,
     ) -> Option<(Pid, WindowId, Rect)> {
         self.parked.remove(&window);
+        self.enforce_attempts.remove(&window);
         let (pid, _) = frames.get(&window)?;
         let f = self.saved.get(&window)?;
         Some((*pid, window, *f))
@@ -181,6 +190,34 @@ impl WorkspaceBackend for EmulatedBackend {
         ax::set_frames(write.as_slice());
         self.apply_app_visibility(&frames);
         Ok(())
+    }
+
+    fn enforce_placement(&mut self, frames: &HashMap<WindowId, (Pid, Rect)>) {
+        let mut writes = Vec::new();
+        for &w in &self.parked {
+            let Some((pid, f)) = frames.get(&w) else {
+                continue;
+            };
+            let want = Self::park_frame(*f);
+            // Position is the parked invariant; size is the window's own.
+            if (f.x - want.x).abs() <= 1.0 && (f.y - want.y).abs() <= 1.0 {
+                self.enforce_attempts.remove(&w);
+                continue;
+            }
+            // A freshly issued park looks like a phantom until the app applies
+            // it, so the first "attempt" is usually just that write landing;
+            // the budget exists for the window that never complies.
+            let n = self.enforce_attempts.entry(w).or_insert(0);
+            if *n >= ENFORCE_LIMIT {
+                continue;
+            }
+            *n += 1;
+            if *n > 1 {
+                eprintln!("ordo: re-parking phantom window {} (attempt {n})", w.0);
+            }
+            writes.push((*pid, w, want));
+        }
+        ax::set_frames(&writes);
     }
 
     fn rescue_window(&mut self, window: WindowId) -> Result<()> {

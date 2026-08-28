@@ -130,7 +130,42 @@ extern "C" {
     /// two "make key window" records are what complete the focus handoff.
     /// The byte layout is yabai's reverse-engineered recipe.
     pub fn SLPSPostEventRecordTo(psn: *const ProcessSerialNumber, bytes: *const u8) -> i32;
+
+    /// Ask WindowServer to push `event` (a raw notification code) to `proc`.
+    /// Confirmed live on Tahoe (examples/raise_notify_probe.rs): 808 fires
+    /// per focused-or-raised window — including a pure background AXRaise —
+    /// 815/816 per order-in/out, 1329/1401 on Space changes. Delivery has two
+    /// more mandatory parts beyond this registration: at least one window
+    /// opted in via `SLSRequestNotificationsForWindows`, and a running
+    /// NSApplication event loop (`[NSApp run]`) — the datagrams arrive
+    /// through AppKit's connection machinery, and a bare CFRunLoop receives
+    /// NOTHING (measured; yabai ends its main with `[NSApp run]` for this).
+    pub fn SLSRegisterConnectionNotifyProc(
+        cid: CgsConnectionId,
+        proc_: SlsNotifyProc,
+        event: u32,
+        context: *mut c_void,
+    ) -> c_int;
+
+    /// Opt this connection into per-window notifications for `windows`.
+    /// REPLACES the connection's watch list — it does not add to it (alt-tab
+    /// measured the failure: sending only deltas silences every previously
+    /// watched window while connection-wide events keep flowing). There is no
+    /// unsubscribe symbol; dropping an id from the next full-set call is the
+    /// only removal.
+    pub fn SLSRequestNotificationsForWindows(
+        cid: CgsConnectionId,
+        windows: *const u32,
+        count: c_int,
+    ) -> c_int;
 }
+
+/// The notify-proc shape per alt-tab's verified decl: (event id, payload,
+/// payload length, context, connection id). Payloads carry the window id in
+/// the first 4 bytes LE; the Space-membership events prepend an 8-byte space
+/// id. Called on whichever thread receives the datagram (AppKit's event
+/// thread) — handlers must extract integers and return.
+pub type SlsNotifyProc = unsafe extern "C" fn(u32, *mut c_void, usize, *mut c_void, c_int);
 
 /// Carbon's process identity, needed only for `_SLPSSetFrontProcessWithMode`.
 #[repr(C)]

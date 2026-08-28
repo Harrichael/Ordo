@@ -16,6 +16,16 @@ const EXPECTATION_RESCANS: u8 = 3;
 /// rounds — divergence becomes a loud log line, never an effect loop.
 const DAMPING_LIMIT: u8 = 3;
 
+/// How long after a switch its focus fallout is still presumed in flight.
+/// Expectations can't cover this: they're one-shot (kitty delivered a
+/// DUPLICATE activation 520ms after its grant — run 38 seq 1410 — after the
+/// first arrival had already consumed the expectation) and they expire on a
+/// rescan count, which event-driven hints have compressed to well under the
+/// measured ~1.6s app landing tail. A blanket wall-clock cap is the blunt but
+/// safe answer; sharper schemes (per-window fallout horizon with early
+/// expiry) are sketched in issues.txt if the lost-follow cost ever shows up.
+const FOCUS_SETTLE_NS: u64 = 2_000_000_000;
+
 /// The result of one pure step. `notes` are deterministic diagnostics — the
 /// core's explanation of what it concluded (echo vs external, ops lost,
 /// divergence). They exist for the log and for replay assertions; the shell
@@ -46,6 +56,10 @@ pub enum Note {
     /// Focus fell onto a hidden workspace as fallout from a window closing;
     /// instead of following, focus was pulled back to this window here.
     HeldFocusOnClose { window: WindowId },
+    /// Focus fell onto a hidden workspace inside the post-switch settle
+    /// window — read as our own grant's late echo, not navigation; focus was
+    /// pulled back to this window here.
+    HeldFocusSettling { window: WindowId },
     /// Monitors disagreed on workspace without an in-flight switch of ours.
     TearDetected { target: WorkspaceId },
     /// Tear realignment hit the damping limit; we stopped re-aligning.
@@ -60,13 +74,21 @@ pub fn update(state: &State, event: &Event) -> Step {
     let mut notes = Vec::new();
 
     match event {
-        Event::Hotkey { action, .. } => {
+        Event::Hotkey { at, action } => {
             if s.mode == Mode::Active {
-                handle_hotkey(&mut s, *action, &mut effects);
+                handle_hotkey(&mut s, *action, at.mono_ns, &mut effects);
             }
         }
-        Event::WorldObserved { trigger, snap, .. } => {
-            handle_snapshot(state, &mut s, trigger, snap, &mut effects, &mut notes);
+        Event::WorldObserved { at, trigger, snap } => {
+            handle_snapshot(
+                state,
+                &mut s,
+                at.mono_ns,
+                trigger,
+                snap,
+                &mut effects,
+                &mut notes,
+            );
         }
         Event::EffectResult { op, outcome, .. } => {
             handle_effect_result(&mut s, *op, outcome, &mut notes);
@@ -113,7 +135,7 @@ fn push_restack(s: &State, ws: WorkspaceId, fx: &mut Vec<Effect>) {
     }
 }
 
-fn handle_hotkey(s: &mut State, action: HotkeyAction, fx: &mut Vec<Effect>) {
+fn handle_hotkey(s: &mut State, action: HotkeyAction, now_ns: u64, fx: &mut Vec<Effect>) {
     match action {
         HotkeyAction::WorkspacePrev
         | HotkeyAction::WorkspaceNext
@@ -162,6 +184,7 @@ fn handle_hotkey(s: &mut State, action: HotkeyAction, fx: &mut Vec<Effect>) {
             }
             let op = s.mint_op();
             fx.push(Effect::SwitchWorkspace { op, target });
+            s.last_switch_mono_ns = Some(now_ns);
             s.pending.push(PendingOp {
                 op,
                 expect: Expectation::AllMonitorsOn(target),
@@ -214,6 +237,7 @@ fn handle_hotkey(s: &mut State, action: HotkeyAction, fx: &mut Vec<Effect>) {
                 op: switch_op,
                 target,
             });
+            s.last_switch_mono_ns = Some(now_ns);
             s.pending.push(PendingOp {
                 op: switch_op,
                 expect: Expectation::AllMonitorsOn(target),
@@ -416,6 +440,7 @@ pub fn coalesce_hotkeys(s: &State, actions: &[HotkeyAction]) -> Vec<HotkeyAction
 fn handle_snapshot(
     pre: &State,
     s: &mut State,
+    now_ns: u64,
     trigger: &RescanTrigger,
     snap: &WorldSnapshot,
     fx: &mut Vec<Effect>,
@@ -638,6 +663,12 @@ fn handle_snapshot(
     // window mid-handoff (Dock dimming's app-hide can fling focus) must not
     // read as the user navigating away; the expectation resolves or expires
     // within EXPECTATION_RESCANS, so a genuine follow is deferred, not lost.
+    //
+    // Neither guard survives the full fallout tail (expectations are one-shot
+    // and rescan-counted; apps re-fling focus for seconds), so inside
+    // FOCUS_SETTLE_NS of our last switch a stray focus is treated like close
+    // fallout: hold the workspace, pull focus back. The pull-back's own echo
+    // can't recurse — its target is on the current workspace.
     if !s.pending.iter().any(|p| {
         matches!(
             p.expect,
@@ -665,7 +696,10 @@ fn handle_snapshot(
                     let close_fallout = deltas
                         .iter()
                         .any(|d| matches!(d, Delta::WindowDestroyed(_)));
-                    if close_fallout {
+                    let settling = s
+                        .last_switch_mono_ns
+                        .is_some_and(|t| now_ns.saturating_sub(t) < FOCUS_SETTLE_NS);
+                    if close_fallout || settling {
                         if let Some(back) = here.and_then(|h| mru_stack(s, h).into_iter().next()) {
                             let op = s.mint_op();
                             fx.push(Effect::FocusWindow { op, window: back });
@@ -674,12 +708,17 @@ fn handle_snapshot(
                                 expect: Expectation::Focused(back),
                                 rescans_left: EXPECTATION_RESCANS,
                             });
-                            notes.push(Note::HeldFocusOnClose { window: back });
+                            notes.push(if close_fallout {
+                                Note::HeldFocusOnClose { window: back }
+                            } else {
+                                Note::HeldFocusSettling { window: back }
+                            });
                             last_op = Some(op);
                         }
                     } else {
                         let op = s.mint_op();
                         fx.push(Effect::SwitchWorkspace { op, target });
+                        s.last_switch_mono_ns = Some(now_ns);
                         s.pending.push(PendingOp {
                             op,
                             expect: Expectation::AllMonitorsOn(target),
@@ -719,6 +758,7 @@ fn handle_snapshot(
             if let Some(target) = reachable {
                 let op = s.mint_op();
                 fx.push(Effect::SwitchWorkspace { op, target });
+                s.last_switch_mono_ns = Some(now_ns);
                 s.pending.push(PendingOp {
                     op,
                     expect: Expectation::AllMonitorsOn(target),

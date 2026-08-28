@@ -12,13 +12,14 @@
 //! window, so callers should hand focus to the intended top window *before*
 //! restacking — the raises then slot in under it.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ordo_core::WindowId;
 use ordo_skylight_sys as sys;
 
 use crate::ports::{RaiseKind, RaiseStat, RestackStats};
 
+use super::ws_events::{RaiseSignals, WaitOutcome};
 use super::{ax, cf};
 
 const ON_SCREEN_ONLY: u32 = 1 << 0;
@@ -107,6 +108,12 @@ pub fn stack_front_to_back() -> Vec<WindowId> {
 /// anyway. A raise already issued cannot be recalled; its late landing is
 /// absorbed by the successor's passes exactly like any other ghost.
 ///
+/// `signals`, when present, is the WindowServer's push stream (808/815): a
+/// gate sleeps until a hint instead of a fixed tick, and wakes read back
+/// exactly as before — events cut the latency between a landing and our
+/// seeing it to ~zero, they never replace the CG read as the authority. With
+/// `None` (probes) every gate is the classic 5ms poll.
+///
 /// `desired[0]` is the DESIGNATED top — the window the core wants focused —
 /// not whatever AX says is focused right now. Asking AX mid-reveal races the
 /// focus effect's own landing (and the outgoing app may already be hidden),
@@ -117,7 +124,11 @@ pub fn stack_front_to_back() -> Vec<WindowId> {
 /// then the top window ping-pongs each round trip" bug. Intent is the
 /// authority; the actual key window, whichever it transiently is, sits in no
 /// gate's scope and settles on top by itself.
-pub fn reassert_stack(desired: &[WindowId], cancel: &dyn Fn() -> bool) -> Option<RestackStats> {
+pub fn reassert_stack(
+    desired: &[WindowId],
+    cancel: &dyn Fn() -> bool,
+    signals: Option<&RaiseSignals>,
+) -> Option<RestackStats> {
     const PRESENCE_TIMEOUT_MS: u64 = 600;
     // Generous on purpose: a landed gate exits in single-digit ms, so this is
     // paid only by an app genuinely slower than it — and a timeout means an
@@ -154,13 +165,17 @@ pub fn reassert_stack(desired: &[WindowId], cancel: &dyn Fn() -> bool) -> Option
             .collect()
     };
 
+    let mut gate = Gate::new(signals);
+
     // Wait for un-hides to finish resurfacing every window we're about to
     // order; a window that pops back mid-pass would land wherever it left off.
+    // Each resurfacing emits an ordered-in (815) hint, so this gate mostly
+    // sleeps until one arrives.
     let t_presence = Instant::now();
-    let mut waited = 0;
-    while observed(desired).len() < desired.len() && waited < PRESENCE_TIMEOUT_MS && !cancel() {
-        std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
-        waited += POLL_MS;
+    let presence_deadline = t_presence + Duration::from_millis(PRESENCE_TIMEOUT_MS);
+    while observed(desired).len() < desired.len() && Instant::now() < presence_deadline && !cancel()
+    {
+        gate.wait(None, presence_deadline, &cancel);
     }
     let presence_wait_ms = t_presence.elapsed().as_millis() as u64;
     // Anything still missing isn't coming (closed, or a stuck app): order
@@ -184,14 +199,15 @@ pub fn reassert_stack(desired: &[WindowId], cancel: &dyn Fn() -> bool) -> Option
     // focused" read this function used to key its physics on. Alt+End is the
     // flow that needs it: the demoted window stays key until the handoff.
     let t_handoff = Instant::now();
-    let mut waited = 0;
+    let handoff_deadline = t_handoff + Duration::from_millis(LANDING_TIMEOUT_MS);
     let mut key_in_want = None;
-    while waited < LANDING_TIMEOUT_MS && !cancel() {
+    while Instant::now() < handoff_deadline && !cancel() {
         match ax::focused_window() {
             Some(f) if want.contains(&f) => {
                 key_in_want = Some(f);
-                std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
-                waited += POLL_MS;
+                // The handoff completing emits 808 for the newly-keyed
+                // window, so a hint is the moment to re-ask AX.
+                gate.wait(None, handoff_deadline, &cancel);
             }
             _ => {
                 key_in_want = None;
@@ -240,7 +256,16 @@ pub fn reassert_stack(desired: &[WindowId], cancel: &dyn Fn() -> bool) -> Option
         if pass > 0 {
             second_pass = true;
         }
-        let keep = raise_pass(top, &want, &scope, &observed, pass, &mut raises, &cancel);
+        let keep = raise_pass(
+            top,
+            &want,
+            &scope,
+            &observed,
+            pass,
+            &mut raises,
+            &cancel,
+            &mut gate,
+        );
         if pass == 0 {
             skipped_suffix = keep as u32;
         }
@@ -256,14 +281,55 @@ pub fn reassert_stack(desired: &[WindowId], cancel: &dyn Fn() -> bool) -> Option
         second_pass,
         converged: observed(&scope) == scope,
         aborted: aborted.get(),
+        ghost_pass: false, // the worker marks its ghost-watch reruns
         raises,
     })
+}
+
+/// One sleep between condition re-checks. With a push stream, the sleep ends
+/// the instant a hint arrives — capped by a poll fallback so a dead or deaf
+/// stream (a window not yet opted in) degrades to polling, never to a stall.
+/// Without one (probes), the classic 5ms tick. The cursor rides along so one
+/// stream serves every gate of a reassert without re-reading old entries.
+struct Gate<'a> {
+    signals: Option<&'a RaiseSignals>,
+    cursor: u64,
+}
+
+impl<'a> Gate<'a> {
+    fn new(signals: Option<&'a RaiseSignals>) -> Self {
+        Gate {
+            signals,
+            cursor: signals.map_or(0, |s| s.cursor()),
+        }
+    }
+
+    /// Returns whether the wake was a matching hint (telemetry: the event
+    /// path carried this gate, rather than the fallback tick).
+    fn wait(&mut self, wid: Option<u32>, deadline: Instant, cancel: &dyn Fn() -> bool) -> bool {
+        const POLL_FALLBACK: Duration = Duration::from_millis(50);
+        match self.signals {
+            Some(s) => {
+                let slice_end = deadline.min(Instant::now() + POLL_FALLBACK);
+                let matches = |w: u32| wid.is_none_or(|t| t == w);
+                matches!(
+                    s.wait(&mut self.cursor, &matches, slice_end, cancel),
+                    WaitOutcome::Hint
+                )
+            }
+            None => {
+                std::thread::sleep(Duration::from_millis(5));
+                false
+            }
+        }
+    }
 }
 
 /// One sequenced, landing-gated raise pass. See [`reassert_stack`] for why
 /// this shape is the only deterministic one available. Returns the length of
 /// the already-correct suffix it skipped, and appends one [`RaiseStat`] per
 /// issued raise.
+#[allow(clippy::too_many_arguments)]
 fn raise_pass(
     top: WindowId,
     want: &[WindowId],
@@ -272,9 +338,9 @@ fn raise_pass(
     pass: u8,
     raises: &mut Vec<RaiseStat>,
     cancel: &dyn Fn() -> bool,
+    gate: &mut Gate<'_>,
 ) -> usize {
     const LANDING_TIMEOUT_MS: u64 = 1000;
-    const POLL_MS: u64 = 5;
 
     // The designated top's OWN app's windows obey different raise physics
     // than everyone else's (probed in slps_sibling_probe.rs, refuting
@@ -370,10 +436,23 @@ fn raise_pass(
             }
         };
         let t = Instant::now();
-        let mut waited = 0;
-        while !landed(w) && waited < LANDING_TIMEOUT_MS && !cancel() {
-            std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
-            waited += POLL_MS;
+        let land_deadline = t + Duration::from_millis(LANDING_TIMEOUT_MS);
+        let mut via_event = false;
+        let mut timed_out = false;
+        loop {
+            if landed(w) {
+                break;
+            }
+            if cancel() {
+                break;
+            }
+            if Instant::now() >= land_deadline {
+                timed_out = true;
+                break;
+            }
+            // via_event labels the wake that PRECEDED the confirming read:
+            // true means the push stream carried this landing.
+            via_event = gate.wait(Some(w.0), land_deadline, cancel);
         }
         let (above_scope, above_all) = above(w);
         raises.push(RaiseStat {
@@ -384,7 +463,8 @@ fn raise_pass(
             above_scope,
             above_all,
             wait_ms: t.elapsed().as_millis() as u64,
-            timed_out: waited >= LANDING_TIMEOUT_MS,
+            timed_out,
+            via_event,
         });
         !cancel()
     });

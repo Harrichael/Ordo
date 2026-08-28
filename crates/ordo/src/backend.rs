@@ -16,7 +16,7 @@
 
 use std::collections::HashMap;
 
-use ordo_core::{MonitorId, WindowId, WorkspaceId};
+use ordo_core::{MonitorId, Pid, Rect, WindowId, WorkspaceId};
 
 pub type Result<T> = std::result::Result<T, BackendError>;
 
@@ -83,6 +83,21 @@ pub trait WorkspaceBackend {
     /// Emergency single-window recovery for the kill switch: make `window`
     /// visible on the active workspace with the least machinery possible.
     fn rescue_window(&mut self, window: WindowId) -> Result<()>;
+
+    /// Re-assert placement promises this backend has made, given the frames
+    /// the enumerator already read (no backend re-enumerates on its own).
+    /// Called once per rescan, and only while Ordo is actively driving —
+    /// never when paused or rescued, where fighting a gather would be worse
+    /// than any phantom.
+    ///
+    /// Band-aid until placement writes get a single owner
+    /// (docs/desired-state-reconciler.md): under rapid switching a stale
+    /// restore can land AFTER the park that superseded it, leaving a
+    /// "phantom" — a window visibly on-screen that the ledger says is parked.
+    /// Nothing delta-driven ever fires on a phantom that has already settled,
+    /// so the invariant needs a standing check. Native makes no placement
+    /// promises; the default is a no-op.
+    fn enforce_placement(&mut self, _frames: &HashMap<WindowId, (Pid, Rect)>) {}
 
     fn capabilities(&self) -> Capabilities;
 }

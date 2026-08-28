@@ -62,7 +62,7 @@ fn main() {
     let want: Vec<u32> = desired.iter().map(|w| w.0).collect();
 
     let t = std::time::Instant::now();
-    zorder::reassert_stack(&desired, &|| false);
+    zorder::reassert_stack(&desired, &|| false, None);
     let took = t.elapsed();
     std::thread::sleep(std::time::Duration::from_millis(150));
     let got = stack();
@@ -86,7 +86,7 @@ fn main() {
     let want: Vec<u32> = desired.iter().map(|w| w.0).collect();
 
     let t = std::time::Instant::now();
-    zorder::reassert_stack(&desired, &|| false);
+    zorder::reassert_stack(&desired, &|| false, None);
     let took = t.elapsed();
     std::thread::sleep(std::time::Duration::from_millis(150));
     let got = stack();

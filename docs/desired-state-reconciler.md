@@ -341,3 +341,12 @@ ones and their resolutions, now folded into the text above:
    folded in.
 14. Complexity honesty: the measured 80% is coverable by P1 + a restack
    worker under the CURRENT model → staging recommendation at the top.
+15. (2026-08-27, from the run-38 follow-focus snap-back:) "in-flight, ours"
+   dying with its generation cannot classify a grant that LANDED and was then
+   superseded — kitty delivered a duplicate activation 520ms after its focus
+   grant had already confirmed, and every landing signal was long gone. The
+   in-flight set must retain satisfied/superseded focus entries for a
+   landing-tail horizon (~2s, the FOCUS_SETTLE_NS bound in update.rs) before
+   dropping them. This is the focus-domain twin of finding 5's ghost raises:
+   fallout has no complete ledger, so quiescence is time-bounded, never
+   counted out.

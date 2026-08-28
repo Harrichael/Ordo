@@ -157,12 +157,19 @@ fn run(
         let _ = tx.send(Msg::Rescue);
     }
 
+    // The WindowServer push stream (raise landings, Space changes). Installed
+    // on the main thread because [NSApp run] below is its delivery mechanism;
+    // windows are opted in by the snapshot path (SubscribingWorld).
+    let ws = ordo::platform::ws_events::install(tx.clone());
+
     // The engine and all macOS handles live entirely on this one thread.
     let engine_intercepting = intercepting.clone();
+    let world_intercepting = intercepting.clone();
     // The restack worker outlives everything but the process (tap-thread
     // lifetime contract); it reports its telemetry back through the engine's
     // channel, so it needs a sender before the engine thread consumes rx.
-    let restack = ordo::platform::restack_worker::spawn(tx.clone());
+    let restack = ordo::platform::restack_worker::spawn(tx.clone(), ws.signals());
+    let engine_ws = ws.clone();
     let engine_thread = std::thread::spawn(move || {
         let clock = SystemClock::new();
         let backend_label = match (backend, observe) {
@@ -182,7 +189,10 @@ fn run(
             Backend::Native => native_backend(),
             Backend::Emulated => emulated_backend(workspaces),
         };
-        let world = MacWorldSource::new(backend.clone());
+        let world = ordo::platform::ws_events::SubscribingWorld::new(
+            MacWorldSource::new(backend.clone(), world_intercepting),
+            engine_ws,
+        );
         let effector: Box<dyn Effector> = if observe {
             Box::new(NullEffector)
         } else {
@@ -198,28 +208,37 @@ fn run(
         observer::spawn_space_watcher(tx.clone());
     }
 
-    // Periodic rescans drive observation. Dropping this tx on stop closes the
-    // engine's channel, which ends its loop and writes the run's end time.
+    // Periodic rescans drive observation; on its own thread because the main
+    // thread below belongs to AppKit. This thread also owns shutdown — NSApp
+    // never returns, so process exit happens here once the engine is joined.
     let period = Duration::from_secs_f64(interval.max(0.1));
-    while !stop.load(Ordering::Relaxed) {
-        // A SIGUSR1 (from `ordo rescue`) disengages interception immediately —
-        // the same effect as the hotkey fast path — and tells the core to go
-        // inert. The gather itself runs in the rescue CLI's own process.
-        if rescue_requested.swap(false, Ordering::Relaxed) {
-            intercepting.store(false, Ordering::Relaxed);
-            let _ = tx.send(Msg::Rescue);
+    std::thread::spawn(move || {
+        while !stop.load(Ordering::Relaxed) {
+            // A SIGUSR1 (from `ordo rescue`) disengages interception
+            // immediately — the same effect as the hotkey fast path — and
+            // tells the core to go inert. The gather itself runs in the
+            // rescue CLI's own process.
+            if rescue_requested.swap(false, Ordering::Relaxed) {
+                intercepting.store(false, Ordering::Relaxed);
+                let _ = tx.send(Msg::Rescue);
+            }
+            if tx.send(Msg::Rescan(RescanTrigger::Periodic)).is_err() {
+                break;
+            }
+            std::thread::sleep(period);
         }
-        if tx.send(Msg::Rescan(RescanTrigger::Periodic)).is_err() {
-            break;
-        }
-        std::thread::sleep(period);
-    }
-    // An explicit shutdown, because the tap thread holds a sender clone that
-    // would otherwise keep the engine's channel open forever.
-    let _ = tx.send(Msg::Shutdown);
-    let _ = engine_thread.join();
-    let _ = std::fs::remove_file(&pidfile);
-    println!("ordo: stopped.");
+        // An explicit shutdown, because the tap thread holds a sender clone
+        // that would otherwise keep the engine's channel open forever.
+        let _ = tx.send(Msg::Shutdown);
+        let _ = engine_thread.join();
+        let _ = std::fs::remove_file(&pidfile);
+        println!("ordo: stopped.");
+        std::process::exit(0);
+    });
+
+    // The main thread is AppKit's from here on. This is what makes the
+    // WindowServer push stream deliver — see ws_events::run_app_loop.
+    ordo::platform::ws_events::run_app_loop();
 }
 
 #[cfg(not(target_os = "macos"))]

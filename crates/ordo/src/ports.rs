@@ -58,6 +58,11 @@ pub struct RestackStats {
     /// Aborted rows are expected under rapid switching and are NOT failures;
     /// exclude them when aggregating latency distributions.
     pub aborted: bool,
+    /// This reassert was started by the worker's post-convergence ghost
+    /// watch (a late 808/815 for an ordered window), not by the engine. Its
+    /// frequency is the measure of how often the old "wrong until the 2s
+    /// rescan" window actually fired.
+    pub ghost_pass: bool,
     pub raises: Vec<RaiseStat>,
 }
 
@@ -76,6 +81,10 @@ pub struct RaiseStat {
     pub above_all: u32,
     pub wait_ms: u64,
     pub timed_out: bool,
+    /// The landing was confirmed on a wake caused by the WindowServer's push
+    /// stream (808/815), not a fallback tick. The hit rate across weeks is
+    /// what decides whether the polling fallback can shrink further.
+    pub via_event: bool,
 }
 
 /// Raise physics class — these are expected to have different latency

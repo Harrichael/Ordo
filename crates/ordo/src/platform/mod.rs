@@ -25,6 +25,7 @@ pub mod rescue_gather;
 pub mod restack_worker;
 pub mod skylight;
 pub mod tap;
+pub mod ws_events;
 pub mod zorder;
 
 pub use effector::MacEffector;
@@ -32,8 +33,12 @@ pub use effector::MacEffector;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
-use ordo_core::{MonitorId, MonitorSnap, WindowId, WindowSnap, WorkspaceId, WorldSnapshot};
+use ordo_core::{
+    MonitorId, MonitorSnap, Pid, Rect, WindowId, WindowSnap, WorkspaceId, WorldSnapshot,
+};
 
 use crate::backend::WorkspaceBackend;
 use crate::ports::WorldSource;
@@ -54,11 +59,19 @@ pub fn emulated_backend(workspaces: u8) -> SharedBackend {
 /// classification, joined into the core's vocabulary.
 pub struct MacWorldSource {
     backend: SharedBackend,
+    /// The tap/effector's shared engagement flag. Placement enforcement rides
+    /// the rescan cadence, so it must stop the moment Ordo is paused or
+    /// rescued — a rescue gather frees windows the ledger still calls parked,
+    /// and fighting the gather would be worse than any phantom.
+    intercepting: Arc<AtomicBool>,
 }
 
 impl MacWorldSource {
-    pub fn new(backend: SharedBackend) -> Self {
-        MacWorldSource { backend }
+    pub fn new(backend: SharedBackend, intercepting: Arc<AtomicBool>) -> Self {
+        MacWorldSource {
+            backend,
+            intercepting,
+        }
     }
 }
 
@@ -75,6 +88,19 @@ impl WorldSource for MacWorldSource {
             .borrow_mut()
             .topology(&window_ids, &known)
             .unwrap_or_default();
+
+        if self.intercepting.load(Ordering::Relaxed) {
+            // The corrective write lands after this snapshot was read, so the
+            // snapshot still shows the phantom; the next rescan absorbs the
+            // fix as an (unattributed) external delta. Acceptable for a
+            // standing-invariant band-aid.
+            let frames: HashMap<WindowId, (Pid, Rect)> = scan
+                .windows
+                .iter()
+                .map(|w| (w.id, (w.app, w.frame)))
+                .collect();
+            self.backend.borrow_mut().enforce_placement(&frames);
+        }
 
         let per_monitor: HashMap<MonitorId, (WorkspaceId, u8)> = topo
             .monitors

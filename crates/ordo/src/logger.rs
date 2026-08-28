@@ -82,13 +82,21 @@ impl Logger {
         // Columns added after a table shipped: CREATE IF NOT EXISTS won't grow
         // an existing table, and the telemetry history is worth keeping (the
         // raise-overlap decision wants weeks of it), so alter in place.
-        let has_aborted = conn
-            .prepare("SELECT 1 FROM pragma_table_info('restacks') WHERE name = 'aborted'")?
-            .exists([])?;
-        if !has_aborted {
-            conn.execute_batch(
-                "ALTER TABLE restacks ADD COLUMN aborted INTEGER NOT NULL DEFAULT 0;",
-            )?;
+        for (table, column) in [
+            ("restacks", "aborted"),
+            ("restacks", "ghost_pass"),
+            ("raises", "via_event"),
+        ] {
+            let exists = conn
+                .prepare(&format!(
+                    "SELECT 1 FROM pragma_table_info('{table}') WHERE name = '{column}'"
+                ))?
+                .exists([])?;
+            if !exists {
+                conn.execute_batch(&format!(
+                    "ALTER TABLE {table} ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0;"
+                ))?;
+            }
         }
 
         let cutoff = now_wall_ms - RETENTION_DAYS * 24 * 60 * 60 * 1000;
@@ -197,8 +205,8 @@ impl Logger {
         tx.execute(
             "INSERT INTO restacks (run_id, wall_ms, total_ms, presence_wait_ms,
                  handoff_wait_ms, desired, missing, skipped_suffix, second_pass, converged,
-                 aborted)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                 aborted, ghost_pass)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 self.run_id,
                 now_wall_ms,
@@ -211,14 +219,15 @@ impl Logger {
                 s.second_pass,
                 s.converged,
                 s.aborted,
+                s.ghost_pass,
             ],
         )?;
         let restack_id = tx.last_insert_rowid();
         for (ord, r) in s.raises.iter().enumerate() {
             tx.execute(
                 "INSERT INTO raises (restack_id, ord, window, pid, kind, pass,
-                     above_scope, above_all, wait_ms, timed_out)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                     above_scope, above_all, wait_ms, timed_out, via_event)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     restack_id,
                     ord as i64,
@@ -230,6 +239,7 @@ impl Logger {
                     r.above_all,
                     r.wait_ms as i64,
                     r.timed_out,
+                    r.via_event,
                 ],
             )?;
         }
@@ -306,6 +316,7 @@ fn note_kind(n: &Note) -> &'static str {
         Note::External { .. } => "external",
         Note::FollowedFocus { .. } => "followed_focus",
         Note::HeldFocusOnClose { .. } => "held_focus_on_close",
+        Note::HeldFocusSettling { .. } => "held_focus_settling",
         Note::TearDetected { .. } => "tear_detected",
         Note::TearPersisting => "tear_persisting",
         Note::Diverged { .. } => "diverged",
@@ -372,7 +383,8 @@ CREATE TABLE IF NOT EXISTS restacks (
     skipped_suffix   INTEGER NOT NULL,
     second_pass      INTEGER NOT NULL,
     converged        INTEGER NOT NULL,
-    aborted          INTEGER NOT NULL DEFAULT 0
+    aborted          INTEGER NOT NULL DEFAULT 0,
+    ghost_pass       INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS raises (
     restack_id  INTEGER NOT NULL REFERENCES restacks(restack_id) ON DELETE CASCADE,
@@ -385,6 +397,7 @@ CREATE TABLE IF NOT EXISTS raises (
     above_all   INTEGER NOT NULL,
     wait_ms     INTEGER NOT NULL,
     timed_out   INTEGER NOT NULL,
+    via_event   INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (restack_id, ord)
 );
 CREATE INDEX IF NOT EXISTS events_by_time ON events(wall_ms);

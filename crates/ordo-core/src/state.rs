@@ -74,6 +74,12 @@ pub struct State {
     pub pending: Vec<PendingOp>,
     /// Damping for tear re-alignment, mirroring `WindowRecord::corrections`.
     pub tear_corrections: u8,
+    /// When we last emitted a SwitchWorkspace (event clock — the core never
+    /// reads time). Follow-the-focus consults this: a switch's focus fallout
+    /// keeps arriving well after every landing signal fires, so "recently
+    /// switched" is the only tell that a stray focus is our own echo.
+    #[serde(default)]
+    pub last_switch_mono_ns: Option<u64>,
     /// OpId counter. Lives in State — not a global — so `update` stays pure
     /// and replay mints identical ids.
     pub next_op: u64,
@@ -91,6 +97,7 @@ impl State {
             focus_history: FocusHistory::new(),
             pending: Vec::new(),
             tear_corrections: 0,
+            last_switch_mono_ns: None,
             next_op: 0,
         }
     }

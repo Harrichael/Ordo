@@ -529,6 +529,73 @@ fn external_focus_on_a_hidden_workspaces_window_is_followed() {
 }
 
 #[test]
+fn late_focus_echo_inside_the_settle_window_is_held_not_followed() {
+    // Run 38's snap-back, replayed: rapid switching leaves focus grants in
+    // flight, and an app can land (or duplicate) one seconds later — after
+    // the switch and its focus expectation have both confirmed and cleared.
+    // Inside the settle window that arrival is our own echo: hold the
+    // workspace, pull focus back. Past the window it's the user navigating.
+    let at = |mono_ns: u64| Ts {
+        wall_ms: 0,
+        mono_ns,
+    };
+    let obs =
+        |mono_ns: u64, active: u8, wins: Vec<WindowSnap>, focused: u32| Event::WorldObserved {
+            at: at(mono_ns),
+            trigger: RescanTrigger::Periodic,
+            snap: WorldSnapshot {
+                monitors: vec![mon_a(active), mon_b(active)],
+                windows: wins,
+                focused: Some(wid(focused)),
+            },
+        };
+    let mut wins = std_windows();
+    wins[1].workspace = ws(2); // w2 lives on workspace 2
+
+    // On ws1 focused w1; switch to ws2 (grants focus to w2)...
+    let s = update(&booted(&[2, 1]), &obs(0, 1, wins.clone(), 1)).state;
+    let s = update(
+        &s,
+        &Event::Hotkey {
+            at: at(1_000_000_000),
+            action: HotkeyAction::WorkspaceNext,
+        },
+    )
+    .state;
+    // ...and the very next snapshot confirms everything: monitors on ws2,
+    // focus on w2. All expectations resolve; the old guards are now down.
+    let s = update(&s, &obs(1_200_000_000, 2, wins.clone(), 2)).state;
+
+    // 500ms after the switch, the stale grant echoes: focus pops back to w1
+    // on hidden ws1. Held, not followed.
+    let held = update(&s, &obs(1_500_000_000, 2, wins.clone(), 1));
+    assert_eq!(count_switches(&held.effects), 0, "no snap-back");
+    assert_eq!(
+        focus_targets(&held.effects),
+        vec![wid(2)],
+        "focus pulled back to the current workspace's MRU window"
+    );
+    assert!(held
+        .notes
+        .iter()
+        .any(|n| matches!(n, Note::HeldFocusSettling { window } if *window == wid(2))));
+
+    // The pull-back confirms; well past the settle window the same focus
+    // change is genuine navigation (Cmd+Tab) and is followed.
+    let s = update(&held.state, &obs(1_600_000_000, 2, wins.clone(), 2)).state;
+    let followed = update(&s, &obs(4_000_000_000, 2, wins, 1));
+    assert!(followed
+        .effects
+        .iter()
+        .any(|e| matches!(e, Effect::SwitchWorkspace { target, .. } if *target == ws(1))));
+    assert!(followed
+        .notes
+        .iter()
+        .any(|n| matches!(n, Note::FollowedFocus { window, target }
+            if *window == wid(1) && *target == ws(1))));
+}
+
+#[test]
 fn closing_a_window_never_follows_focus_to_another_workspace() {
     // Closing a window makes macOS hand focus to the app's next window,
     // wherever it lives — including a hidden workspace. That's fallout, not

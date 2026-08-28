@@ -14,9 +14,9 @@ windows (AXWindowCreated). Still scan-only:
   notification, NSWorkspaceActiveSpaceDidChangeNotification needs a real app
   identity (tried NSApplication init + main-runloop pumping; never delivered),
   and NO distributed notification fires on a switch (examples/notify_probe.rs
-  listened to all of them). Remaining zero-poll candidate: private
-  SLSRegisterConnectionNotifyProc event codes (yabai's route) — undocumented
-  magic numbers, needs its own probe session.
+  listened to all of them). The zero-poll route is now CONFIRMED: private
+  SLSRegisterConnectionNotifyProc events 1329/1401 fire on space changes —
+  see the probed recipe under "Stacking research notes" (needs [NSApp run]).
 - Window closes. Alt+Tab can target a window closed <2s ago; the focus op
   fails honestly and the next scan cleans up. Fix if it ever annoys: per-window
   AXUIElementDestroyed observers.
@@ -136,10 +136,44 @@ named the symptom yet — candidates, ranked:
   alt-tab probed CGSOrderWindow ("does nothing"), Hammerspoon's sendToBack is
   focus-each + 80ms sleeps. Only windows OUR connection creates can be
   ordered relative to foreign ones (JankyBorders pattern) — the route to
-  proxy-window switch animations if ever wanted. Zero-poll upgrade for both
-  the reassert's landing gates and the space watcher:
-  SLSRequestNotificationsForWindows (event ids 804/1325/1326, alt-tab's
-  WindowServerEvents.swift). If Ordo ever drives native Spaces again:
+  proxy-window switch animations if ever wanted.
+- Zero-poll upgrade — PROBED, CONFIRMED, AND ADOPTED 2026-08-27 (examples/
+  raise_notify_probe.rs, then platform/ws_events.rs; Tahoe 26.6): the
+  WindowServer pushes per-window events, including for a PURE RAISE.
+  Shipped shape: events are HINTS that wake a read-back, never the authority
+  — every gate keeps a 50ms poll fallback (and its old timeout), so a deaf
+  window or dead stream degrades to polling, never stalls. The reassert's
+  presence/handoff/landing gates wake on 808/815 (raises.via_event logs the
+  hit rate); the worker's post-convergence GHOST WATCH (1.8s, max 2 reruns,
+  filtered to ordered windows) closes the "wrong until the 2s rescan" tail
+  (restacks.ghost_pass, real ghost = ghost_pass row WITH raises); 1329/1401
+  hint an instant rescan with the 150ms space watcher kept as backstop.
+  main's thread now belongs to [NSApp run] (activation policy Prohibited);
+  the periodic/shutdown loop moved to its own thread. Windows are opted in
+  on the snapshot path (SubscribingWorld) — a window born between rescans is
+  deaf until the next one, covered by the fallback. A background AXRaise of an onscreen
+  window emits 808 + 815 carrying exactly that window id, instantly. So the
+  reassert's landing gates (5ms CG-read polling), the trailing ghost-raise
+  tail (a cancelled/timed-out raise landing after the final read-back — the
+  "Outlook over the terminals until the rescan" symptom), and the 150ms space
+  watcher can all go event-driven. The recipe, all three parts load-bearing:
+  (1) SLSRegisterConnectionNotifyProc(cid, handler, code, NULL) per code;
+  (2) SLSRequestNotificationsForWindows(cid, ids, n) — mandatory since
+  Sequoia, and it REPLACES the connection's watch list (always send the full
+  set; there is no unsubscribe symbol — dropping an id from the next call is
+  the only removal); (3) a running NSApplication event loop ([NSApp run]) —
+  the datagrams arrive via AppKit's connection event machinery, and a bare
+  CFRunLoop gets NOTHING (measured: 0 events, identical registrations), nor
+  does NSApplicationLoad() alone. yabai ends main with [NSApp run] for
+  exactly this; adopting it in ordo means the main thread runs NSApp and the
+  handler forwards to the engine channel. Confirmed code map (alt-tab's
+  WsEventRouting + observed live): 811 created / 804 destroyed / 806 moved /
+  807 resized / 808 focused-or-raised / 815 ordered-in / 816 ordered-out /
+  1325-1326 space membership (payload: 8-byte space id + 4-byte wid; others
+  carry just the wid) / 1329+1401 space change. Also seen, undecoded: 805
+  (fires with membership flips), 1308/1322/1508 (activation/space-adjacent).
+  Handler runs on AppKit's event thread — extract ints, hop threads, return.
+- If Ordo ever drives native Spaces again:
   SLPSSetFrontProcessWithOptions clobbers other Spaces' front-process memory
   (alt-tab #4507, repair = SLSSpaceSetFrontPSN).
 - Cross-monitor frame math targets the display's raw bounds, so macOS clamps
@@ -150,6 +184,65 @@ named the symptom yet — candidates, ranked:
 - Follow-the-focus is unconditional: an app self-activating on a hidden
   workspace (Slack notification, Xcode build-done) yanks the user over, same
   as native Spaces does. If that annoys, add damping or an allowlist.
+- Follow-the-focus snap-back under rapid switching — DIAGNOSED AND CAPPED
+  2026-08-27 (run 38 seqs 1410/1451/1480/1491/1535, all FollowedFocus). The
+  mechanism: a switch's FocusWindow grant lands (or DUPLICATES — kitty
+  delivered the same activation twice, the second 520ms after the first) after
+  the switch self-confirmed and the one-shot Focused expectation was consumed,
+  so the arrival reads as external focus on a hidden-workspace window and
+  follow-the-focus yanks back to the workspace just left. Event-driven hints
+  made it worse: EXPECTATION_RESCANS=3 is now ~150-400ms of wall time, far
+  under the measured ~1.6s app landing tail. No observation channel can fix
+  this — the OS doesn't say WHO caused a focus change; only our own recent-op
+  memory can.
+  Shipped fix (blunt on purpose): FOCUS_SETTLE_NS in update.rs — within 2s of
+  any SwitchWorkspace we emitted, a stray focus onto a hidden workspace is
+  treated like close fallout (hold the workspace, pull focus back to the
+  current MRU head; note held_focus_settling). Cost: a genuine Cmd+Tab to a
+  hidden-workspace window within 2s of a switch gets bounced back once —
+  accepted, same trade as HeldFocusOnClose ("a wrong yank costs far more").
+  Sharper options if the lost-follow ever grates (deliberately not built):
+  (a) per-window fallout horizon — remember each window we granted focus in
+      the last 2s and only suppress follows onto THOSE, with per-entry early
+      expiry once the grant confirmed AND stayed quiet ~300ms; genuine
+      Cmd+Tab to any other window follows instantly even mid-burst. Strictly
+      better; slightly more state.
+  (b) quiet-based early exit on the blanket window (close at 300ms of focus
+      quiet) — simpler than (a) but re-opens before kitty's sparse tail and
+      turns the quiet threshold into a forever-tuning knob. Prefer (a).
+  Strict "all expected events accounted for → expire early" is UNSOUND: the
+  trace above had every expected event accounted for at t=384 and the
+  snap-back still arrived at t=522 as a duplicate. Fallout has no complete
+  ledger. Same lesson feeds the reconciler plan (finding 15 there): an
+  in-flight set that dies at generation end can't classify landed-then-
+  superseded grants either.
+- PHANTOM WINDOWS — diagnosed 2026-08-28 (run 38 seqs 20599-20682), band-aid
+  shipped same day. Mechanism: park/restore frame writes have the same
+  apply-on-the-app's-schedule AX physics as raises but NONE of the raise
+  machinery (no landing gates, no generation preemption, no ghost watch).
+  Rapid ws bouncing puts a park and the PREVIOUS switch's restore in flight
+  for the same window; log caught a restore landing 600ms AFTER the park that
+  superseded it. Last-lander-wins → window visibly on-screen, ledger says
+  parked. No delta ever fires again (reconcile is delta-driven; a settled
+  phantom is a standing violation), so it persisted until the next clean
+  round-trip. Downstream symptoms, all corrupted-belief, not bad rules:
+  clicking a phantom follow-the-focuses you to its believed workspace; MRU
+  filters (Alt+Tab/backtick/shift-tab) leak across workspaces/monitors —
+  window `monitor` is derived from frame center and flips displays through
+  the park corner on every transit.
+  Band-aid (this commit): WorkspaceBackend::enforce_placement — a standing
+  check per rescan, emulated impl re-parks any believed-parked window not at
+  its sliver, damped at 3 per window (mirrors core damping), reset when it
+  parks clean or unparks; gated on the intercepting flag so a paused/rescued
+  daemon never fights a rescue gather. The re-park write lands post-snapshot
+  and is absorbed as an External delta next rescan — attribution honesty is
+  deliberately sacrificed; this dies at reconciler R3 when plan() owns
+  park/restore and the phantom becomes just another goal-vs-belief diff.
+  REAL FIX: the reconciler (docs/desired-state-reconciler.md) — the fifth and
+  sixth members of the staleness class (carry mis-target via lagging believed
+  focus; phantom via unowned frame writes) both land in its R1-R5 scope, and
+  the phantom one is NOT cheaply fixable under the current model. Michael has
+  agreed to review the rearchitecture plan next (2026-08-28).
 
 - Carry-to-workspace (Ctrl+Cmd+arrows) briefly blinks the carried window on the
   emulated backend: the move parks it (one AX write) and the switch restores it
@@ -183,3 +276,16 @@ named the symptom yet — candidates, ranked:
 - Deferred review findings F5/F6b/F7/F9/F10 — see the review-fix plan notes in
   git history (fa426ca) for rationale; F6b (persist the emulated ledger across
   restarts) matters if the emulated backend becomes the daily driver.
+  F6b BIT TWICE ON 2026-08-27, now understood precisely: restarting the
+  daemon while any workspace is hidden strands that workspace's windows as
+  1px corner slivers, silently. Mechanism: the fresh ledger has no `saved`
+  entry for an already-parked window, so the next switch's restore() emits
+  NO write (Option chain returns None), the window stays at the corner, the
+  rescan adopts corner-as-truth (belief follows reality), and the next park
+  saves the corner as its "real" frame — ossified, no error anywhere.
+  Recovery (proven live, no daemon restart): while the window's workspace is
+  CURRENT, externally move it to a sane frame — the rescan adopts it and the
+  next park inherits it. Moving it while parked gets reverted by design.
+  Fix when picked up: persist saved+parked (XDG state or the log DB), plus a
+  startup sanity pass — any window sitting at the park corner with no ledger
+  entry gets a cascaded onscreen frame instead of being adopted as-is.
