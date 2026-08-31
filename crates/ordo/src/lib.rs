@@ -9,7 +9,9 @@
 //! - [`engine`] — the single serial loop: event in, core, log, effects out.
 //! - [`logger`] / [`replay`] — the structured log and its replay checker.
 //! - [`ports`] — the two traits the engine talks to the world through.
-//! - [`backend`] — the workspace-backend boundary (native vs future emulated).
+//! - [`backend`] — the workspace-backend boundary. The implementations live
+//!   in their own crates (`ordo-emulated`; SkyLight FFI in
+//!   `ordo-skylight-sys`), bound to the trait under [`platform`].
 //! - [`clock`] — the one place time is read.
 //! - [`platform`] — the macOS FFI: displays, Accessibility, SkyLight, mouse.
 //! - [`rescue`] — the log-driven recovery gather.
@@ -18,12 +20,10 @@ pub mod backend;
 pub mod clock;
 pub mod engine;
 pub mod keys;
-pub mod ledger;
 pub mod logger;
 pub mod ports;
 pub mod replay;
 pub mod rescue;
-pub mod statefile;
 
 #[cfg(target_os = "macos")]
 pub mod platform;

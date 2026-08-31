@@ -3,5 +3,6 @@ resolver = "2"
 members = [
     "crates/ordo-core",
     "crates/ordo-skylight-sys",
+    "crates/ordo-emulated",
     "crates/ordo",
 ]

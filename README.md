@@ -15,8 +15,11 @@ ordo-core         pure decisions: update(&State, &Event) -> (State, [Effect])
   ▲                 no I/O, no clock, no OS types — replayable by construction
   │
 ordo (shell)      observes macOS, executes effects, logs, kill switch
-  │
-ordo-skylight-sys  every private/undocumented symbol, quarantined in one crate
+  │                 binds one workspace mechanism to the WorkspaceBackend trait:
+  ├── ordo-emulated    Ordo owns workspaces (park/restore, ledger, state file),
+  │                      OS touches behind its Desktop port
+  └── ordo-skylight-sys  native Spaces: every private/undocumented symbol,
+                           quarantined in one crate
 ```
 
 The two rules that make it work:

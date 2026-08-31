@@ -4,9 +4,11 @@
 //! two changes.
 //!
 //! The trait lives here, platform-free, so its *shape* is frozen independently
-//! of either implementation (the native one is in [`crate::platform`]; the
-//! emulated one arrives in a later milestone). Core vocabulary only: 1-based
-//! [`WorkspaceId`] ordinals cross this boundary, never a native space id.
+//! of either implementation. Each mechanism is its own crate (`ordo-emulated`;
+//! native SkyLight FFI in `ordo-skylight-sys`), bound to this trait under
+//! [`crate::platform`] — choosing a backend is choosing a crate. Core
+//! vocabulary only: 1-based [`WorkspaceId`] ordinals cross this boundary,
+//! never a native space id.
 //!
 //! The two implementations differ in who owns the truth. Native: macOS owns it,
 //! `topology()` reads it, and the user can change it behind our back. Emulated:

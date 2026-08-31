@@ -475,6 +475,7 @@ dependencies = [
  "objc2-core-graphics",
  "objc2-foundation",
  "ordo-core",
+ "ordo-emulated",
  "ordo-skylight-sys",
  "rusqlite",
  "serde",
@@ -485,6 +486,16 @@ dependencies = [
 name = "ordo-core"
 version = "0.1.0"
 dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "ordo-emulated"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "ordo-core",
  "serde",
  "serde_json",
 ]

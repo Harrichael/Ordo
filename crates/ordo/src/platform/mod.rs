@@ -3,7 +3,8 @@
 //! Assembly of a [`WorldSnapshot`] pulls from three sources and joins them on
 //! stable ids: display geometry from Core Graphics ([`display`]), windows from
 //! the Accessibility API ([`ax`]), and workspace assignment from the backend
-//! ([`native_backend`] over [`skylight`]). The backend is shared with the
+//! ([`native_backend`] over [`skylight`], or [`emulated_backend`] adapting the
+//! `ordo-emulated` crate). The backend is shared with the
 //! effector (later milestones) via `Rc<RefCell<…>>`; that is sound because the
 //! entire platform layer lives on the single engine thread — none of these
 //! handles are `Send`, and none ever leave it.
