@@ -116,6 +116,18 @@ named the symptom yet — candidates, ranked:
   pollution self-corrects on the next real focus). If stacking ever still
   feels slow, the lever is raising fewer windows (e.g. only the top K of
   the MRU) or the data-gated overlap plan below, not more threads.
+  - VERDICT 2026-08-28 (telemetry analysis, runs 34-38): overlap FAILS its
+    own gating criteria — raise landings are only ~31ms of a ~294ms median
+    restack (full overlap saves ~13ms median), landings are bimodal (96.6%
+    <50ms, ~3% >500ms, no middle to pace against), and 99% first-pass
+    correctness needs a straggler rate 14x lower than measured. The real cost
+    was the UNCONDITIONAL 150ms (~200ms wall) pass-1 settle sleep — 76% of
+    the median restack, paid on 100% of restacks to cover the 3.3% with a
+    live straggler. Fixed 2026-08-31: the sleep now runs only when a raise in
+    this reassert actually timed_out (the landing gate is exhaustive:
+    confirmed or timed_out, so no-timeouts means nothing in flight; cancelled-
+    generation ghosts were always the worker ghost watch's job). Projected
+    294 -> ~89ms median; second_pass/ghost_pass telemetry will confirm.
   - Michael's overlap idea (2026-08-27, deliberately NOT implemented yet —
     full plan, physics, queries, and decision criteria in
     docs/raise-overlap.md):
@@ -243,6 +255,11 @@ named the symptom yet — candidates, ranked:
   focus; phantom via unowned frame writes) both land in its R1-R5 scope, and
   the phantom one is NOT cheaply fixable under the current model. Michael has
   agreed to review the rearchitecture plan next (2026-08-28).
+- INTENT VS OBSERVATION (2026-08-31): the architecture exploration that now
+  gates everything, including the reconciler (PAUSED by Michael). Workspace
+  assignment is a DECLARATION; observation must never rewrite it — the week's
+  bugs are all category violations. Full data-ownership audit, incident map,
+  candidate tweaks, and open questions: docs/intent-vs-observation.md.
 - WEEKEND AMNESIA + PERSISTENCE — diagnosed and fixed 2026-08-31. Over a
   sleeping weekend, displays vanished and AX scans came back empty; the
   daemon read that as "every window closed": ledger.forget_missing erased all
