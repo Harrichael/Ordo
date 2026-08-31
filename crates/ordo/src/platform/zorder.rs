@@ -239,12 +239,24 @@ pub fn reassert_stack(
     let mut second_pass = false;
     for pass in 0..2u8 {
         if pass > 0 {
-            // The settle sleep is the longest uninterruptible stretch left if
-            // done in one call — tick it so a preemption isn't blind for 150ms.
-            let mut slept = 0;
-            while slept < 150 && !cancel() {
-                std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
-                slept += POLL_MS;
+            // Sleep only when a straggler can actually exist: every raise
+            // either confirmed landing at its gate or set timed_out, so with
+            // no timeouts nothing from this pass is still in flight and the
+            // read-back can run immediately. Measured (run 38): the
+            // unconditional form cost ~200ms wall on 100% of restacks — 76%
+            // of the median switch — to cover the 3.3% with a live
+            // straggler. Ghosts from a CANCELLED generation land on their
+            // own schedule either way; those are the worker's event-driven
+            // ghost watch's job, not this sleep's.
+            if raises.iter().any(|r: &RaiseStat| r.timed_out) {
+                // The settle sleep is the longest uninterruptible stretch
+                // left if done in one call — tick it so a preemption isn't
+                // blind for 150ms.
+                let mut slept = 0;
+                while slept < 150 && !cancel() {
+                    std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
+                    slept += POLL_MS;
+                }
             }
         }
         if cancel() {
