@@ -53,6 +53,12 @@ impl Desktop for AxDesktop {
                 h: 1080.0,
             })
     }
+
+    fn existing_windows(&self, ids: &[WindowId]) -> Option<std::collections::HashSet<WindowId>> {
+        let all = super::zorder::all_windows()?;
+        let all: std::collections::HashSet<WindowId> = all.into_iter().collect();
+        Some(ids.iter().filter(|w| all.contains(w)).copied().collect())
+    }
 }
 
 pub struct EmulatedBackend {
@@ -79,10 +85,10 @@ impl EmulatedBackend {
 impl WorkspaceBackend for EmulatedBackend {
     fn topology(
         &mut self,
-        windows: &[WindowId],
+        windows: &[(WindowId, Pid)],
         monitors: &[(MonitorId, bool)],
     ) -> Result<BackendTopology> {
-        self.model.note_scan(windows);
+        self.model.note_scan(&self.desktop, windows);
         let mons = monitors
             .iter()
             .map(|(id, _)| MonitorWorkspace {

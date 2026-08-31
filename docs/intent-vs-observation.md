@@ -1,10 +1,13 @@
 # Intent vs. observation: the data-ownership audit
 
-Status: **exploration plan, nothing implemented** (2026-08-31, written at
-Michael's direction). The reconciler (docs/desired-state-reconciler.md) is
-PAUSED until this is settled — Michael's judgment: we don't yet understand the
-current model well enough to rewrite it. This doc is the prerequisite: get the
-ownership model right first, then re-evaluate the reconciler against it.
+Status: **being implemented in reviewed steps** (2026-08-31; originally an
+exploration plan). Michael approved the program after the Opus design review
+(docs/intent-vs-observation-review.md): hotfixes (park sliver guard,
+S-after-R merge) → ordo-emulated crate extraction → snapshot seam split
+(observation vs workspace-word channels, believed frames) → CG-probe death
+evidence + (id,pid) identity → enforcement-as-assertion → declared-focus
+command context. The reconciler (docs/desired-state-reconciler.md) stays
+PAUSED; re-evaluate it against the finished ownership model.
 
 ## The principle (Michael's formulation)
 

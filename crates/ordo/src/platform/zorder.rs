@@ -55,6 +55,35 @@ pub fn stack_with_pids() -> Vec<(u32, i32)> {
     out
 }
 
+/// ALL windows the window server knows — including windows of Cmd+H-hidden
+/// apps, which is what makes this usable as death evidence for parked windows
+/// (dock dimming hides exactly their apps; an on-screen-only read would
+/// report them dead). No layer filter, unlike the stacking reads above: for
+/// an existence question a filter can only manufacture false deaths, never
+/// remove a false alive. `None` when the read fails or comes back empty: an
+/// empty full list is a failed read, not a desktop with no windows.
+pub fn all_windows() -> Option<Vec<WindowId>> {
+    let mut out = Vec::new();
+    unsafe {
+        let arr = CGWindowListCopyWindowInfo(EXCLUDE_DESKTOP, 0);
+        if arr.is_null() {
+            return None;
+        }
+        for i in 0..cf::array_len(arr) {
+            let d = cf::array_get(arr, i) as sys::CFDictionaryRef;
+            if let Some(wid) = cf::number_i64(cf::dict_get(d, "kCGWindowNumber")) {
+                out.push(WindowId(wid as u32));
+            }
+        }
+        sys::CFRelease(arr);
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
 /// On-screen normal (layer-0) windows, front to back.
 pub fn stack_front_to_back() -> Vec<WindowId> {
     let mut out = Vec::new();

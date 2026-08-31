@@ -86,12 +86,12 @@ impl WorldSource for MacWorldSource {
         let known: Vec<(MonitorId, bool)> = displays.iter().map(|d| (d.id, d.is_main)).collect();
 
         let scan = ax::scan();
-        let window_ids: Vec<WindowId> = scan.windows.iter().map(|w| w.id).collect();
+        let scanned: Vec<(WindowId, Pid)> = scan.windows.iter().map(|w| (w.id, w.app)).collect();
 
         let topo = self
             .backend
             .borrow_mut()
-            .topology(&window_ids, &known)
+            .topology(&scanned, &known)
             .unwrap_or_default();
 
         let frames: HashMap<WindowId, (Pid, Rect)> = scan

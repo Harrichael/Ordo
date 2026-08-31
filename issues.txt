@@ -283,8 +283,9 @@ named the symptom yet — candidates, ranked:
   (a) An empty observation is not an observation of emptiness — engine drops
       snapshots with zero monitors; the emulated backend skips forget/adopt
       on an empty window list. (Reconciler doc: this belongs in the snapshot
-      contract. Hardening deferred: forgetting still fires on a single
-      partial scan; N-consecutive-absences would close that.)
+      contract. CLOSED 2026-08-31: forgetting now requires CG-confirmed
+      death — a window absent from an AX scan is probed against the window
+      server's full list; absence from a scan alone never forgets.)
   (b) parked/saved/enforce_attempts prune in lockstep with the ledger.
   (c) enforce_placement never parks a window assigned to the current ws —
       the ledger outranks the parked set.
@@ -292,8 +293,11 @@ named the symptom yet — candidates, ranked:
   frames, current ws) write through to state.json next to the log DB and
   reload on boot — F6b is fixed; restarts are placement-invisible. Trust
   model: kern.boottime seal voids the file across reboots (CGWindowIDs
-  regenerate), out-of-range entries dropped, missing windows pruned by the
-  first sighted scan, `ordo run --fresh` ignores it entirely. First lossless
+  regenerate), out-of-range entries clamped into range (2026-08-31; a shrunk
+  --workspaces merges high workspaces onto the last one rather than deleting
+  declarations), missing windows pruned only on CG-confirmed death
+  (2026-08-31; identity is (id, owning pid) so recycled ids never inherit a
+  dead window's claim), `ordo run --fresh` ignores it entirely. First lossless
   restart: run 40, seeded from the log DB. At reconciler R3 this file's
   contents become Desired's placement slice — schema is data, not backend
   internals. Deferred: rescue does not tombstone the file (post-rescue state

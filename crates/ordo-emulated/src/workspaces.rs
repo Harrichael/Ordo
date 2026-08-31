@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use ordo_core::{Pid, Rect, WindowId, WorkspaceId};
 
-use crate::ledger::{Ledger, MoveAction};
+use crate::ledger::{Claim, Ledger, MoveAction};
 use crate::statefile::{self, PersistedState, PersistedWindow};
 use crate::Desktop;
 
@@ -79,31 +79,57 @@ impl EmulatedWorkspaces {
         self.ledger.window_ws()
     }
 
-    /// Fold a completed window scan into the model: forget the closed, adopt
-    /// the new, keep the park bookkeeping in lockstep.
+    /// Fold a completed window scan into the model: adopt the genuinely new,
+    /// forget the provably dead, keep the park bookkeeping in lockstep with
+    /// the ledger.
     ///
-    /// An empty scan is not an observation of emptiness: displays asleep or
-    /// apps too suspended to answer AX look exactly like "every window
-    /// closed", and forgetting on that erased every assignment over a weekend
-    /// (issues.txt, 2026-08-31 — everything re-adopted onto one workspace at
-    /// wake). Forgetting requires positive evidence: a scan that found
-    /// SOMETHING but not this window.
-    pub fn note_scan(&mut self, windows: &[WindowId]) {
+    /// Absence is not death. An empty scan looks exactly like "every window
+    /// closed" when displays sleep (the weekend flatten), and a PARTIAL scan
+    /// looks like one app's windows closed when that app blows the AX
+    /// timeout — the mechanism behind the deterministic wrong-workspace
+    /// phantom (a parked Chrome window missed ONE scan, was forgotten, and
+    /// re-adopted onto the visible workspace three seconds later). A missing
+    /// window is forgotten only when the window server's full list confirms
+    /// it no longer exists; a failed CG read is not evidence either, and
+    /// everything is kept.
+    pub fn note_scan(&mut self, d: &dyn Desktop, windows: &[(WindowId, Pid)]) {
         if windows.is_empty() {
             return;
         }
-        let before = self.ledger.window_ws();
-        self.ledger.forget_missing(windows);
-        self.ledger.note_seen(windows);
-        // The park bookkeeping must forget in lockstep: a stale `parked`
-        // entry for a window the ledger re-adopted turns placement
-        // enforcement against the user (it re-slivers a window that now
-        // belongs on the visible workspace).
-        self.saved.retain(|id, _| windows.contains(id));
-        self.parked.retain(|id| windows.contains(id));
-        self.enforce_attempts.retain(|id, _| windows.contains(id));
-        if self.ledger.window_ws() != before {
+        let before = self.ledger.window_claims();
+        let scanned: HashSet<WindowId> = windows.iter().map(|(w, _)| *w).collect();
+        let absent: Vec<WindowId> = self
+            .ledger
+            .window_ws()
+            .keys()
+            .filter(|w| !scanned.contains(w))
+            .copied()
+            .collect();
+        if !absent.is_empty() {
+            if let Some(alive) = d.existing_windows(&absent) {
+                let dead: Vec<WindowId> = absent
+                    .iter()
+                    .filter(|w| !alive.contains(w))
+                    .copied()
+                    .collect();
+                self.ledger.forget(&dead);
+                self.drop_park_bookkeeping(&dead);
+            }
+        }
+        // A recycled id's saved frame belongs to a dead stranger; the new
+        // window must not inherit a teleport to it.
+        let recycled = self.ledger.note_seen(windows);
+        self.drop_park_bookkeeping(&recycled);
+        if self.ledger.window_claims() != before {
             self.persist();
+        }
+    }
+
+    fn drop_park_bookkeeping(&mut self, ids: &[WindowId]) {
+        for id in ids {
+            self.saved.remove(id);
+            self.parked.remove(id);
+            self.enforce_attempts.remove(id);
         }
     }
 
@@ -186,16 +212,17 @@ impl EmulatedWorkspaces {
                 let frames = current_frames(d);
                 let main = d.main_display();
                 let merged =
-                    merge_fresh_session(&self.ledger.window_ws(), &self.saved, &ps, |id| {
+                    merge_fresh_session(&self.ledger.window_claims(), &self.saved, &ps, |id| {
                         frames
                             .get(id)
                             .is_some_and(|(_, f)| at_park_position(f, main))
                     });
                 self.ledger =
                     Ledger::restore(self.ledger.count(), self.ledger.current(), merged.assign);
-                // Ledger::restore drops out-of-range claims; the park
-                // bookkeeping must not outlive them (a parked entry with no
-                // assignment arms enforcement against a workspace-less window).
+                // Cheap assertion of the parked ⊆ assigned invariant (restore
+                // clamps rather than drops, so this always holds today — a
+                // parked entry with no assignment would arm enforcement
+                // against a workspace-less window).
                 let assigned = self.ledger.window_ws();
                 for (id, f) in merged.saved {
                     if assigned.contains_key(&id) {
@@ -303,9 +330,20 @@ impl EmulatedWorkspaces {
             return;
         };
         let count = self.ledger.count();
-        let assign: BTreeMap<WindowId, WorkspaceId> =
-            ps.windows.iter().map(|w| (w.id, w.workspace)).collect();
-        self.ledger = Ledger::restore(count, ps.current, assign);
+        let claims: BTreeMap<WindowId, Claim> = ps
+            .windows
+            .iter()
+            .map(|w| {
+                (
+                    w.id,
+                    Claim {
+                        ws: w.workspace,
+                        owner: w.owner,
+                    },
+                )
+            })
+            .collect();
+        self.ledger = Ledger::restore(count, ps.current, claims);
         self.saved.clear();
         self.parked.clear();
         self.enforce_attempts.clear();
@@ -324,11 +362,12 @@ impl EmulatedWorkspaces {
         let Some(path) = &self.state_path else { return };
         let windows = self
             .ledger
-            .window_ws()
+            .window_claims()
             .into_iter()
-            .map(|(id, workspace)| PersistedWindow {
+            .map(|(id, claim)| PersistedWindow {
                 id,
-                workspace,
+                workspace: claim.ws,
+                owner: claim.owner,
                 saved: self
                     .parked
                     .contains(&id)
@@ -471,7 +510,7 @@ fn rehome_into(f: &Rect, area: Rect) -> Rect {
 
 /// The merged model an S-after-R resume adopts.
 struct FreshMerge {
-    assign: BTreeMap<WindowId, WorkspaceId>,
+    assign: BTreeMap<WindowId, Claim>,
     /// Restore promises revived from the file (window is parked again).
     saved: Vec<(WindowId, Rect)>,
 }
@@ -486,7 +525,7 @@ struct FreshMerge {
 /// and deliberately parked it — that sliver is the user's arrangement, not
 /// adoption noise, however it reads physically.
 fn merge_fresh_session(
-    model: &BTreeMap<WindowId, WorkspaceId>,
+    model: &BTreeMap<WindowId, Claim>,
     own_saved: &HashMap<WindowId, Rect>,
     file: &PersistedState,
     is_slivered: impl Fn(&WindowId) -> bool,
@@ -498,7 +537,13 @@ fn merge_fresh_session(
         let noise_sliver =
             w.saved.is_some() && is_slivered(&w.id) && !own_saved.contains_key(&w.id);
         if !model_knows || noise_sliver {
-            assign.insert(w.id, w.workspace);
+            assign.insert(
+                w.id,
+                Claim {
+                    ws: w.workspace,
+                    owner: w.owner,
+                },
+            );
             if let Some(f) = w.saved {
                 saved.push((w.id, f));
             }
@@ -538,6 +583,7 @@ mod tests {
     struct FakeDesktop {
         windows: std::cell::RefCell<BTreeMap<WindowId, (Pid, Rect)>>,
         frozen: std::cell::Cell<bool>,
+        cg_down: std::cell::Cell<bool>,
     }
 
     impl FakeDesktop {
@@ -547,6 +593,7 @@ mod tests {
                     windows.iter().map(|(w, p, f)| (*w, (*p, *f))).collect(),
                 ),
                 frozen: std::cell::Cell::new(false),
+                cg_down: std::cell::Cell::new(false),
             }
         }
 
@@ -556,6 +603,20 @@ mod tests {
 
         fn freeze(&self) {
             self.frozen.set(true);
+        }
+
+        /// The window really closes: gone from the window server too.
+        fn close(&self, w: WindowId) {
+            self.windows.borrow_mut().remove(&w);
+        }
+
+        /// A scan of this desktop, as the shell would deliver it.
+        fn scan(&self) -> Vec<(WindowId, Pid)> {
+            self.windows
+                .borrow()
+                .iter()
+                .map(|(w, (p, _))| (*w, *p))
+                .collect()
         }
     }
 
@@ -587,6 +648,19 @@ mod tests {
         fn main_display(&self) -> Rect {
             MAIN
         }
+
+        fn existing_windows(&self, ids: &[WindowId]) -> Option<HashSet<WindowId>> {
+            if self.cg_down.get() {
+                return None;
+            }
+            let known = self.windows.borrow();
+            Some(
+                ids.iter()
+                    .filter(|w| known.contains_key(w))
+                    .copied()
+                    .collect(),
+            )
+        }
     }
 
     #[test]
@@ -596,7 +670,7 @@ mod tests {
             (w(2), Pid(20), rect(300.0, 200.0)),
         ]);
         let mut b = EmulatedWorkspaces::new(3);
-        b.note_scan(&[w(1), w(2)]);
+        b.note_scan(&d, &d.scan());
 
         // Moving w2 to a hidden workspace parks it at the corner…
         b.move_window_to_workspace(&d, w(2), ws(2)).unwrap();
@@ -622,7 +696,7 @@ mod tests {
             (w(2), Pid(20), rect(300.0, 200.0)),
         ]);
         let mut b = EmulatedWorkspaces::new(3);
-        b.note_scan(&[w(1), w(2)]);
+        b.note_scan(&d, &d.scan());
         b.move_window_to_workspace(&d, w(1), ws(2)).unwrap(); // parks w1
 
         let frames: HashMap<WindowId, (Pid, Rect)> = d
@@ -674,44 +748,91 @@ mod tests {
     }
 
     #[test]
+    fn a_partial_scan_never_reassigns_a_living_window() {
+        // The deterministic phantom-maker, replayed: a parked window's app
+        // blows the AX timeout, so ONE scan misses it while the window server
+        // still knows it. Its declaration and restore promise must survive.
+        let d = FakeDesktop::new(&[
+            (w(1), Pid(10), rect(100.0, 100.0)),
+            (w(2), Pid(20), rect(300.0, 200.0)),
+        ]);
+        let mut b = EmulatedWorkspaces::new(3);
+        b.note_scan(&d, &d.scan());
+        b.move_window_to_workspace(&d, w(1), ws(3)).unwrap(); // parked
+
+        b.note_scan(&d, &[(w(2), Pid(20))]); // partial: w1 missing, alive
+        assert_eq!(b.window_ws()[&w(1)], ws(3), "declaration kept");
+        assert_eq!(b.saved[&w(1)], rect(100.0, 100.0), "promise kept");
+
+        // Re-sighted next scan: same identity, nothing to adopt.
+        b.note_scan(&d, &d.scan());
+        assert_eq!(b.window_ws()[&w(1)], ws(3));
+
+        // A failed CG read is not evidence either.
+        d.cg_down.set(true);
+        d.close(w(1));
+        b.note_scan(&d, &[(w(2), Pid(20))]);
+        assert_eq!(b.window_ws()[&w(1)], ws(3), "no evidence, no forgetting");
+
+        // CG back up and the window really is gone: forgotten everywhere.
+        d.cg_down.set(false);
+        b.note_scan(&d, &[(w(2), Pid(20))]);
+        assert!(!b.window_ws().contains_key(&w(1)));
+        assert!(!b.saved.contains_key(&w(1)));
+        assert!(!b.parked.contains(&w(1)));
+    }
+
+    #[test]
+    fn a_recycled_id_never_inherits_the_dead_windows_promise() {
+        let d = FakeDesktop::new(&[
+            (w(1), Pid(10), rect(100.0, 100.0)),
+            (w(2), Pid(20), rect(300.0, 200.0)),
+        ]);
+        let mut b = EmulatedWorkspaces::new(3);
+        b.note_scan(&d, &d.scan());
+        b.move_window_to_workspace(&d, w(1), ws(3)).unwrap(); // parked, saved
+
+        // The id comes back in the same scan under a different app: it is a
+        // NEW window on the current workspace, with no inherited teleport.
+        b.note_scan(&d, &[(w(1), Pid(99)), (w(2), Pid(20))]);
+        assert_eq!(b.window_ws()[&w(1)], ws(1));
+        assert!(!b.saved.contains_key(&w(1)));
+        assert!(!b.parked.contains(&w(1)));
+    }
+
+    #[test]
     fn fresh_session_merge_keeps_unseen_declarations_and_revives_slivered_ones() {
+        let pw = |id: u32, wsn: u8, saved: Option<Rect>| PersistedWindow {
+            id: w(id),
+            workspace: ws(wsn),
+            owner: Pid(10),
+            saved,
+        };
         let file = PersistedState {
             version: statefile::VERSION,
             boot_time_sec: 1,
             current: ws(1),
             windows: vec![
                 // Parked pre-R, never seen by the fresh session.
-                PersistedWindow {
-                    id: w(10),
-                    workspace: ws(3),
-                    saved: Some(rect(10.0, 20.0)),
-                },
+                pw(10, 3, Some(rect(10.0, 20.0))),
                 // Parked pre-R, adopted by the fresh session but still a sliver.
-                PersistedWindow {
-                    id: w(11),
-                    workspace: ws(2),
-                    saved: Some(rect(30.0, 40.0)),
-                },
+                pw(11, 2, Some(rect(30.0, 40.0))),
                 // Parked pre-R, pulled out and placed by the user during R.
-                PersistedWindow {
-                    id: w(12),
-                    workspace: ws(2),
-                    saved: Some(rect(70.0, 80.0)),
-                },
+                pw(12, 2, Some(rect(70.0, 80.0))),
                 // Parked pre-R, and RE-parked by the user during R (so it is
                 // physically a sliver, but by this session's own hand).
-                PersistedWindow {
-                    id: w(14),
-                    workspace: ws(2),
-                    saved: Some(rect(90.0, 95.0)),
-                },
+                pw(14, 2, Some(rect(90.0, 95.0))),
             ],
         };
-        let model: BTreeMap<WindowId, WorkspaceId> = [
-            (w(11), ws(1)),
-            (w(12), ws(1)),
-            (w(13), ws(1)),
-            (w(14), ws(3)),
+        let claim = |wsn: u8| Claim {
+            ws: ws(wsn),
+            owner: Pid(10),
+        };
+        let model: BTreeMap<WindowId, Claim> = [
+            (w(11), claim(1)),
+            (w(12), claim(1)),
+            (w(13), claim(1)),
+            (w(14), claim(3)),
         ]
         .into();
         let own_saved: HashMap<WindowId, Rect> = [(w(14), rect(91.0, 96.0))].into();
@@ -719,16 +840,16 @@ mod tests {
 
         let m = merge_fresh_session(&model, &own_saved, &file, slivered);
         // Unseen: the file's declaration survives S untouched.
-        assert_eq!(m.assign[&w(10)], ws(3));
+        assert_eq!(m.assign[&w(10)].ws, ws(3));
         // Slivered adoptee: adoption was noise, the file's promise wins.
-        assert_eq!(m.assign[&w(11)], ws(2));
+        assert_eq!(m.assign[&w(11)].ws, ws(2));
         // User-placed: the live arrangement is the new truth.
-        assert_eq!(m.assign[&w(12)], ws(1));
+        assert_eq!(m.assign[&w(12)].ws, ws(1));
         // Genuinely new in the fresh session: kept.
-        assert_eq!(m.assign[&w(13)], ws(1));
+        assert_eq!(m.assign[&w(13)].ws, ws(1));
         // Slivered by the session's OWN park: a deliberate placement, not
         // noise — the fresh model and its captured frame win.
-        assert_eq!(m.assign[&w(14)], ws(3));
+        assert_eq!(m.assign[&w(14)].ws, ws(3));
         // Only the noise slivers and unseen windows get file promises back.
         let saved: BTreeMap<_, _> = m.saved.into_iter().collect();
         assert_eq!(saved.get(&w(10)), Some(&rect(10.0, 20.0)));

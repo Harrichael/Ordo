@@ -64,13 +64,15 @@ pub trait WorkspaceBackend {
     /// Ground truth. Native interrogates the OS; emulated reports its ledger
     /// cross-checked against where windows actually are. Called on every rescan.
     ///
-    /// Takes the world the enumerator already gathered — the current display set
-    /// (with which is main) and the live window ids — because both are needed to
-    /// classify workspaces (native maps window->space; emulated consults its
-    /// ledger) and neither backend should re-enumerate them independently.
+    /// Takes the world the enumerator already gathered — the current display
+    /// set (with which is main) and the scanned windows with their owning
+    /// apps — because both are needed to classify workspaces (native maps
+    /// window->space; emulated consults its ledger, whose identity unit is
+    /// the (id, pid) pair) and neither backend should re-enumerate them
+    /// independently.
     fn topology(
         &mut self,
-        windows: &[WindowId],
+        windows: &[(WindowId, Pid)],
         monitors: &[(MonitorId, bool)],
     ) -> Result<BackendTopology>;
 

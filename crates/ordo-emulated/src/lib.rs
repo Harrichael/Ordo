@@ -38,4 +38,12 @@ pub trait Desktop {
     fn focused_window(&self) -> Option<WindowId>;
     /// The main display's frame — the anchor for the park corner.
     fn main_display(&self) -> Rect;
+    /// Which of `ids` still exist per the WINDOW SERVER's full window list —
+    /// authoritative death evidence, unlike an AX scan (one slow app drops
+    /// its whole window set from a scan). Must consult all windows, not just
+    /// on-screen ones: parked windows' apps are Cmd+H-hidden by dock dimming
+    /// and an on-screen-only read would report exactly them as dead. `None`
+    /// means the read itself failed or came back empty — not evidence; the
+    /// caller keeps every belief.
+    fn existing_windows(&self, ids: &[WindowId]) -> Option<std::collections::HashSet<WindowId>>;
 }
