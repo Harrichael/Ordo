@@ -84,6 +84,18 @@ pub trait WorkspaceBackend {
     /// visible on the active workspace with the least machinery possible.
     fn rescue_window(&mut self, window: WindowId) -> Result<()>;
 
+    /// The engage chords: `use_state: true` (O) reloads the workspace model
+    /// from the state file (a no-op when write-through has kept file and
+    /// memory identical, a restore after a fresh session) and resumes
+    /// persistence; `false` (R) blanks the model — keeping the current
+    /// workspace ordinal — and SUSPENDS persistence, so the fresh session
+    /// never reads or writes the file. Native keeps no model; default no-op.
+    fn bring_up(&mut self, _use_state: bool) {}
+
+    /// The save-state chord: resume persistence and write the current model
+    /// as the new durable state. Idempotent when persistence is already on.
+    fn resume_persistence(&mut self) {}
+
     /// Re-assert placement promises this backend has made, given the frames
     /// the enumerator already read (no backend re-enumerates on its own).
     /// Called once per rescan, and only while Ordo is actively driving —

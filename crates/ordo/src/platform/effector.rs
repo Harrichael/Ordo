@@ -40,6 +40,14 @@ impl MacEffector {
 }
 
 impl Effector for MacEffector {
+    fn bring_up_workspaces(&mut self, use_state: bool) {
+        self.backend.borrow_mut().bring_up(use_state);
+    }
+
+    fn persist_workspaces(&mut self) {
+        self.backend.borrow_mut().resume_persistence();
+    }
+
     fn execute(&mut self, effect: &Effect) -> Option<OpOutcome> {
         match effect {
             Effect::FocusWindow { window, .. } => {

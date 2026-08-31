@@ -15,9 +15,16 @@
 //!     the MRU history and focus the next one
 //!   - Ctrl+Alt+Cmd+Escape       → rescue candidate (engages on a double-press;
 //!     the timing lives in the tap, not here)
-//!   - Ctrl+Alt+Cmd+O            → engage: undo a rescue, or bring a --paused
-//!     run alive. Deliberately a different key than rescue so mashing the panic
-//!     chord can never re-engage the thing being escaped.
+//!   - Ctrl+Alt+Cmd+O            → engage: bring Ordo up WITH the state file
+//!     (undo a rescue, or bring a --paused run alive). Deliberately a
+//!     different key than rescue so mashing the panic chord can never
+//!     re-engage the thing being escaped.
+//!   - Ctrl+Alt+Cmd+R            → engage fresh: O's corollary — bring Ordo up
+//!     WITHOUT the state file. Blank workspace model, and the file is neither
+//!     read nor written until S or O says otherwise. Single press, like O.
+//!   - Ctrl+Alt+Cmd+S            → save state: turn the state file back on
+//!     (after an R bring-up) and persist the current arrangement as the new
+//!     durable truth. Idempotent when persistence is already on.
 //!
 //! Modifier matching is deliberately strict so Ordo only swallows the exact
 //! chord: Cmd+Shift+arrows are claimed (the user gave up select-to-line for
@@ -33,6 +40,8 @@ mod code {
     pub const GRAVE: u16 = 0x32; // backtick
     pub const ESCAPE: u16 = 0x35;
     pub const O: u16 = 0x1F;
+    pub const R: u16 = 0x0F;
+    pub const S: u16 = 0x01;
     pub const END: u16 = 0x77;
 }
 
@@ -50,8 +59,16 @@ pub enum Chord {
     /// One press of the rescue combo. The tap decides whether it's the second
     /// within the window and thus actually engages rescue.
     RescueCandidate,
-    /// (Re)engage Ordo: single press, honored even while disengaged.
+    /// (Re)engage Ordo, loading the state file: single press, honored even
+    /// while disengaged.
     Engage,
+    /// (Re)engage Ordo with a blank workspace model, leaving the state file
+    /// untouched and unused: O's corollary, same handling.
+    EngageFresh,
+    /// Turn persistence back on and save the current model as the new durable
+    /// state. Only meaningful while engaged, so it sits behind the
+    /// interception gate like the ordinary hotkeys.
+    SaveState,
 }
 
 /// Which chord, if any, a key-down maps to. `None` means "not ours — pass it
@@ -67,6 +84,12 @@ pub fn match_chord(keycode: u16, m: Mods) -> Option<Chord> {
     }
     if m.ctrl && m.alt && m.cmd && keycode == code::O {
         return Some(Chord::Engage);
+    }
+    if m.ctrl && m.alt && m.cmd && keycode == code::R {
+        return Some(Chord::EngageFresh);
+    }
+    if m.ctrl && m.alt && m.cmd && keycode == code::S {
+        return Some(Chord::SaveState);
     }
 
     match keycode {
@@ -228,6 +251,21 @@ mod tests {
         // Plain or partially-modified O belongs to the apps.
         assert_eq!(match_chord(code::O, mods(false, false, false, false)), None);
         assert_eq!(match_chord(code::O, mods(true, false, false, false)), None);
+    }
+
+    #[test]
+    fn engage_fresh_and_save_state_chords_map_and_bare_keys_pass_through() {
+        assert_eq!(
+            match_chord(code::R, mods(true, true, false, true)),
+            Some(Chord::EngageFresh)
+        );
+        assert_eq!(
+            match_chord(code::S, mods(true, true, false, true)),
+            Some(Chord::SaveState)
+        );
+        assert_eq!(match_chord(code::R, mods(false, false, false, false)), None);
+        assert_eq!(match_chord(code::S, mods(true, false, false, false)), None);
+        // Cmd+S is Save
     }
 
     #[test]

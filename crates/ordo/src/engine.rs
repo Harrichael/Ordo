@@ -33,8 +33,16 @@ pub enum Msg {
     Hotkey(HotkeyAction),
     Rescan(RescanTrigger),
     Rescue,
-    /// The engage chord (or a --paused run coming alive): leave Rescued mode.
+    /// The engage chord (or a --paused run coming alive): leave Rescued mode,
+    /// bringing the workspace model up from the state file.
     Engage,
+    /// The engage-fresh chord: leave Rescued mode with a BLANK workspace
+    /// model; the state file is neither read nor written until SaveState (or
+    /// a later Engage) turns it back on.
+    EngageFresh,
+    /// The save-state chord: resume persistence and write the current model
+    /// as the new durable state.
+    SaveState,
     /// Telemetry from the restack worker, delivered as a message because the
     /// SQLite logger is engine-thread-only. Never becomes a core event.
     RestackStats(RestackStats),
@@ -82,6 +90,13 @@ impl Engine {
     /// external producer, which cannot touch the thread-affine world source.
     pub fn observe(&mut self, trigger: RescanTrigger) {
         let snap = self.world.snapshot();
+        // No displays means the world is unobservable, not empty — displays
+        // asleep make every window "missing", and believing that once erased
+        // the whole model over a weekend. Discard the blind scan; the next
+        // sighted one self-heals whatever actually changed.
+        if snap.monitors.is_empty() {
+            return;
+        }
         self.pump(Event::WorldObserved {
             at: self.clock.now(),
             trigger,
@@ -127,9 +142,29 @@ impl Engine {
                             Msg::Rescue => self.pump(Event::RescueEngaged {
                                 at: self.clock.now(),
                             }),
-                            Msg::Engage => self.pump(Event::Engaged {
-                                at: self.clock.now(),
-                            }),
+                            // For both engage flavors the backend is set up
+                            // FIRST, so the post-engage rescan reports the
+                            // model the user chose (file-loaded or blank) and
+                            // the core re-learns the world from it.
+                            Msg::Engage => {
+                                self.effector.bring_up_workspaces(true);
+                                self.pump(Event::Engaged {
+                                    at: self.clock.now(),
+                                });
+                                self.observe(RescanTrigger::BackendHint {
+                                    kind: "engage".into(),
+                                });
+                            }
+                            Msg::EngageFresh => {
+                                self.effector.bring_up_workspaces(false);
+                                self.pump(Event::Engaged {
+                                    at: self.clock.now(),
+                                });
+                                self.observe(RescanTrigger::BackendHint {
+                                    kind: "engage_fresh".into(),
+                                });
+                            }
+                            Msg::SaveState => self.effector.persist_workspaces(),
                             Msg::Shutdown => break 'recv,
                             Msg::Hotkey(_) | Msg::RestackStats(_) => {
                                 unreachable!("handled above")

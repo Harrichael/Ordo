@@ -44,6 +44,11 @@ enum Command {
         /// uses the Spaces you created in Mission Control).
         #[arg(long, default_value_t = 9)]
         workspaces: u8,
+        /// Ignore persisted workspace state (state.json next to the log DB)
+        /// and start with a blank ledger — the escape hatch if bad state
+        /// keeps coming back online.
+        #[arg(long)]
+        fresh: bool,
     },
     /// Disengage Ordo and gather displaced windows back onto the visible area.
     /// Signals a running daemon to go inert, then gathers in this process too,
@@ -77,7 +82,8 @@ fn main() {
             paused,
             backend,
             workspaces,
-        } => run(db, interval, observe, paused, backend, workspaces),
+            fresh,
+        } => run(db, interval, observe, paused, backend, workspaces, fresh),
         Command::Rescue { db } => rescue(db),
         Command::Replay { db, run, from } => replay(db, run, from),
     }
@@ -103,6 +109,7 @@ fn run(
     paused: bool,
     backend: Backend,
     workspaces: u8,
+    fresh: bool,
 ) {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
@@ -187,7 +194,13 @@ fn run(
         };
         let backend = match backend {
             Backend::Native => native_backend(),
-            Backend::Emulated => emulated_backend(workspaces),
+            Backend::Emulated => {
+                // Observe mode must stay write-free, including to disk.
+                let state_path = (!fresh && !observe)
+                    .then(|| path.parent().map(|d| d.join("state.json")))
+                    .flatten();
+                emulated_backend(workspaces, state_path)
+            }
         };
         let world = ordo::platform::ws_events::SubscribingWorld::new(
             MacWorldSource::new(backend.clone(), world_intercepting),

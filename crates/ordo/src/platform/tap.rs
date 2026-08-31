@@ -128,6 +128,13 @@ unsafe extern "C-unwind" fn callback(
             let _ = ctx.tx.send(Msg::Engage);
             std::ptr::null_mut() // swallow
         }
+        // O's corollary: identical fast path, the difference (blank model,
+        // state file unused) is the engine's business.
+        Some(Chord::EngageFresh) => {
+            ctx.intercepting.store(true, Ordering::Relaxed);
+            let _ = ctx.tx.send(Msg::EngageFresh);
+            std::ptr::null_mut() // swallow
+        }
         Some(chord) if ctx.intercepting.load(Ordering::Relaxed) => match chord {
             Chord::Hotkey(action) => {
                 let _ = ctx.tx.send(Msg::Hotkey(action));
@@ -137,7 +144,11 @@ unsafe extern "C-unwind" fn callback(
                 handle_rescue(ctx);
                 std::ptr::null_mut()
             }
-            Chord::Engage => unreachable!(),
+            Chord::SaveState => {
+                let _ = ctx.tx.send(Msg::SaveState);
+                std::ptr::null_mut()
+            }
+            Chord::Engage | Chord::EngageFresh => unreachable!(),
         },
         _ => pass,
     }

@@ -14,7 +14,9 @@
 | Ctrl + Cmd + Left / Right | Carry the focused window to the previous / next workspace and switch there with it |
 | Alt + End | Demote the focused window: back of the MRU history, back of the visual stack, focus moves to the next one |
 | Ctrl + Alt + Cmd + Esc (twice within 2s) | Rescue / kill switch: disengage and gather windows back on-screen |
-| Ctrl + Alt + Cmd + O | Engage: undo a rescue, or bring a `--paused` run alive |
+| Ctrl + Alt + Cmd + O | Engage WITH the state file: undo a rescue or bring a `--paused` run alive, loading the saved organization |
+| Ctrl + Alt + Cmd + R | Engage WITHOUT the state file: blank workspace model; the file is neither read nor written until S or O |
+| Ctrl + Alt + Cmd + S | Save state: turn the state file back on and persist the current arrangement as the new truth |
 
 When Ordo changes focus, the mouse pointer follows to the center of the newly
 focused window. New windows open on the focused workspace and monitor.

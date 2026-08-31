@@ -27,6 +27,17 @@ pub trait WorldSource {
 /// dropping the effect); `Some` is logged as an `EffectResult` event.
 pub trait Effector {
     fn execute(&mut self, effect: &Effect) -> Option<OpOutcome>;
+
+    /// The engage chords' shell half, run before the core leaves Rescued
+    /// mode: `use_state: true` (O) brings the workspace model up from the
+    /// state file; `false` (R) brings it up blank with persistence suspended.
+    /// Not an [`Effect`] — the core never decides which state to trust.
+    /// Default no-op (observe mode, tests).
+    fn bring_up_workspaces(&mut self, _use_state: bool) {}
+
+    /// The save-state chord: resume persistence and write the current model
+    /// as the new durable state. Default no-op.
+    fn persist_workspaces(&mut self) {}
 }
 
 /// One restack's timing breakdown. The point is the question it exists to

@@ -243,6 +243,32 @@ named the symptom yet — candidates, ranked:
   focus; phantom via unowned frame writes) both land in its R1-R5 scope, and
   the phantom one is NOT cheaply fixable under the current model. Michael has
   agreed to review the rearchitecture plan next (2026-08-28).
+- WEEKEND AMNESIA + PERSISTENCE — diagnosed and fixed 2026-08-31. Over a
+  sleeping weekend, displays vanished and AX scans came back empty; the
+  daemon read that as "every window closed": ledger.forget_missing erased all
+  assignments, and Monday's wake re-adopted all 12 windows onto the current
+  workspace (ws3). Worse, the backend's parked/saved maps were NOT forgotten
+  in lockstep, so the phantom band-aid spent the morning re-slivering windows
+  the ledger had re-adopted (1,526 fight lines). Three fixes:
+  (a) An empty observation is not an observation of emptiness — engine drops
+      snapshots with zero monitors; the emulated backend skips forget/adopt
+      on an empty window list. (Reconciler doc: this belongs in the snapshot
+      contract. Hardening deferred: forgetting still fires on a single
+      partial scan; N-consecutive-absences would close that.)
+  (b) parked/saved/enforce_attempts prune in lockstep with the ledger.
+  (c) enforce_placement never parks a window assigned to the current ws —
+      the ledger outranks the parked set.
+  PERSISTENCE (statefile.rs): ledger promises (assignments, parked restore
+  frames, current ws) write through to state.json next to the log DB and
+  reload on boot — F6b is fixed; restarts are placement-invisible. Trust
+  model: kern.boottime seal voids the file across reboots (CGWindowIDs
+  regenerate), out-of-range entries dropped, missing windows pruned by the
+  first sighted scan, `ordo run --fresh` ignores it entirely. First lossless
+  restart: run 40, seeded from the log DB. At reconciler R3 this file's
+  contents become Desired's placement slice — schema is data, not backend
+  internals. Deferred: rescue does not tombstone the file (post-rescue state
+  mirrors the gathered reality, and --fresh covers the rest); MRU history is
+  not persisted (Alt+Tab starts cold after restart).
 
 - Carry-to-workspace (Ctrl+Cmd+arrows) briefly blinks the carried window on the
   emulated backend: the move parks it (one AX write) and the switch restores it

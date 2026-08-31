@@ -49,10 +49,13 @@ pub fn native_backend() -> SharedBackend {
     Rc::new(RefCell::new(native_backend::NativeBackend::new()))
 }
 
-pub fn emulated_backend(workspaces: u8) -> SharedBackend {
-    Rc::new(RefCell::new(emulated_backend::EmulatedBackend::new(
-        workspaces,
-    )))
+/// `state_path`: where the ledger's promises persist across restarts;
+/// `None` (e.g. `--fresh`) starts empty and stays ephemeral.
+pub fn emulated_backend(workspaces: u8, state_path: Option<std::path::PathBuf>) -> SharedBackend {
+    Rc::new(RefCell::new(match state_path {
+        Some(p) => emulated_backend::EmulatedBackend::with_persistence(workspaces, p),
+        None => emulated_backend::EmulatedBackend::new(workspaces),
+    }))
 }
 
 /// Builds a full snapshot each call: displays + AX windows + backend workspace

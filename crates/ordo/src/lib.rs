@@ -23,6 +23,7 @@ pub mod logger;
 pub mod ports;
 pub mod replay;
 pub mod rescue;
+pub mod statefile;
 
 #[cfg(target_os = "macos")]
 pub mod platform;

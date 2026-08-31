@@ -11,7 +11,8 @@
 //! unlimited instant workspaces with no private Space APIs — see the research.
 //! Best paired with "Displays have separate Spaces" off.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::PathBuf;
 
 use ordo_core::{Pid, Rect, WindowId, WorkspaceId};
 
@@ -19,6 +20,7 @@ use crate::backend::{
     BackendError, BackendTopology, Capabilities, MonitorWorkspace, Result, WorkspaceBackend,
 };
 use crate::ledger::{Ledger, MoveAction};
+use crate::statefile::{self, PersistedState, PersistedWindow};
 
 use super::{ax, display};
 
@@ -41,6 +43,14 @@ pub struct EmulatedBackend {
     parked: HashSet<WindowId>,
     /// Phantom re-parks issued per window since it last sat parked correctly.
     enforce_attempts: HashMap<WindowId, u8>,
+    /// Where the ledger's promises persist across restarts (None = ephemeral,
+    /// e.g. `--fresh`). Written through on every mutation; see statefile.rs
+    /// for the trust model.
+    state_path: Option<PathBuf>,
+    boot_time: i64,
+    /// True during a fresh session (the R chord): the state file is neither
+    /// read nor written, so O can still bring the pre-R organization back.
+    suspended: bool,
 }
 
 impl EmulatedBackend {
@@ -50,7 +60,71 @@ impl EmulatedBackend {
             saved: HashMap::new(),
             parked: HashSet::new(),
             enforce_attempts: HashMap::new(),
+            state_path: None,
+            boot_time: statefile::boot_time_sec(),
+            suspended: false,
         }
+    }
+
+    /// Like `new`, but promises survive restarts via `path`. A valid file
+    /// makes a restart placement-invisible: nothing moved while we were dead,
+    /// so reloading what the slivers MEAN is the entire job.
+    pub fn with_persistence(count: u8, path: PathBuf) -> Self {
+        let mut b = Self::new(count);
+        b.state_path = Some(path);
+        b.load_state();
+        b
+    }
+
+    /// Replace the in-memory model with the state file's, when it validates.
+    fn load_state(&mut self) {
+        let Some(path) = &self.state_path else { return };
+        let Some(ps) = statefile::load(path, self.boot_time) else {
+            return;
+        };
+        let count = self.ledger.count();
+        let assign: BTreeMap<WindowId, WorkspaceId> =
+            ps.windows.iter().map(|w| (w.id, w.workspace)).collect();
+        self.ledger = Ledger::restore(count, ps.current, assign);
+        self.saved.clear();
+        self.parked.clear();
+        self.enforce_attempts.clear();
+        for w in &ps.windows {
+            if let Some(f) = w.saved {
+                self.saved.insert(w.id, f);
+                self.parked.insert(w.id);
+            }
+        }
+    }
+
+    fn persist(&self) {
+        if self.suspended {
+            return;
+        }
+        let Some(path) = &self.state_path else { return };
+        let windows = self
+            .ledger
+            .window_ws()
+            .into_iter()
+            .map(|(id, workspace)| PersistedWindow {
+                id,
+                workspace,
+                saved: self
+                    .parked
+                    .contains(&id)
+                    .then(|| self.saved.get(&id).copied())
+                    .flatten(),
+            })
+            .collect();
+        statefile::save(
+            path,
+            &PersistedState {
+                version: statefile::VERSION,
+                boot_time_sec: self.boot_time,
+                current: self.ledger.current(),
+                windows,
+            },
+        );
     }
 
     fn current_frames() -> HashMap<WindowId, (Pid, Rect)> {
@@ -140,8 +214,27 @@ impl WorkspaceBackend for EmulatedBackend {
         windows: &[WindowId],
         monitors: &[(ordo_core::MonitorId, bool)],
     ) -> Result<BackendTopology> {
-        self.ledger.forget_missing(windows);
-        self.ledger.note_seen(windows);
+        // An empty scan is not an observation of emptiness: displays asleep or
+        // apps too suspended to answer AX look exactly like "every window
+        // closed", and forgetting on that erased every assignment over a
+        // weekend (issues.txt, 2026-08-31 — everything re-adopted onto one
+        // workspace at wake). Forgetting requires positive evidence: a scan
+        // that found SOMETHING but not this window.
+        if !windows.is_empty() {
+            let before = self.ledger.window_ws();
+            self.ledger.forget_missing(windows);
+            self.ledger.note_seen(windows);
+            // The park bookkeeping must forget in lockstep: a stale `parked`
+            // entry for a window the ledger re-adopted turns placement
+            // enforcement against the user (it re-slivers a window that now
+            // belongs on the visible workspace).
+            self.saved.retain(|id, _| windows.contains(id));
+            self.parked.retain(|id| windows.contains(id));
+            self.enforce_attempts.retain(|id, _| windows.contains(id));
+            if self.ledger.window_ws() != before {
+                self.persist();
+            }
+        }
 
         let mons = monitors
             .iter()
@@ -165,6 +258,7 @@ impl WorkspaceBackend for EmulatedBackend {
         // which the effector reasserts after this returns.
         let plan = self.ledger.switch(target);
         if plan.park.is_empty() && plan.restore.is_empty() {
+            self.persist(); // `current` may still have changed
             return Ok(());
         }
         let frames = Self::current_frames();
@@ -175,6 +269,7 @@ impl WorkspaceBackend for EmulatedBackend {
         for w in plan.restore {
             writes.extend(self.restore(w, &frames));
         }
+        self.persist();
         ax::set_frames(&writes);
         self.apply_app_visibility(&frames);
         Ok(())
@@ -187,14 +282,49 @@ impl WorkspaceBackend for EmulatedBackend {
             Some(MoveAction::Restore) => self.restore(window, &frames),
             None => return Err(BackendError(format!("workspace {} out of range", target.0))),
         };
+        self.persist();
         ax::set_frames(write.as_slice());
         self.apply_app_visibility(&frames);
         Ok(())
     }
 
+    fn bring_up(&mut self, use_state: bool) {
+        if use_state {
+            // O: reload the file. With write-through active this is the model
+            // we already have; after a fresh session it's the restore.
+            self.load_state();
+            self.suspended = false;
+        } else {
+            // R: blank model on the same workspace ordinal, file untouched
+            // and unused. Parked slivers keep sitting where they are — O can
+            // always bring their meaning back from the file.
+            self.ledger =
+                Ledger::restore(self.ledger.count(), self.ledger.current(), BTreeMap::new());
+            self.saved.clear();
+            self.parked.clear();
+            self.enforce_attempts.clear();
+            self.suspended = true;
+        }
+    }
+
+    fn resume_persistence(&mut self) {
+        self.suspended = false;
+        self.persist();
+    }
+
     fn enforce_placement(&mut self, frames: &HashMap<WindowId, (Pid, Rect)>) {
+        let assignments = self.ledger.window_ws();
+        let current = self.ledger.current();
         let mut writes = Vec::new();
         for &w in &self.parked {
+            // The ledger outranks the parked set: a window assigned to the
+            // visible workspace must never be slivered, whatever stale
+            // bookkeeping says (a weekend of ledger amnesia left `parked`
+            // full of windows the ledger had re-adopted, and this pass spent
+            // the morning re-hiding windows the user had just placed).
+            if assignments.get(&w) == Some(&current) {
+                continue;
+            }
             let Some((pid, f)) = frames.get(&w) else {
                 continue;
             };
@@ -231,6 +361,7 @@ impl WorkspaceBackend for EmulatedBackend {
             false,
         );
         let write = self.restore(window, &frames);
+        self.persist();
         ax::set_frames(write.as_slice());
         Ok(())
     }

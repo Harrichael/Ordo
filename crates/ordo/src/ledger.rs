@@ -44,6 +44,27 @@ impl Ledger {
         }
     }
 
+    /// Rebuild from persisted claims (see [`crate::statefile`]). Out-of-range
+    /// entries are clamped/dropped rather than trusted — the file is a claim.
+    pub fn restore(
+        count: u8,
+        current: WorkspaceId,
+        assign: BTreeMap<WindowId, WorkspaceId>,
+    ) -> Self {
+        let count = count.max(1);
+        let mut l = Ledger {
+            current: if current.0 >= 1 && current.0 <= count {
+                current
+            } else {
+                WorkspaceId(1)
+            },
+            count,
+            assign,
+        };
+        l.assign.retain(|_, ws| ws.0 >= 1 && ws.0 <= count);
+        l
+    }
+
     pub fn current(&self) -> WorkspaceId {
         self.current
     }
