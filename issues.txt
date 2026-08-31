@@ -304,11 +304,12 @@ named the symptom yet — candidates, ranked:
   mirrors the gathered reality, and --fresh covers the rest); MRU history is
   not persisted (Alt+Tab starts cold after restart).
 
-- Carry-to-workspace (Ctrl+Cmd+arrows) briefly blinks the carried window on the
-  emulated backend: the move parks it (one AX write) and the switch restores it
-  (another), because they're two independent backend calls. Fix if it grates:
-  teach the emulated backend to coalesce a park+restore of the same window
-  within one effect batch, or add a combined move-and-switch backend op.
+- Carry blink/race — FIXED 2026-08-31: a carry now emits an assignment-only
+  effect (AssignWindowToWorkspace); the window's frame is never touched, the
+  following switch finds it already a resident, and the old park-then-restore
+  double write (two racing AX writes per carry) is gone. restore() also now
+  refuses to write a window that is neither bookkept parked nor at the corner,
+  so a lingering saved promise can't teleport a carried window.
 - Native-backend switches are inherently per-display sequential: the Mission
   Control lever targets the display under the pointer, so displays must be
   driven one at a time and each plays its own animation. The emulated backend

@@ -1191,15 +1191,16 @@ fn carry_moves_the_focused_window_and_switches_with_it() {
     let s = booted(&[1]);
     let step = update(&s, &hotkey(HotkeyAction::CarryFocusedToWorkspaceNext));
 
-    // The window is reassigned, then the view follows: move before switch.
+    // The window is reassigned, then the view follows: assignment (never a
+    // frame-touching move — the carried window must not park) before switch.
     let kinds: Vec<&Effect> = step.effects.iter().collect();
     let move_pos = kinds
         .iter()
         .position(|e| {
-            matches!(e, Effect::MoveWindowToWorkspace { window, target, .. }
+            matches!(e, Effect::AssignWindowToWorkspace { window, target, .. }
                 if *window == wid(1) && *target == ws(2))
         })
-        .expect("move effect");
+        .expect("assign effect");
     let switch_pos = kinds
         .iter()
         .position(|e| matches!(e, Effect::SwitchWorkspace { target, .. } if *target == ws(2)))
@@ -1233,6 +1234,31 @@ fn carry_moves_the_focused_window_and_switches_with_it() {
     );
     assert!(obs.state.pending.is_empty());
     assert!(!obs.notes.iter().any(|n| matches!(n, Note::External { .. })));
+}
+
+#[test]
+fn a_carry_mid_handoff_takes_the_granted_window_not_the_stale_focus() {
+    // Run 38 seq 20447: Alt+Tab issued a focus grant, the user carried before
+    // the echo arrived, and the carry read observation-lagged focus — moving
+    // the PREVIOUS window instead of the one visibly focused. Commands must
+    // read the declared focus.
+    let s = booted(&[3, 2, 1]); // history [1, 2, 3], observed focus w1
+    let step = update(&s, &hotkey(HotkeyAction::MruWorkspace)); // grant -> w2
+    assert_eq!(focus_targets(&step.effects), vec![wid(2)]);
+
+    // No snapshot yet: observation still says w1. Carry anyway.
+    let carried = update(
+        &step.state,
+        &hotkey(HotkeyAction::CarryFocusedToWorkspaceNext),
+    );
+    assert!(
+        carried.effects.iter().any(|e| {
+            matches!(e, Effect::AssignWindowToWorkspace { window, target, .. }
+                if *window == wid(2) && *target == ws(2))
+        }),
+        "carried the granted window, not the stale one: {:?}",
+        carried.effects
+    );
 }
 
 #[test]

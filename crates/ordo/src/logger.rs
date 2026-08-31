@@ -286,6 +286,7 @@ fn effect_kind(e: &Effect) -> &'static str {
     match e {
         Effect::SwitchWorkspace { .. } => "switch_workspace",
         Effect::MoveWindowToWorkspace { .. } => "move_window_to_workspace",
+        Effect::AssignWindowToWorkspace { .. } => "assign_window_to_workspace",
         Effect::SetWindowFrame { .. } => "set_window_frame",
         Effect::FocusWindow { .. } => "focus_window",
         Effect::WarpMouse { .. } => "warp_mouse",
@@ -299,6 +300,7 @@ fn effect_op(e: &Effect) -> Option<OpId> {
     match e {
         Effect::SwitchWorkspace { op, .. }
         | Effect::MoveWindowToWorkspace { op, .. }
+        | Effect::AssignWindowToWorkspace { op, .. }
         | Effect::SetWindowFrame { op, .. }
         | Effect::FocusWindow { op, .. } => Some(*op),
         Effect::WarpMouse { .. }

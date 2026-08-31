@@ -107,6 +107,24 @@ impl State {
         OpId(self.next_op)
     }
 
+    /// The user's focus as COMMANDS must read it: the most recent still-
+    /// pending focus grant we issued, falling back to observed focus. Between
+    /// issuing a FocusWindow and its echo arriving, the observation is stale
+    /// by exactly the amount that once made a carry grab the wrong window
+    /// (run 38 seq 20447: the previous window, not the visibly focused one).
+    /// The declared target self-expires with its expectation, so a failed
+    /// grant falls back to observation within a few rescans.
+    pub fn declared_focus(&self) -> Option<WindowId> {
+        self.pending
+            .iter()
+            .rev()
+            .find_map(|p| match p.expect {
+                Expectation::Focused(w) => Some(w),
+                _ => None,
+            })
+            .or(self.focused)
+    }
+
     /// The monitor the user is "at": the focused window's monitor, falling
     /// back to the main display. This anchor decides what "current workspace"
     /// means and where new windows belong.

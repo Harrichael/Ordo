@@ -15,8 +15,20 @@ pub enum Effect {
         op: OpId,
         target: WorkspaceId,
     },
-    /// Reassign one window's workspace without changing what's visible.
+    /// Move one window to a workspace, including whatever visible change
+    /// that implies (the emulated backend parks or restores it). The
+    /// corrective for a window standing where it shouldn't.
     MoveWindowToWorkspace {
+        op: OpId,
+        window: WindowId,
+        target: WorkspaceId,
+    },
+    /// Rewrite one window's workspace DECLARATION and nothing else — no
+    /// frame is touched. A carry wants exactly this: the window stays put
+    /// and the scenery changes around it. Issuing a full move there raced
+    /// two frame writes per carry (the move's park against the following
+    /// switch's restore), a coin flip against any slow app.
+    AssignWindowToWorkspace {
         op: OpId,
         window: WindowId,
         target: WorkspaceId,

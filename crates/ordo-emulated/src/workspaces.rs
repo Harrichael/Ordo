@@ -182,6 +182,29 @@ impl EmulatedWorkspaces {
         Ok(())
     }
 
+    /// Rewrite the window's declaration and nothing else — no frame write, no
+    /// park bookkeeping. The carry path: the window is visible and stays
+    /// exactly where it is; only which workspace it belongs to changes. (The
+    /// full move used to park it and the following switch immediately
+    /// restored it — two frame writes racing on the app's schedule.)
+    pub fn assign_window_to_workspace(
+        &mut self,
+        window: WindowId,
+        target: WorkspaceId,
+    ) -> Result<(), WorkspaceOutOfRange> {
+        if self.ledger.assign_window(window, target).is_none() {
+            return Err(WorkspaceOutOfRange(target));
+        }
+        // A promise about a window now declared onto the visible workspace is
+        // void (nothing should re-park it); toward a hidden workspace, any
+        // needed parking is enforcement's job and keeps its bookkeeping.
+        if target == self.ledger.current() {
+            self.drop_park_bookkeeping(&[window]);
+        }
+        self.persist();
+        Ok(())
+    }
+
     pub fn bring_up(&mut self, use_state: bool) {
         if use_state {
             // O: reload the file. With write-through active this is the model
@@ -503,9 +526,18 @@ impl EmulatedWorkspaces {
         frames: &HashMap<WindowId, (Pid, Rect)>,
         main: Rect,
     ) -> Option<(Pid, WindowId, Rect)> {
-        self.parked.remove(&window);
+        let was_parked = self.parked.remove(&window);
         self.enforce_attempts.remove(&window);
         let (pid, f) = frames.get(&window)?;
+        // Restoring is only meaningful for a window that needs it: bookkept
+        // parked, or physically at the corner. A window already standing
+        // visible (a carried resident, a corrective toward the current
+        // workspace) must NOT be written — `saved` outlives the parked flag
+        // for restore-lag substitution, and honoring that stale promise here
+        // teleported carried windows back to where they used to live.
+        if !was_parked && !at_park_position(f, main) {
+            return None;
+        }
         match self.saved.get(&window) {
             Some(s) => Some((*pid, window, *s)),
             // Parked with no promise (its real frame was never trustworthily
@@ -889,6 +921,41 @@ mod tests {
             .into_iter()
             .map(|(id, p, f)| (id, (p, f)))
             .collect()
+    }
+
+    #[test]
+    fn an_assignment_never_touches_the_frame_and_the_switch_carries_it() {
+        let d = FakeDesktop::new(&[
+            (w(1), Pid(10), rect(100.0, 100.0)),
+            (w(2), Pid(20), rect(300.0, 200.0)),
+        ]);
+        let mut b = EmulatedWorkspaces::new(3);
+        b.note_scan(&d, &d.scan());
+
+        // Prologue: a workspace round trip leaves w1 with a lingering saved
+        // promise (saved outlives parked), and the user then moves it. The
+        // carry must respect where the user put it — honoring the stale
+        // promise teleported carried windows back to their old frame.
+        b.move_window_to_workspace(&d, w(2), ws(2)).unwrap();
+        b.switch_workspace(&d, ws(2));
+        b.switch_workspace(&d, ws(1)); // w1 parked and restored; promise lingers
+        let placed = rect(700.0, 400.0);
+        d.place(w(1), placed);
+
+        // The carry path: reassign, no frame write of any kind…
+        b.assign_window_to_workspace(w(1), ws(2)).unwrap();
+        assert_eq!(b.window_ws()[&w(1)], ws(2));
+        assert_eq!(d.frame(w(1)), placed, "stayed put");
+        assert!(!b.parked.contains(&w(1)));
+
+        // …then the switch finds it already a resident: nothing moves it.
+        b.switch_workspace(&d, ws(2));
+        assert_eq!(d.frame(w(1)), placed, "still where the user put it");
+
+        // And leaving again parks it with a FRESH promise.
+        b.switch_workspace(&d, ws(1));
+        assert!(at_park_position(&d.frame(w(1)), MAIN));
+        assert_eq!(b.saved[&w(1)], placed);
     }
 
     #[test]

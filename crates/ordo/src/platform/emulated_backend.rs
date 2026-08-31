@@ -114,6 +114,12 @@ impl WorkspaceBackend for EmulatedBackend {
             .map_err(|e| BackendError(format!("workspace {} out of range", e.0 .0)))
     }
 
+    fn assign_window_to_workspace(&mut self, window: WindowId, target: WorkspaceId) -> Result<()> {
+        self.model
+            .assign_window_to_workspace(window, target)
+            .map_err(|e| BackendError(format!("workspace {} out of range", e.0 .0)))
+    }
+
     fn rescue_window(&mut self, window: WindowId) -> Result<()> {
         self.model.rescue_window(&self.desktop, window);
         Ok(())

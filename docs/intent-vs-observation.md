@@ -96,11 +96,12 @@ Categories: **D** declared (only commands/named policies write), **O** observed
      stale restores never drain the budget.
 3. **Derivations anchored on the right category**: window `monitor` derives
    from the saved (declared) frame while parked → fixes MRU scope leaks.
-4. **Commands read declared context** (carry mis-target): a carry should act
-   on the user's intended focus, not observation-lagged focus. Options: defer
-   while a Focused expectation is unconfirmed (cheap guard), or the
-   reconciler's full "command read context". Decide here later; do not build
-   both.
+4. **Commands read declared context** (carry mis-target) — DONE 2026-08-31:
+   `State::declared_focus()` (most recent pending focus grant, falling back
+   to observation) feeds the carry, the MRU anchor, demote, and
+   move-to-monitor; a landed grant retires older pending grants so the
+   declaration can never point backward. Carries also became assignment-only
+   (`AssignWindowToWorkspace`), ending the park/restore double-write race.
 5. Only after 1–4 are settled: **re-evaluate the reconciler** against this
    table. Its Desired/Believed split ≈ D/O here; its fight-or-adopt table
    should be regenerated from this audit rather than trusted as written.

@@ -252,6 +252,7 @@ fn effect_op(e: &Effect) -> Option<OpId> {
     match e {
         Effect::SwitchWorkspace { op, .. }
         | Effect::MoveWindowToWorkspace { op, .. }
+        | Effect::AssignWindowToWorkspace { op, .. }
         | Effect::SetWindowFrame { op, .. }
         | Effect::FocusWindow { op, .. } => Some(*op),
         Effect::WarpMouse { .. }

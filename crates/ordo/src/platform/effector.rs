@@ -65,6 +65,11 @@ impl Effector for MacEffector {
                     .borrow_mut()
                     .move_window_to_workspace(*window, *target),
             )),
+            Effect::AssignWindowToWorkspace { window, target, .. } => Some(result_outcome(
+                self.backend
+                    .borrow_mut()
+                    .assign_window_to_workspace(*window, *target),
+            )),
             Effect::WarpMouse { to } => {
                 mouse::warp_to(*to);
                 None

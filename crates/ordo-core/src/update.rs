@@ -199,7 +199,9 @@ fn handle_hotkey(s: &mut State, action: HotkeyAction, now_ns: u64, fx: &mut Vec<
         }
 
         HotkeyAction::CarryFocusedToWorkspacePrev | HotkeyAction::CarryFocusedToWorkspaceNext => {
-            let Some(focused) = s.focused else {
+            // Declared focus, not observed: mid-handoff the observation is
+            // stale and a carry grabbed the PREVIOUS window (run 38).
+            let Some(focused) = s.declared_focus() else {
                 return;
             };
             if !s.windows.contains_key(&focused) {
@@ -208,6 +210,12 @@ fn handle_hotkey(s: &mut State, action: HotkeyAction, now_ns: u64, fx: &mut Vec<
             let Some(cur) = s.current_workspace() else {
                 return;
             };
+            // You carry what's with you: focus can legitimately sit on a
+            // hidden window (landing on an empty workspace leaves it behind),
+            // and dragging that one over would materialize it from nowhere.
+            if s.windows[&focused].workspace != cur {
+                return;
+            }
             let target = match action {
                 HotkeyAction::CarryFocusedToWorkspacePrev if cur.0 > 1 => WorkspaceId(cur.0 - 1),
                 HotkeyAction::CarryFocusedToWorkspaceNext if cur.0 < s.workspace_count => {
@@ -217,9 +225,11 @@ fn handle_hotkey(s: &mut State, action: HotkeyAction, now_ns: u64, fx: &mut Vec<
             };
             // Reassign first, then switch: when the switch lands, the carried
             // window is already a resident of the destination and comes along.
-            // Focus and frame don't change, so no FocusWindow and no WarpMouse.
+            // Assignment only — the window's frame and focus don't change, so
+            // no frame write may be issued for it (a full move parked it and
+            // the switch immediately restored it: two racing writes).
             let move_op = s.mint_op();
-            fx.push(Effect::MoveWindowToWorkspace {
+            fx.push(Effect::AssignWindowToWorkspace {
                 op: move_op,
                 window: focused,
                 target,
@@ -256,7 +266,8 @@ fn handle_hotkey(s: &mut State, action: HotkeyAction, now_ns: u64, fx: &mut Vec<
             let Some(cur_ws) = s.current_workspace() else {
                 return;
             };
-            let focused_rec = s.focused.and_then(|w| s.windows.get(&w)).cloned();
+            let focused = s.declared_focus();
+            let focused_rec = focused.and_then(|w| s.windows.get(&w)).cloned();
             // The scoped variants are relative to the focused window; with
             // nothing focused there is no "same monitor/app" to speak of.
             if focused_rec.is_none() && action != HotkeyAction::MruWorkspace {
@@ -264,7 +275,7 @@ fn handle_hotkey(s: &mut State, action: HotkeyAction, now_ns: u64, fx: &mut Vec<
             }
             let target = {
                 let windows = &s.windows;
-                s.focus_history.most_recent(s.focused, |w| {
+                s.focus_history.most_recent(focused, |w| {
                     let Some(r) = windows.get(&w) else {
                         return false;
                     };
@@ -312,7 +323,7 @@ fn handle_hotkey(s: &mut State, action: HotkeyAction, now_ns: u64, fx: &mut Vec<
             let Some(cur_ws) = s.current_workspace() else {
                 return;
             };
-            let Some(focused) = s.focused else {
+            let Some(focused) = s.declared_focus() else {
                 return;
             };
             // Demoting is only meaningful if focus can actually leave the
@@ -348,7 +359,7 @@ fn handle_hotkey(s: &mut State, action: HotkeyAction, now_ns: u64, fx: &mut Vec<
         }
 
         HotkeyAction::MoveFocusedToOtherMonitor => {
-            let Some(focused) = s.focused else {
+            let Some(focused) = s.declared_focus() else {
                 return;
             };
             let Some(rec) = s.windows.get(&focused).cloned() else {
@@ -457,9 +468,27 @@ fn handle_snapshot(
     reconcile::apply_snapshot(s, snap);
 
     // Resolve or age expectations against the fresh belief.
+    //
+    // Focus is one global slot, so a LANDED grant makes every older pending
+    // grant dead intent. Aging those out normally is harmless for delta
+    // attribution, but declared_focus() would keep reading the stale one —
+    // and a carry mid-burst would grab a window from a workspace behind us.
+    // Newer unlanded grants stay: they remain the freshest declaration.
+    let last_landed_focus = s
+        .pending
+        .iter()
+        .rposition(|p| matches!(p.expect, Expectation::Focused(w) if s.focused == Some(w)));
     let mut expired: Vec<PendingOp> = Vec::new();
     let mut still_pending: Vec<PendingOp> = Vec::new();
-    for mut p in std::mem::take(&mut s.pending) {
+    for (i, mut p) in std::mem::take(&mut s.pending).into_iter().enumerate() {
+        if matches!(p.expect, Expectation::Focused(_))
+            && !expectation_satisfied(&p.expect, s)
+            && last_landed_focus.is_some_and(|j| i < j)
+        {
+            notes.push(Note::OpLost { op: p.op });
+            expired.push(p);
+            continue;
+        }
         if expectation_satisfied(&p.expect, s) {
             notes.push(Note::SelfConfirmed { op: p.op });
             // The world accepted this placement: this axis's fight is over.

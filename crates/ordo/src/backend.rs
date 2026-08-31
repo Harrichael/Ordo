@@ -81,8 +81,17 @@ pub trait WorkspaceBackend {
     /// returning an honest result.
     fn switch_workspace(&mut self, target: WorkspaceId) -> Result<()>;
 
-    /// Reassign one window's workspace without changing what's visible.
+    /// Move one window to a workspace, including whatever visible change that
+    /// implies (emulated: park/restore writes).
     fn move_window_to_workspace(&mut self, window: WindowId, target: WorkspaceId) -> Result<()>;
+
+    /// Rewrite the window's workspace declaration WITHOUT touching its frame
+    /// — what a carry needs (the window stays put; the scenery changes).
+    /// Under native the two are the same operation (an SLS space move never
+    /// touches the frame), so the default delegates.
+    fn assign_window_to_workspace(&mut self, window: WindowId, target: WorkspaceId) -> Result<()> {
+        self.move_window_to_workspace(window, target)
+    }
 
     /// Emergency single-window recovery for the kill switch: make `window`
     /// visible on the active workspace with the least machinery possible.
