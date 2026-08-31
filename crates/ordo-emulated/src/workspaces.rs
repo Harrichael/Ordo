@@ -209,6 +209,32 @@ impl EmulatedWorkspaces {
         self.persist();
     }
 
+    /// Substitute the promise for the mechanism: a window observed at the
+    /// park corner with a live restore promise is REALLY at its saved frame —
+    /// the sliver is this backend's own artifact, and letting it into belief
+    /// poisoned everything downstream (mouse warps aimed at the corner, MRU
+    /// monitor scoping, our own park/restore writes logged as external
+    /// changes). Covers restore lag too: `saved` outlives the parked flag, so
+    /// a just-restored window reads as its real frame while the write is
+    /// still in flight.
+    pub fn believed_frames(
+        &self,
+        d: &dyn Desktop,
+        frames: &HashMap<WindowId, (Pid, Rect)>,
+    ) -> HashMap<WindowId, Rect> {
+        if self.saved.is_empty() {
+            return HashMap::new();
+        }
+        let main = d.main_display();
+        frames
+            .iter()
+            .filter_map(|(w, (_, f))| {
+                let saved = self.saved.get(w)?;
+                at_park_position(f, main).then_some((*w, *saved))
+            })
+            .collect()
+    }
+
     /// `frames` arrives from the caller rather than `d.windows()` because the
     /// shell's enumerator has always just scanned when this runs — no backend
     /// re-enumerates on its own.
@@ -507,9 +533,11 @@ mod tests {
     };
 
     /// A desktop where frame writes land instantly — enough to drive the whole
-    /// backend through the port without a real window.
+    /// backend through the port without a real window. `freeze()` makes later
+    /// writes vanish, simulating an app that hasn't applied them yet.
     struct FakeDesktop {
         windows: std::cell::RefCell<BTreeMap<WindowId, (Pid, Rect)>>,
+        frozen: std::cell::Cell<bool>,
     }
 
     impl FakeDesktop {
@@ -518,11 +546,16 @@ mod tests {
                 windows: std::cell::RefCell::new(
                     windows.iter().map(|(w, p, f)| (*w, (*p, *f))).collect(),
                 ),
+                frozen: std::cell::Cell::new(false),
             }
         }
 
         fn frame(&self, w: WindowId) -> Rect {
             self.windows.borrow()[&w].1
+        }
+
+        fn freeze(&self) {
+            self.frozen.set(true);
         }
     }
 
@@ -536,6 +569,9 @@ mod tests {
         }
 
         fn set_frames(&self, writes: &[(Pid, WindowId, Rect)]) {
+            if self.frozen.get() {
+                return;
+            }
             let mut ws = self.windows.borrow_mut();
             for (pid, w, f) in writes {
                 ws.insert(*w, (*pid, *f));
@@ -577,6 +613,42 @@ mod tests {
         b.switch_workspace(&d, ws(1));
         assert_eq!(d.frame(w(1)), rect(100.0, 100.0));
         assert!(at_park_position(&d.frame(w(2)), MAIN));
+    }
+
+    #[test]
+    fn believed_frames_substitute_the_promise_for_the_sliver() {
+        let d = FakeDesktop::new(&[
+            (w(1), Pid(10), rect(100.0, 100.0)),
+            (w(2), Pid(20), rect(300.0, 200.0)),
+        ]);
+        let mut b = EmulatedWorkspaces::new(3);
+        b.note_scan(&[w(1), w(2)]);
+        b.move_window_to_workspace(&d, w(1), ws(2)).unwrap(); // parks w1
+
+        let frames: HashMap<WindowId, (Pid, Rect)> = d
+            .windows()
+            .into_iter()
+            .map(|(id, p, f)| (id, (p, f)))
+            .collect();
+        let believed = b.believed_frames(&d, &frames);
+        // The parked window reads as its promise, not the corner artifact…
+        assert_eq!(believed.get(&w(1)), Some(&rect(100.0, 100.0)));
+        // …and a visible window's observation stands.
+        assert_eq!(believed.get(&w(2)), None);
+
+        // Restore lag: switch to w1's workspace, but the app never applies
+        // the restore write — the window is bookkept unparked while still
+        // physically a sliver. The promise must keep substituting, which is
+        // exactly why `saved` outlives the parked flag.
+        d.freeze();
+        b.switch_workspace(&d, ws(2));
+        let frames: HashMap<WindowId, (Pid, Rect)> = d
+            .windows()
+            .into_iter()
+            .map(|(id, p, f)| (id, (p, f)))
+            .collect();
+        let believed = b.believed_frames(&d, &frames);
+        assert_eq!(believed.get(&w(1)), Some(&rect(100.0, 100.0)));
     }
 
     #[test]

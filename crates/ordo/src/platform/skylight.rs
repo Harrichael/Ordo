@@ -90,14 +90,21 @@ pub fn fold_topology(displays: &[DisplaySpaces], known: &[(MonitorId, bool)]) ->
             continue;
         };
         let count = d.spaces.len().min(u8::MAX as usize) as u8;
-        let mut active = WorkspaceId(1);
+        let mut active = None;
         for (idx, sid) in d.spaces.iter().enumerate() {
             let ordinal = WorkspaceId((idx as u8).saturating_add(1).max(1));
             space_to_ordinal.insert(*sid, ordinal);
             if *sid == d.current_space {
-                active = ordinal;
+                active = Some(ordinal);
             }
         }
+        // A current space we can't find in the display's own space list means
+        // the active workspace is UNKNOWN (a fullscreen Space, a schema
+        // drift); omit the display so belief keeps its last known value —
+        // never launder the unknown into "workspace 1".
+        let Some(active) = active else {
+            continue;
+        };
         per_monitor.insert(monitor, (active, count.max(1)));
     }
 

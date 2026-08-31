@@ -38,7 +38,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use ordo_core::{
-    MonitorId, MonitorSnap, Pid, Rect, WindowId, WindowSnap, WorkspaceId, WorldSnapshot,
+    MonitorId, MonitorSnap, MonitorWs, Pid, Rect, WindowId, WindowSnap, WorkspaceSnap,
+    WorldSnapshot,
 };
 
 use crate::backend::WorkspaceBackend;
@@ -93,47 +94,30 @@ impl WorldSource for MacWorldSource {
             .topology(&window_ids, &known)
             .unwrap_or_default();
 
+        let frames: HashMap<WindowId, (Pid, Rect)> = scan
+            .windows
+            .iter()
+            .map(|w| (w.id, (w.app, w.frame)))
+            .collect();
+
         if self.intercepting.load(Ordering::Relaxed) {
             // The corrective write lands after this snapshot was read, so the
             // snapshot still shows the phantom; the next rescan absorbs the
             // fix as an (unattributed) external delta. Acceptable for a
             // standing-invariant band-aid.
-            let frames: HashMap<WindowId, (Pid, Rect)> = scan
-                .windows
-                .iter()
-                .map(|w| (w.id, (w.app, w.frame)))
-                .collect();
             self.backend.borrow_mut().enforce_placement(&frames);
         }
 
-        let per_monitor: HashMap<MonitorId, (WorkspaceId, u8)> = topo
-            .monitors
-            .iter()
-            .map(|m| (m.monitor, (m.active, m.count)))
-            .collect();
-        // The usable workspace count spans all displays, so it's the min.
-        let global_count = topo
-            .monitors
-            .iter()
-            .map(|m| m.count)
-            .min()
-            .unwrap_or(1)
-            .max(1);
+        // Mechanism artifacts (park slivers) never reach the core: the
+        // backend substitutes the promise each one encodes.
+        let believed = self.backend.borrow().believed_frames(&frames);
 
         let monitors = displays
             .iter()
-            .map(|d| {
-                let (active, count) = per_monitor
-                    .get(&d.id)
-                    .copied()
-                    .unwrap_or((WorkspaceId(1), global_count));
-                MonitorSnap {
-                    id: d.id,
-                    frame: d.frame,
-                    is_main: d.is_main,
-                    active_workspace: active,
-                    workspace_count: count,
-                }
+            .map(|d| MonitorSnap {
+                id: d.id,
+                frame: d.frame,
+                is_main: d.is_main,
             })
             .collect();
 
@@ -145,18 +129,36 @@ impl WorldSource for MacWorldSource {
                 app: w.app,
                 bundle_id: w.bundle_id.clone(),
                 title: w.title.clone(),
-                frame: w.frame,
-                // A window SkyLight didn't resolve defaults to workspace 1.
-                // Known limitation: a window on another space that the query
-                // missed will look mislocated until the next resolved scan.
-                workspace: topo.window_ws.get(&w.id).copied().unwrap_or(WorkspaceId(1)),
+                frame: believed.get(&w.id).copied().unwrap_or(w.frame),
             })
             .collect();
+
+        // The workspace layer travels on its own channel, exactly as the
+        // backend told it: a monitor or window it didn't resolve is absent —
+        // UNKNOWN to the core — never defaulted (the old join fabricated
+        // workspace 1 for unresolved windows).
+        let workspaces = WorkspaceSnap {
+            monitors: topo
+                .monitors
+                .iter()
+                .map(|m| {
+                    (
+                        m.monitor,
+                        MonitorWs {
+                            active: m.active,
+                            count: m.count,
+                        },
+                    )
+                })
+                .collect(),
+            assignments: topo.window_ws.iter().map(|(w, ws)| (*w, *ws)).collect(),
+        };
 
         WorldSnapshot {
             monitors,
             windows,
             focused: scan.focused,
+            workspaces,
         }
     }
 }

@@ -125,6 +125,10 @@ impl WorkspaceBackend for EmulatedBackend {
         self.model.enforce_placement(&self.desktop, frames);
     }
 
+    fn believed_frames(&self, frames: &HashMap<WindowId, (Pid, Rect)>) -> HashMap<WindowId, Rect> {
+        self.model.believed_frames(&self.desktop, frames)
+    }
+
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             // The whole point of emulation: we can mint workspaces freely.

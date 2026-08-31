@@ -36,48 +36,71 @@ fn rect(x: f64, y: f64) -> Rect {
     }
 }
 
-fn mon_a(active: u8) -> MonitorSnap {
-    MonitorSnap {
-        id: mid(1),
-        frame: Rect {
-            x: 0.0,
-            y: 0.0,
-            w: 1920.0,
-            h: 1080.0,
+/// A monitor observation plus the backend's workspace word for it, kept
+/// together so fixtures read like one record; `world()` routes each half onto
+/// its own snapshot channel.
+#[derive(Clone)]
+struct Mon {
+    snap: MonitorSnap,
+    active: WorkspaceId,
+    count: u8,
+}
+
+/// Same pairing for a window: the observation plus its assignment.
+#[derive(Clone)]
+struct Win {
+    snap: WindowSnap,
+    workspace: WorkspaceId,
+}
+
+fn mon_a(active: u8) -> Mon {
+    Mon {
+        snap: MonitorSnap {
+            id: mid(1),
+            frame: Rect {
+                x: 0.0,
+                y: 0.0,
+                w: 1920.0,
+                h: 1080.0,
+            },
+            is_main: true,
         },
-        is_main: true,
-        active_workspace: ws(active),
-        workspace_count: 3,
+        active: ws(active),
+        count: 3,
     }
 }
 
-fn mon_b(active: u8) -> MonitorSnap {
-    MonitorSnap {
-        id: mid(2),
-        frame: Rect {
-            x: 1920.0,
-            y: 0.0,
-            w: 1920.0,
-            h: 1080.0,
+fn mon_b(active: u8) -> Mon {
+    Mon {
+        snap: MonitorSnap {
+            id: mid(2),
+            frame: Rect {
+                x: 1920.0,
+                y: 0.0,
+                w: 1920.0,
+                h: 1080.0,
+            },
+            is_main: false,
         },
-        is_main: false,
-        active_workspace: ws(active),
-        workspace_count: 3,
+        active: ws(active),
+        count: 3,
     }
 }
 
-fn win(id: u32, pid: i32, workspace: u8, frame: Rect) -> WindowSnap {
-    WindowSnap {
-        id: wid(id),
-        app: Pid(pid),
-        bundle_id: None,
-        title: format!("w{id}"),
-        frame,
+fn win(id: u32, pid: i32, workspace: u8, frame: Rect) -> Win {
+    Win {
+        snap: WindowSnap {
+            id: wid(id),
+            app: Pid(pid),
+            bundle_id: None,
+            title: format!("w{id}"),
+            frame,
+        },
         workspace: ws(workspace),
     }
 }
 
-fn std_windows() -> Vec<WindowSnap> {
+fn std_windows() -> Vec<Win> {
     vec![
         win(1, 100, 1, rect(100.0, 100.0)),
         win(2, 200, 1, rect(2000.0, 100.0)),
@@ -85,20 +108,39 @@ fn std_windows() -> Vec<WindowSnap> {
     ]
 }
 
+fn world(monitors: &[Mon], windows: &[Win], focused: Option<u32>) -> WorldSnapshot {
+    WorldSnapshot {
+        monitors: monitors.iter().map(|m| m.snap.clone()).collect(),
+        windows: windows.iter().map(|w| w.snap.clone()).collect(),
+        focused: focused.map(wid),
+        workspaces: WorkspaceSnap {
+            monitors: monitors
+                .iter()
+                .map(|m| {
+                    (
+                        m.snap.id,
+                        MonitorWs {
+                            active: m.active,
+                            count: m.count,
+                        },
+                    )
+                })
+                .collect(),
+            assignments: windows.iter().map(|w| (w.snap.id, w.workspace)).collect(),
+        },
+    }
+}
+
 fn observed(
-    monitors: Vec<MonitorSnap>,
-    windows: Vec<WindowSnap>,
+    monitors: Vec<Mon>,
+    windows: Vec<Win>,
     focused: Option<u32>,
     trigger: RescanTrigger,
 ) -> Event {
     Event::WorldObserved {
         at: ts(),
         trigger,
-        snap: WorldSnapshot {
-            monitors,
-            windows,
-            focused: focused.map(wid),
-        },
+        snap: world(&monitors, &windows, focused),
     }
 }
 
@@ -227,6 +269,61 @@ fn destroyed_window_leaves_the_mru_history() {
     .state;
     let step = update(&s, &hotkey(HotkeyAction::MruWorkspace));
     assert_eq!(focus_targets(&step.effects), vec![wid(3)]);
+}
+
+#[test]
+fn an_unresolved_workspace_is_unknown_not_a_fact() {
+    // The workspace layer travels on its own channel, and absence there means
+    // UNKNOWN: belief keeps what it had, and nothing is fabricated. (The old
+    // single-record snapshot defaulted unresolved windows to workspace 1 —
+    // an unknown laundered into a "fact" that then rewrote declarations.)
+    // Move the world to workspace 2 first, so "kept" is distinguishable from
+    // the old fabrication default (workspace 1).
+    let s = booted(&[1]);
+    let mut wins = std_windows();
+    wins[1].workspace = ws(2);
+    let s = update(
+        &s,
+        &observed(
+            vec![mon_a(2), mon_b(2)],
+            wins.clone(),
+            Some(2),
+            RescanTrigger::Periodic,
+        ),
+    )
+    .state;
+
+    // This scan, the backend has no word on w2, none on monitor B, and none
+    // on the never-before-seen w9.
+    wins.push(win(9, 300, 2, rect(700.0, 100.0)));
+    let mut snap = world(&[mon_a(2), mon_b(2)], &wins, Some(2));
+    snap.workspaces.assignments.remove(&wid(2));
+    snap.workspaces.assignments.remove(&wid(9));
+    snap.workspaces.monitors.remove(&mid(2));
+    let obs = update(
+        &s,
+        &Event::WorldObserved {
+            at: ts(),
+            trigger: RescanTrigger::Periodic,
+            snap,
+        },
+    );
+
+    // w2 keeps its workspace; the gap is not read as a change (and is not
+    // defaulted back to workspace 1).
+    assert_eq!(obs.state.windows[&wid(2)].workspace, ws(2));
+    // Monitor B keeps its last known active workspace.
+    assert_eq!(obs.state.monitor_ws[&mid(2)], ws(2));
+    // w9 stays out of the model until the backend can place it.
+    assert!(!obs.state.windows.contains_key(&wid(9)));
+    assert!(
+        obs.notes
+            .iter()
+            .all(|n| !matches!(n, Note::External { .. })),
+        "unknowns produced no external deltas: {:?}",
+        obs.notes
+    );
+    assert!(obs.effects.is_empty());
 }
 
 // --- MRU hotkeys -------------------------------------------------------------
@@ -539,16 +636,11 @@ fn late_focus_echo_inside_the_settle_window_is_held_not_followed() {
         wall_ms: 0,
         mono_ns,
     };
-    let obs =
-        |mono_ns: u64, active: u8, wins: Vec<WindowSnap>, focused: u32| Event::WorldObserved {
-            at: at(mono_ns),
-            trigger: RescanTrigger::Periodic,
-            snap: WorldSnapshot {
-                monitors: vec![mon_a(active), mon_b(active)],
-                windows: wins,
-                focused: Some(wid(focused)),
-            },
-        };
+    let obs = |mono_ns: u64, active: u8, wins: Vec<Win>, focused: u32| Event::WorldObserved {
+        at: at(mono_ns),
+        trigger: RescanTrigger::Periodic,
+        snap: world(&[mon_a(active), mon_b(active)], &wins, Some(focused)),
+    };
     let mut wins = std_windows();
     wins[1].workspace = ws(2); // w2 lives on workspace 2
 
@@ -615,7 +707,7 @@ fn closing_a_window_never_follows_focus_to_another_workspace() {
     .state;
 
     // w3 closes; macOS gives focus to w2 (on hidden workspace 2).
-    wins.retain(|w| w.id != wid(3));
+    wins.retain(|w| w.snap.id != wid(3));
     let step = update(
         &s,
         &observed(
@@ -997,7 +1089,7 @@ fn clamped_landing_on_the_target_monitor_confirms_the_move() {
     let f = set_frame_for(&step.effects, 1).expect("frame effect");
 
     let mut wins = std_windows();
-    wins[0].frame = Rect { y: f.y + 33.0, ..f }; // clamped below the menu bar
+    wins[0].snap.frame = Rect { y: f.y + 33.0, ..f }; // clamped below the menu bar
     let landed = update(
         &step.state,
         &observed(
@@ -1209,41 +1301,24 @@ fn tear_realign_skips_workspaces_no_display_can_reach() {
     // F3: monitor A has 5 spaces and sits on space 5; monitor B has only 3.
     // The world is torn, but no display can reach workspace 5, so Ordo must not
     // fire a futile switch.
-    let mon_a5 = MonitorSnap {
-        id: mid(1),
-        frame: Rect {
-            x: 0.0,
-            y: 0.0,
-            w: 1920.0,
-            h: 1080.0,
-        },
-        is_main: true,
-        active_workspace: ws(5),
-        workspace_count: 5,
+    let mon_a5 = Mon {
+        active: ws(5),
+        count: 5,
+        ..mon_a(1)
     };
-    let mon_b3 = MonitorSnap {
-        id: mid(2),
-        frame: Rect {
-            x: 1920.0,
-            y: 0.0,
-            w: 1920.0,
-            h: 1080.0,
-        },
-        is_main: false,
-        active_workspace: ws(1),
-        workspace_count: 3,
+    let mon_b3 = Mon {
+        active: ws(1),
+        count: 3,
+        ..mon_b(1)
     };
     let obs = update(
         &State::new(),
-        &Event::WorldObserved {
-            at: ts(),
-            trigger: RescanTrigger::Startup,
-            snap: WorldSnapshot {
-                monitors: vec![mon_a5, mon_b3],
-                windows: vec![win(1, 100, 5, rect(100.0, 100.0))],
-                focused: Some(wid(1)),
-            },
-        },
+        &observed(
+            vec![mon_a5, mon_b3],
+            vec![win(1, 100, 5, rect(100.0, 100.0))],
+            Some(1),
+            RescanTrigger::Startup,
+        ),
     );
     assert!(obs.state.is_torn());
     assert_eq!(obs.state.current_workspace(), Some(ws(5)));

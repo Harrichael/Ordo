@@ -113,5 +113,15 @@ pub trait WorkspaceBackend {
     /// promises; the default is a no-op.
     fn enforce_placement(&mut self, _frames: &HashMap<WindowId, (Pid, Rect)>) {}
 
+    /// The backend's better knowledge of some windows' real frames, keyed by
+    /// window; absent windows are taken as observed. Observation artifacts of
+    /// a backend's own mechanism (the emulated park sliver) are replaced by
+    /// the promise they encode BEFORE the snapshot is assembled, so the core
+    /// never sees the mechanism — or mistakes it for the user or an app
+    /// acting. Native has no such mechanism; the default is empty.
+    fn believed_frames(&self, _frames: &HashMap<WindowId, (Pid, Rect)>) -> HashMap<WindowId, Rect> {
+        HashMap::new()
+    }
+
     fn capabilities(&self) -> Capabilities;
 }

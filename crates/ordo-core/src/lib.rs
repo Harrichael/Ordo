@@ -41,8 +41,8 @@ mod update;
 
 pub use effect::{CorrectionAxis, Effect, Expectation};
 pub use event::{
-    AxHintKind, Event, HotkeyAction, MonitorSnap, OpOutcome, RescanTrigger, Ts, WindowSnap,
-    WorldSnapshot,
+    AxHintKind, Event, HotkeyAction, MonitorSnap, MonitorWs, OpOutcome, RescanTrigger, Ts,
+    WindowSnap, WorkspaceSnap, WorldSnapshot,
 };
 pub use ids::{MonitorId, OpId, Pid, Point, Rect, WindowId, WorkspaceId, FRAME_EPSILON};
 pub use mru::FocusHistory;

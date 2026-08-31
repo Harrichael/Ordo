@@ -111,14 +111,29 @@ pub enum OpOutcome {
     Timeout,
 }
 
-/// A full observation of the world, already translated into core vocabulary:
-/// the enumerator and backend resolve SpaceIds, display ids, and AX handles
-/// before this is built.
+/// A full reading of the world, already translated into core vocabulary: the
+/// enumerator and backend resolve SpaceIds, display ids, and AX handles before
+/// this is built.
+///
+/// Two channels, deliberately separate. `monitors`/`windows`/`focused` are
+/// OBSERVATIONS — what CG and AX actually saw; belief follows them freely.
+/// `workspaces` is the backend's WORD on the workspace layer, which is not an
+/// observation of the same kind: under emulation those are Ordo's own
+/// declarations (only commands change them — a scan physically cannot report
+/// a different assignment, which is what makes the old smuggled
+/// `WindowSnap.workspace` bug class unrepresentable), while under native
+/// Spaces the OS owns them and the same field genuinely is observed. The core
+/// handles both identically — the backend's word is authoritative — so the
+/// core path never bifurcates; only the provenance differs, behind the seam.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WorldSnapshot {
     pub monitors: Vec<MonitorSnap>,
     pub windows: Vec<WindowSnap>,
     pub focused: Option<WindowId>,
+    /// `serde(default)` so pre-split logs still decode for inspection (their
+    /// replays diverge regardless — the decision logic changed with the shape).
+    #[serde(default)]
+    pub workspaces: WorkspaceSnap,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -126,10 +141,6 @@ pub struct MonitorSnap {
     pub id: MonitorId,
     pub frame: Rect,
     pub is_main: bool,
-    pub active_workspace: WorkspaceId,
-    /// Per-display space count; the usable workspace count is the minimum
-    /// across displays (extra spaces on one display are unreachable by Ordo).
-    pub workspace_count: u8,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -139,5 +150,26 @@ pub struct WindowSnap {
     pub bundle_id: Option<String>,
     pub title: String,
     pub frame: Rect,
-    pub workspace: WorkspaceId,
+}
+
+/// The workspace layer, as the backend tells it. Absence means UNKNOWN, never
+/// a default: a monitor or window missing from these maps leaves belief
+/// exactly as it was (the old contract fabricated workspace 1 for unresolved
+/// windows — an unknown laundered into a fact).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct WorkspaceSnap {
+    /// Active workspace and per-display workspace count, per monitor the
+    /// backend resolved. The usable count is the minimum across the monitors
+    /// covered here (extra spaces on one display are unreachable by Ordo);
+    /// an uncovered monitor cannot move the count or its own active belief.
+    pub monitors: std::collections::BTreeMap<MonitorId, MonitorWs>,
+    /// Workspace assignment for every window the backend resolved; an
+    /// unresolved window is absent, and its belief stands.
+    pub assignments: std::collections::BTreeMap<WindowId, WorkspaceId>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MonitorWs {
+    pub active: WorkspaceId,
+    pub count: u8,
 }

@@ -1,5 +1,18 @@
 # Ordo — open issues
 
+## Believed-frame substitution hides one phantom shape (2026-08-31, accepted)
+
+Since the seam split, a window observed at the park corner with a live
+restore promise reads to the core as sitting at its saved frame (the sliver
+is the backend's own artifact). Deliberate trade: "restore in flight" and
+"restore never landed" are the same observable state, and the rule resolves
+the ambiguity toward the promise. Consequence: a window assigned to the
+CURRENT workspace whose restore write never landed sits as a 1px sliver the
+user can see while belief and the log say it's fine — enforcement skips it
+(assigned here) and nothing delta-driven fires. Fix shape if it ever bites:
+a bounded restore-pending window (promise substitutes only while the restore
+is younger than N scans), instead of unbounded `saved`.
+
 ## Polling gaps (belief staleness up to one rescan interval, default 2s)
 
 The architecture is "notifications are hints, scans are truth"; anything

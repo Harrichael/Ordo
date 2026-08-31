@@ -13,8 +13,8 @@ use ordo::logger::Logger;
 use ordo::ports::{Effector, NullEffector, WorldSource};
 use ordo::replay::replay;
 use ordo_core::{
-    Effect, MonitorId, MonitorSnap, OpOutcome, Pid, Rect, WindowId, WindowSnap, WorkspaceId,
-    WorldSnapshot,
+    Effect, MonitorId, MonitorSnap, MonitorWs, OpOutcome, Pid, Rect, WindowId, WindowSnap,
+    WorkspaceId, WorkspaceSnap, WorldSnapshot,
 };
 use rusqlite::Connection;
 
@@ -69,7 +69,7 @@ impl Clock for StepClock {
 
 // --- snapshot fixtures -----------------------------------------------------
 
-fn mon(id: u8, x: f64, active: u8) -> MonitorSnap {
+fn mon(id: u8, x: f64) -> MonitorSnap {
     MonitorSnap {
         id: MonitorId(id as u128),
         frame: Rect {
@@ -79,12 +79,10 @@ fn mon(id: u8, x: f64, active: u8) -> MonitorSnap {
             h: 1080.0,
         },
         is_main: id == 1,
-        active_workspace: WorkspaceId(active),
-        workspace_count: 3,
     }
 }
 
-fn win(id: u32, pid: i32, x: f64, ws: u8) -> WindowSnap {
+fn win(id: u32, pid: i32, x: f64) -> WindowSnap {
     WindowSnap {
         id: WindowId(id),
         app: Pid(pid),
@@ -96,19 +94,39 @@ fn win(id: u32, pid: i32, x: f64, ws: u8) -> WindowSnap {
             w: 400.0,
             h: 300.0,
         },
-        workspace: WorkspaceId(ws),
     }
 }
 
 fn snap(focused: Option<u32>, a_ws: u8, b_ws: u8) -> WorldSnapshot {
     WorldSnapshot {
-        monitors: vec![mon(1, 0.0, a_ws), mon(2, 1920.0, b_ws)],
-        windows: vec![
-            win(1, 100, 100.0, a_ws),
-            win(2, 200, 2000.0, b_ws),
-            win(3, 100, 600.0, a_ws),
-        ],
+        monitors: vec![mon(1, 0.0), mon(2, 1920.0)],
+        windows: vec![win(1, 100, 100.0), win(2, 200, 2000.0), win(3, 100, 600.0)],
         focused: focused.map(WindowId),
+        workspaces: WorkspaceSnap {
+            monitors: [
+                (
+                    MonitorId(1),
+                    MonitorWs {
+                        active: WorkspaceId(a_ws),
+                        count: 3,
+                    },
+                ),
+                (
+                    MonitorId(2),
+                    MonitorWs {
+                        active: WorkspaceId(b_ws),
+                        count: 3,
+                    },
+                ),
+            ]
+            .into(),
+            assignments: [
+                (WindowId(1), WorkspaceId(a_ws)),
+                (WindowId(2), WorkspaceId(b_ws)),
+                (WindowId(3), WorkspaceId(a_ws)),
+            ]
+            .into(),
+        },
     }
 }
 
