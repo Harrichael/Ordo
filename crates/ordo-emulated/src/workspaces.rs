@@ -16,6 +16,13 @@ use crate::Desktop;
 /// manual escape hatch if Ordo dies mid-park.
 const SLIVER: f64 = 1.0;
 
+/// How far the WindowServer may drag a parked window back from the corner we
+/// asked for. Observed pull-back is a title bar's height (~28-40pt); the
+/// margin covers taller bars and display scaling. Wide enough to recognize
+/// every real park, narrow enough that only a window nobody could read sits
+/// inside it.
+const PARK_SLACK: f64 = 80.0;
+
 /// Foreign-attributed re-parks of a phantom before the episode is resolved
 /// by ADOPTION — the declaration rewrites to match where the window visibly
 /// insists on living. Never a silent surrender: a standing disagreement
@@ -539,6 +546,12 @@ impl EmulatedWorkspaces {
             return None;
         }
         match self.saved.get(&window) {
+            // A promise that is itself a park position is not a promise. It is
+            // residue from before the corner was recognizable (see
+            // `at_park_position`), and it was persisted to disk, so it outlives
+            // the bug that wrote it. Honoring it re-parks the window the instant
+            // its workspace comes up — the window you cannot switch to.
+            Some(s) if at_park_position(s, main) => Some((*pid, window, rehome_into(s, main))),
             Some(s) => Some((*pid, window, *s)),
             // Parked with no promise (its real frame was never trustworthily
             // seen — see park()'s sliver guard): don't leave it a 1px sliver
@@ -600,9 +613,26 @@ fn park_frame(size: Rect, main: Rect) -> Rect {
 
 /// Is this frame sitting at the park corner? Position is the parked
 /// invariant; size is the window's own.
+///
+/// GOTCHA: a parked window does NOT land where we asked. The WindowServer
+/// refuses to push a title bar off the bottom of the screen and pulls the
+/// window back up by roughly a title bar's height — on a 1080p main display,
+/// a park requested at y=1079 lands at y≈1039-1052, and the pull-back varies
+/// by app. So this asks whether the origin sits in the park CORNER REGION,
+/// never whether it hit the exact point.
+///
+/// The exact-point version of this test answered "not parked" about every
+/// window we had in fact parked, which is not a rounding nuisance but the
+/// hinge the whole model turns on: enforcement re-parked compliant windows
+/// forever and then adopted them onto whatever workspace was showing, and
+/// `park`'s sliver guard never fired, so it canonicalized corner positions as
+/// windows' real frames. Prefer a false "parked" to a false "escaped" — a
+/// window whose origin is in this region is not usefully visible anyway.
 fn at_park_position(f: &Rect, main: Rect) -> bool {
     let want = park_frame(*f, main);
-    (f.x - want.x).abs() <= 1.0 && (f.y - want.y).abs() <= 1.0
+    let pulled_back =
+        |actual: f64, requested: f64| actual <= requested + 1.0 && actual >= requested - PARK_SLACK;
+    pulled_back(f.x, want.x) && pulled_back(f.y, want.y)
 }
 
 /// Re-home a frame fully inside `area` (top-left, shrunk if oversized) — the
@@ -745,13 +775,24 @@ mod tests {
                 .collect()
         }
 
+        /// Writes land CLAMPED, as the real WindowServer lands them: a window
+        /// may not be positioned with its title bar below the bottom of the
+        /// display. A fake that stores frames verbatim is a fake that cannot
+        /// reproduce parking, which is how an exact-point `at_park_position`
+        /// passed every test here and fought every window in production.
         fn set_frames(&self, writes: &[(Pid, WindowId, Rect)]) {
             if self.frozen.get() {
                 return;
             }
+            const TITLE_BAR: f64 = 28.0;
+            let floor = MAIN.y + MAIN.h - TITLE_BAR;
             let mut ws = self.windows.borrow_mut();
             for (pid, w, f) in writes {
-                ws.insert(*w, (*pid, *f));
+                let landed = Rect {
+                    y: f.y.min(floor),
+                    ..*f
+                };
+                ws.insert(*w, (*pid, landed));
             }
         }
 
@@ -1024,6 +1065,78 @@ mod tests {
         assert!(!b.saved.contains_key(&w(1)));
         assert!(!b.parked.contains(&w(1)));
         assert_eq!(d.frame(w(1)), foreign, "and left where it stood");
+    }
+
+    /// The regression that made the emulated backend unusable: macOS lands a
+    /// parked window a title bar above the corner we asked for, so a compliant
+    /// window read as an escapee on every pass — re-parked forever, then
+    /// adopted onto whatever workspace happened to be showing.
+    #[test]
+    fn a_park_that_lands_where_macos_puts_it_is_compliance_not_escape() {
+        let d = FakeDesktop::new(&[
+            (w(1), Pid(10), rect(100.0, 100.0)),
+            (w(2), Pid(20), rect(300.0, 200.0)),
+        ]);
+        let mut b = EmulatedWorkspaces::new(3);
+        b.note_scan(&d, &d.scan());
+        b.move_window_to_workspace(&d, w(1), ws(2)).unwrap();
+
+        // The landed frame is NOT the requested corner — that is the whole
+        // point — but it is still parked.
+        let landed = d.frame(w(1));
+        assert!(landed.y < MAIN.h - SLIVER, "macOS pulled it back up");
+        assert!(
+            at_park_position(&landed, MAIN),
+            "still recognized as parked"
+        );
+
+        // Enforcement must leave it alone indefinitely: no budget spent, no
+        // adoption, no write churn against a window that is already obeying.
+        for _ in 0..(ENFORCE_LIMIT as usize + 5) {
+            b.enforce_placement(&d, &frames_of(&d));
+        }
+        assert_eq!(b.window_ws()[&w(1)], ws(2), "declaration survives");
+        assert!(
+            b.enforce_attempts.is_empty(),
+            "no violation was ever counted"
+        );
+        assert_eq!(d.frame(w(1)), landed, "and it was never rewritten");
+
+        // The promise stayed the window's real frame, so it comes back whole.
+        b.switch_workspace(&d, ws(2));
+        assert_eq!(d.frame(w(1)), rect(100.0, 100.0));
+    }
+
+    /// State files written before the corner was recognizable carry promises
+    /// that ARE park positions. Honoring one re-parks the window the moment
+    /// its workspace comes up: the window you cannot switch to.
+    #[test]
+    fn a_promise_that_is_itself_a_park_position_re_homes_instead_of_re_parking() {
+        let d = FakeDesktop::new(&[(w(1), Pid(10), rect(100.0, 100.0))]);
+        let mut b = EmulatedWorkspaces::new(3);
+        b.note_scan(&d, &d.scan());
+        b.move_window_to_workspace(&d, w(1), ws(2)).unwrap();
+
+        // Exactly the residue found in a live state.json: origin at the park
+        // corner, the window's own size preserved.
+        let poisoned = Rect {
+            x: MAIN.w - SLIVER,
+            y: MAIN.h - 28.0,
+            w: 1424.0,
+            h: 906.0,
+        };
+        b.saved.insert(w(1), poisoned);
+
+        b.switch_workspace(&d, ws(2));
+        let restored = d.frame(w(1));
+        assert!(
+            !at_park_position(&restored, MAIN),
+            "must not restore into the corner it was parked in"
+        );
+        assert!(
+            restored.x >= MAIN.x && restored.y >= MAIN.y && restored.x + restored.w <= MAIN.w,
+            "and must land somewhere reachable: {restored:?}"
+        );
     }
 
     #[test]
