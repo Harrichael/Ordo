@@ -16,8 +16,10 @@ use crate::Desktop;
 /// manual escape hatch if Ordo dies mid-park.
 const SLIVER: f64 = 1.0;
 
-/// Re-parks of a phantom before we stop fighting it (mirrors the core's
-/// correction damping): an app that insists on being visible wins, loudly.
+/// Foreign-attributed re-parks of a phantom before the episode is resolved
+/// by ADOPTION — the declaration rewrites to match where the window visibly
+/// insists on living. Never a silent surrender: a standing disagreement
+/// between ledger and screen is the raw material of enforcement wars.
 const ENFORCE_LIMIT: u8 = 3;
 
 /// A requested workspace outside the configured range.
@@ -32,8 +34,12 @@ pub struct EmulatedWorkspaces {
     /// already-parked window (a hidden->hidden move) doesn't overwrite its real
     /// saved frame with the sliver position.
     parked: HashSet<WindowId>,
-    /// Phantom re-parks issued per window since it last sat parked correctly.
+    /// FOREIGN-attributed re-parks issued per window since it last sat parked
+    /// correctly (our own stale restores and systemic events don't count).
     enforce_attempts: HashMap<WindowId, u8>,
+    /// The main display as of the last enforcement pass. A change moves the
+    /// park corner itself — a systemic event no window should be blamed for.
+    last_main: Option<Rect>,
     /// Where the ledger's promises persist across restarts (None = ephemeral,
     /// e.g. `--fresh`). Written through on every mutation; see statefile.rs
     /// for the trust model.
@@ -51,6 +57,7 @@ impl EmulatedWorkspaces {
             saved: HashMap::new(),
             parked: HashSet::new(),
             enforce_attempts: HashMap::new(),
+            last_main: None,
             state_path: None,
             boot_time: statefile::boot_time_sec(),
             suspended: false,
@@ -262,28 +269,59 @@ impl EmulatedWorkspaces {
             .collect()
     }
 
+    /// Assert the declarations: every window assigned to a hidden workspace
+    /// must sit at the park corner. Iterates the LEDGER, not the parked set —
+    /// a window whose park write never happened (its frame was unreadable at
+    /// park time) is still declared hidden, and a parked-set walk was blind
+    /// to it forever.
+    ///
+    /// Violations are classified by frame before they cost budget:
+    /// - at the park corner: compliant.
+    /// - at its own restore promise (position match, like the corner check —
+    ///   size is the window's own): OUR stale restore landed late (or the
+    ///   app re-applied its autosaved frame — same response). Re-park
+    ///   without counting; our own writes are not an app fighting back, and
+    ///   counting them drained the budget until damping surrendered to them
+    ///   (run 41's enforcement war).
+    /// - anywhere else: a foreign write; count it. At the limit the episode
+    ///   ends in AGREEMENT, not surrender: the window is ADOPTED onto the
+    ///   visible workspace (it visibly lives here; leaving a lie in the
+    ///   ledger is what wars are made of), loudly — at most one per pass,
+    ///   because many windows escaping at once is a systemic event, not an
+    ///   app fighting back.
+    ///
+    /// A main-display change IS such a systemic event: the park corner moves,
+    /// so every parked window reads as in violation at once for a reason
+    /// that has nothing to do with opposition. That pass re-asserts without
+    /// counting and clears every budget.
+    ///
     /// `frames` arrives from the caller rather than `d.windows()` because the
     /// shell's enumerator has always just scanned when this runs — no backend
     /// re-enumerates on its own.
     pub fn enforce_placement(&mut self, d: &dyn Desktop, frames: &HashMap<WindowId, (Pid, Rect)>) {
+        let current = self.ledger.current();
+        let hidden: Vec<WindowId> = self
+            .ledger
+            .window_ws()
+            .into_iter()
+            .filter(|(_, ws)| *ws != current)
+            .map(|(w, _)| w)
+            .collect();
         // This runs on every snapshot; don't pay the display query when
         // there's nothing to enforce.
-        if self.parked.is_empty() {
+        if hidden.is_empty() {
             return;
         }
-        let assignments = self.ledger.window_ws();
-        let current = self.ledger.current();
         let main = d.main_display();
+        let systemic = self.last_main.is_some_and(|m| m != main);
+        self.last_main = Some(main);
+        if systemic {
+            self.enforce_attempts.clear();
+        }
         let mut writes = Vec::new();
-        for &w in &self.parked {
-            // The ledger outranks the parked set: a window assigned to the
-            // visible workspace must never be slivered, whatever stale
-            // bookkeeping says (a weekend of ledger amnesia left `parked`
-            // full of windows the ledger had re-adopted, and this pass spent
-            // the morning re-hiding windows the user had just placed).
-            if assignments.get(&w) == Some(&current) {
-                continue;
-            }
+        let mut adopt: Option<WindowId> = None;
+        let mut newly_parked = false;
+        for w in hidden {
             let Some((pid, f)) = frames.get(&w) else {
                 continue;
             };
@@ -291,19 +329,58 @@ impl EmulatedWorkspaces {
                 self.enforce_attempts.remove(&w);
                 continue;
             }
-            let want = park_frame(*f, main);
-            // A freshly issued park looks like a phantom until the app applies
-            // it, so the first "attempt" is usually just that write landing;
-            // the budget exists for the window that never complies.
-            let n = self.enforce_attempts.entry(w).or_insert(0);
-            if *n >= ENFORCE_LIMIT {
-                continue;
+            let own_stale_restore = self
+                .saved
+                .get(&w)
+                .is_some_and(|s| (f.x - s.x).abs() <= 1.0 && (f.y - s.y).abs() <= 1.0);
+            if !own_stale_restore && !systemic {
+                // A freshly issued park looks like a phantom until the app
+                // applies it, so the first "attempt" is usually just that
+                // write landing; the budget exists for the window that never
+                // complies.
+                let n = self.enforce_attempts.entry(w).or_insert(0);
+                if *n >= ENFORCE_LIMIT {
+                    if adopt.is_none() {
+                        adopt = Some(w);
+                        continue;
+                    }
+                    // A second at-limit window this pass waits its turn:
+                    // re-asserted uncounted below.
+                } else {
+                    *n += 1;
+                    if *n > 1 {
+                        eprintln!("ordo: re-parking phantom window {} (attempt {n})", w.0);
+                    }
+                }
             }
-            *n += 1;
-            if *n > 1 {
-                eprintln!("ordo: re-parking phantom window {} (attempt {n})", w.0);
+            // Re-assert. A bookkept parked window keeps its promise and just
+            // gets the corner write again; one that was never parked (the
+            // blind spot) parks properly, capturing its promise on the way.
+            if self.parked.contains(&w) {
+                writes.push((*pid, w, park_frame(*f, main)));
+            } else {
+                let write = self.park(w, frames, main);
+                newly_parked |= write.is_some();
+                writes.extend(write);
             }
-            writes.push((*pid, w, want));
+        }
+        if let Some(w) = adopt {
+            eprintln!(
+                "ordo: window {} kept escaping its park — adopting it onto workspace {}",
+                w.0, current.0
+            );
+            self.ledger.assign_window(w, current);
+            self.drop_park_bookkeeping(&[w]);
+            // The adoptee's app may be dock-dimmed (that's how most escapes
+            // start); a declared resident of the visible workspace must not
+            // stay hidden behind a Cmd+H.
+            if let Some((pid, _)) = frames.get(&w) {
+                d.set_app_hidden(*pid, false);
+            }
+        }
+        // Both adoption and a blind-spot park changed durable promises.
+        if adopt.is_some() || newly_parked {
+            self.persist();
         }
         d.set_frames(&writes);
     }
@@ -610,6 +687,13 @@ mod tests {
             self.windows.borrow_mut().remove(&w);
         }
 
+        /// An external hand (the app, the user) moves the window.
+        fn place(&self, w: WindowId, f: Rect) {
+            let mut ws = self.windows.borrow_mut();
+            let pid = ws[&w].0;
+            ws.insert(w, (pid, f));
+        }
+
         /// A scan of this desktop, as the shell would deliver it.
         fn scan(&self) -> Vec<(WindowId, Pid)> {
             self.windows
@@ -798,6 +882,81 @@ mod tests {
         assert_eq!(b.window_ws()[&w(1)], ws(1));
         assert!(!b.saved.contains_key(&w(1)));
         assert!(!b.parked.contains(&w(1)));
+    }
+
+    fn frames_of(d: &FakeDesktop) -> HashMap<WindowId, (Pid, Rect)> {
+        d.windows()
+            .into_iter()
+            .map(|(id, p, f)| (id, (p, f)))
+            .collect()
+    }
+
+    #[test]
+    fn enforcement_asserts_the_declaration_not_the_parked_set() {
+        // The blind spot: a window declared hidden while its frame was
+        // unreadable never got a park write, never entered the parked set,
+        // and the old parked-set walk could never see it.
+        let d = FakeDesktop::new(&[(w(2), Pid(20), rect(300.0, 200.0))]);
+        let mut b = EmulatedWorkspaces::new(3);
+        b.note_scan(&d, &d.scan());
+        b.move_window_to_workspace(&d, w(1), ws(2)).unwrap(); // no frame yet
+
+        // The window appears, visible on the wrong workspace.
+        d.windows
+            .borrow_mut()
+            .insert(w(1), (Pid(10), rect(100.0, 100.0)));
+        b.enforce_placement(&d, &frames_of(&d));
+        assert!(at_park_position(&d.frame(w(1)), MAIN), "parked at last");
+        assert_eq!(b.saved[&w(1)], rect(100.0, 100.0), "promise captured");
+    }
+
+    #[test]
+    fn a_stale_restore_never_drains_the_enforcement_budget() {
+        let d = FakeDesktop::new(&[
+            (w(1), Pid(10), rect(100.0, 100.0)),
+            (w(2), Pid(20), rect(300.0, 200.0)),
+        ]);
+        let mut b = EmulatedWorkspaces::new(3);
+        b.note_scan(&d, &d.scan());
+        b.move_window_to_workspace(&d, w(1), ws(2)).unwrap(); // parked
+
+        // Our own restore keeps landing late, over and over — far past the
+        // budget. Each round must re-park without counting, never surrender.
+        for _ in 0..(ENFORCE_LIMIT as usize + 3) {
+            d.place(w(1), rect(100.0, 100.0)); // exactly the promise = our write
+            b.enforce_placement(&d, &frames_of(&d));
+            assert!(at_park_position(&d.frame(w(1)), MAIN), "re-parked");
+        }
+        assert_eq!(b.enforce_attempts.get(&w(1)), None, "budget untouched");
+        assert_eq!(b.window_ws()[&w(1)], ws(2), "declaration intact");
+    }
+
+    #[test]
+    fn a_window_that_keeps_escaping_is_adopted_not_abandoned() {
+        let d = FakeDesktop::new(&[
+            (w(1), Pid(10), rect(100.0, 100.0)),
+            (w(2), Pid(20), rect(300.0, 200.0)),
+        ]);
+        let mut b = EmulatedWorkspaces::new(3);
+        b.note_scan(&d, &d.scan());
+        b.move_window_to_workspace(&d, w(1), ws(2)).unwrap();
+
+        // A foreign hand insists the window stays visible; our park writes
+        // never take (frozen desktop). The episode must end in agreement —
+        // the window becomes a resident of the workspace it visibly lives
+        // on — never in a standing lie the next war is made of.
+        let foreign = rect(500.0, 400.0);
+        d.place(w(1), foreign);
+        d.freeze();
+        for _ in 0..ENFORCE_LIMIT {
+            b.enforce_placement(&d, &frames_of(&d));
+            assert_eq!(b.window_ws()[&w(1)], ws(2), "budget not yet spent");
+        }
+        b.enforce_placement(&d, &frames_of(&d));
+        assert_eq!(b.window_ws()[&w(1)], ws(1), "adopted onto current");
+        assert!(!b.saved.contains_key(&w(1)));
+        assert!(!b.parked.contains(&w(1)));
+        assert_eq!(d.frame(w(1)), foreign, "and left where it stood");
     }
 
     #[test]
