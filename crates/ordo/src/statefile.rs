@@ -43,9 +43,13 @@ pub struct PersistedState {
 pub struct PersistedWindow {
     pub id: WindowId,
     pub workspace: WorkspaceId,
-    /// Present iff the window is parked: the frame to restore it to. A parked
-    /// claim without a restore frame would strand the window as a sliver, so
-    /// the schema makes that state unrepresentable.
+    /// The frame a parked window restores to. Present for a parked window
+    /// whose real frame was trustworthily seen; `None` means either "not
+    /// parked" or "parked but its real frame is unknown" (the sliver guard
+    /// refuses to record a park-corner frame as truth). Loading treats both
+    /// `None` cases as unparked — a window without a promise re-parks and
+    /// self-heals on its next trustworthy sighting, whereas a recorded lie
+    /// would strand it at 1px forever.
     pub saved: Option<Rect>,
 }
 
