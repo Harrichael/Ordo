@@ -173,6 +173,8 @@ impl EmulatedWorkspaces {
         // Stacking is NOT this backend's problem: the core follows every
         // switch with a RestackWindows effect derived from the MRU history,
         // which the effector reasserts after this returns.
+        // Before the ledger moves: afterwards `current` IS the target.
+        let from = self.ledger.current();
         let plan = self.ledger.switch(target);
         if plan.park.is_empty() && plan.restore.is_empty() {
             self.persist(); // `current` may still have changed
@@ -180,14 +182,27 @@ impl EmulatedWorkspaces {
         }
         let frames = current_frames(d);
         let main = d.main_display();
+        let t = ParkTrace::new(WindowId(0), ParkTraceKind::Switch)
+            .ws(from, target)
+            .detail(format!(
+                "parking {}, restoring {}",
+                plan.park.len(),
+                plan.restore.len()
+            ));
+        self.note(t);
         let mut writes = Vec::new();
         for w in plan.park {
-            writes.extend(self.park(w, &frames, main));
+            writes.extend(self.park(w, None, &frames, main));
         }
         for w in plan.restore {
             writes.extend(self.restore(w, &frames, main));
         }
         self.persist();
+        // Frames first, then visibility — a window must already be at the
+        // corner before its app is un-hidden, or the unhide reveals it where it
+        // still stands. Whether that ordering is SUFFICIENT is the open
+        // question: it cannot stop an app from restoring its own geometry in
+        // response to being un-hidden, which is what the trace is here to show.
         d.set_frames(&writes);
         self.apply_app_visibility(d, &frames);
     }
@@ -201,7 +216,7 @@ impl EmulatedWorkspaces {
         let frames = current_frames(d);
         let main = d.main_display();
         let write = match self.ledger.assign_window(window, target) {
-            Some(MoveAction::Park) => self.park(window, &frames, main),
+            Some(MoveAction::Park) => self.park(window, None, &frames, main),
             Some(MoveAction::Restore) => self.restore(window, &frames, main),
             None => return Err(WorkspaceOutOfRange(target)),
         };
@@ -442,7 +457,7 @@ impl EmulatedWorkspaces {
                 self.note(t);
                 writes.push((*pid, w, want));
             } else {
-                let write = self.park(w, frames, main);
+                let write = self.park(w, self.enforce_attempts.get(&w).copied(), frames, main);
                 newly_parked |= write.is_some();
                 writes.extend(write);
             }
@@ -560,9 +575,13 @@ impl EmulatedWorkspaces {
     /// Bookkeep a park and return the frame write it requires, so a switch can
     /// batch every write into one parallel pass instead of moving windows one
     /// by one (which made multi-monitor switches visibly ripple).
+    /// `attempt`: enforcement's charge count for this window, when the caller
+    /// is enforcement. Carried only so the trace can show the countdown toward
+    /// the limit on this path too — a switch's park has no such notion.
     fn park(
         &mut self,
         window: WindowId,
+        attempt: Option<u8>,
         frames: &HashMap<WindowId, (Pid, Rect)>,
         main: Rect,
     ) -> Option<(Pid, WindowId, Rect)> {
@@ -583,10 +602,13 @@ impl EmulatedWorkspaces {
         if at_park_position(f, main) {
             self.parked.insert(window);
             self.enforce_attempts.remove(&window);
-            let t = ParkTrace::new(window, ParkTraceKind::Park)
+            let mut t = ParkTrace::new(window, ParkTraceKind::Park)
                 .observed(*f)
                 .at_park(true)
                 .detail("already at the corner; promise left untouched");
+            if let Some(n) = attempt {
+                t = t.attempt(n);
+            }
             self.note(t);
             return None;
         }
@@ -595,10 +617,13 @@ impl EmulatedWorkspaces {
         self.parked.insert(window);
         self.enforce_attempts.remove(&window);
         let want = park_frame(f, main);
-        let t = ParkTrace::new(window, ParkTraceKind::Park)
+        let mut t = ParkTrace::new(window, ParkTraceKind::Park)
             .observed(f)
             .requested(want)
             .at_park(false);
+        if let Some(n) = attempt {
+            t = t.attempt(n);
+        }
         self.note(t);
         Some((pid, window, want))
     }
@@ -656,7 +681,7 @@ impl EmulatedWorkspaces {
     /// app makes macOS fling focus somewhere arbitrary. Core-side, switches
     /// hand focus to the destination before this runs, so the exemption
     /// almost never bites; when it does, the app just stays undimmed.
-    fn apply_app_visibility(&self, d: &dyn Desktop, frames: &HashMap<WindowId, (Pid, Rect)>) {
+    fn apply_app_visibility(&mut self, d: &dyn Desktop, frames: &HashMap<WindowId, (Pid, Rect)>) {
         let current = self.ledger.current();
         let assignments = self.ledger.window_ws();
         let mut here_by_app: HashMap<Pid, bool> = HashMap::new();
@@ -668,12 +693,38 @@ impl EmulatedWorkspaces {
         let focused_app = d
             .focused_window()
             .and_then(|w| frames.get(&w).map(|(p, _)| *p));
+        // Count each app's windows that are NOT on the current workspace: those
+        // are the ones an unhide reveals along with the wanted one, and the
+        // number worth having when reading a flash back.
+        let mut elsewhere: HashMap<Pid, usize> = HashMap::new();
+        for (window, (pid, _)) in frames {
+            if assignments.get(window).is_some_and(|ws| *ws != current) {
+                *elsewhere.entry(*pid).or_insert(0) += 1;
+            }
+        }
+        let mut notes = Vec::new();
         for (pid, has_window_here) in here_by_app {
+            let parked_too = elsewhere.get(&pid).copied().unwrap_or(0);
             if has_window_here {
                 d.set_app_hidden(pid, false);
+                notes.push(
+                    ParkTrace::app(pid, ParkTraceKind::AppShown)
+                        .ws(current, current)
+                        .detail(format!(
+                            "unhidden; also reveals {parked_too} window(s) parked for other workspaces"
+                        )),
+                );
             } else if Some(pid) != focused_app {
                 d.set_app_hidden(pid, true);
+                notes.push(
+                    ParkTrace::app(pid, ParkTraceKind::AppHidden)
+                        .ws(current, current)
+                        .detail(format!("hidden; {parked_too} window(s) parked")),
+                );
             }
+        }
+        for t in notes {
+            self.note(t);
         }
     }
 }
@@ -931,6 +982,63 @@ mod tests {
         assert!(at_park_position(&d.frame(w(2)), MAIN));
     }
 
+    /// A switch must be readable end to end from the trace alone: which
+    /// workspaces, every frame write, and — the part no channel recorded before
+    /// — the app unhide that reveals a straddling app's OTHER windows. That
+    /// unhide is the prime suspect for the flash on arriving at a workspace, so
+    /// it has to be attributable to a moment.
+    #[test]
+    fn a_switch_is_legible_end_to_end_including_the_app_unhide() {
+        // One app owning windows on two workspaces: the straddling case, where
+        // hiding cannot express the split and parking has to carry it.
+        let d = FakeDesktop::new(&[
+            (w(1), Pid(10), rect(100.0, 100.0)),
+            (w(2), Pid(10), rect(300.0, 200.0)),
+        ]);
+        let mut b = EmulatedWorkspaces::new(3);
+        b.note_scan(&d, &d.scan());
+        b.assign_window_to_workspace(w(2), ws(2)).unwrap();
+        b.take_trace();
+
+        b.switch_workspace(&d, ws(2)); // ws1 -> ws2: park w1, restore w2
+        let trace = b.take_trace();
+
+        let sw = trace
+            .iter()
+            .find(|t| t.kind == ParkTraceKind::Switch)
+            .expect("the switch names itself");
+        assert_eq!(
+            (sw.declared, sw.current),
+            (Some(ws(1)), Some(ws(2))),
+            "and says where FROM, not the target twice"
+        );
+
+        let parked = trace
+            .iter()
+            .find(|t| t.kind == ParkTraceKind::Park && t.window == w(1))
+            .expect("w1's park is on the record");
+        assert!(at_park_position(
+            &parked.requested.expect("with the frame asked for"),
+            MAIN
+        ));
+
+        // The app stays visible (it owns a window here), and the record says
+        // how many of its windows the unhide also exposes — 1, the parked w1.
+        let shown = trace
+            .iter()
+            .find(|t| t.kind == ParkTraceKind::AppShown)
+            .expect("the unhide is attributable");
+        assert_eq!(shown.pid, Some(Pid(10)));
+        assert!(
+            shown
+                .detail
+                .as_deref()
+                .is_some_and(|d| d.contains("1 window")),
+            "counts the windows a flash would show: {:?}",
+            shown.detail
+        );
+    }
+
     /// The trace exists because every other channel is laundered: the core is
     /// told a parked window's promise, so the corner it physically occupies
     /// appears nowhere. A park must therefore be legible here — with the frame
@@ -1019,12 +1127,12 @@ mod tests {
 
         // A window already at the park corner: bookkept as parked, but its
         // (unknown) real frame is never fabricated from the sliver.
-        assert_eq!(b.park(w(1), &frames, MAIN), None);
+        assert_eq!(b.park(w(1), None, &frames, MAIN), None);
         assert!(b.parked.contains(&w(1)));
         assert!(!b.saved.contains_key(&w(1)));
 
         // A window at a real position parks normally.
-        let write = b.park(w(2), &frames, MAIN).unwrap();
+        let write = b.park(w(2), None, &frames, MAIN).unwrap();
         assert_eq!(b.saved[&w(2)], rect(50.0, 60.0));
         assert!((write.2.x - (MAIN.w - SLIVER)).abs() < 0.5);
     }

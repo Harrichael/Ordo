@@ -22,7 +22,7 @@
 //! }
 //! ```
 
-use ordo_core::{Rect, WindowId, WorkspaceId};
+use ordo_core::{Pid, Rect, WindowId, WorkspaceId};
 use serde::Serialize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -43,6 +43,15 @@ pub enum ParkTraceKind {
     Suppressed,
     /// Enforcement rewrote the declaration to match the screen.
     Adopted,
+    /// A workspace switch began: the boundary that groups everything after it.
+    Switch,
+    /// Dock dimming un-hid an app (Cmd+H cleared), revealing EVERY window it
+    /// owns — including the ones parked for other workspaces. The suspected
+    /// source of the switch flash, and previously unrecorded, so a flash could
+    /// not be attributed to Ordo's write or the app's own reaction to it.
+    AppShown,
+    /// Dock dimming hid an app: all its windows live on hidden workspaces.
+    AppHidden,
 }
 
 /// One diagnostic fact about a window's frame mechanics.
@@ -52,8 +61,11 @@ pub enum ParkTraceKind {
 /// the two differ, which is exactly the case the log could not previously see.
 #[derive(Debug, Clone, Serialize)]
 pub struct ParkTrace {
+    /// The window this concerns. `WindowId(0)` for records about an app or a
+    /// switch rather than a single window; `pid` carries the app in that case.
     pub window: WindowId,
     pub kind: ParkTraceKind,
+    pub pid: Option<Pid>,
     pub declared: Option<WorkspaceId>,
     pub current: Option<WorkspaceId>,
     pub observed: Option<Rect>,
@@ -73,6 +85,7 @@ impl ParkTrace {
         ParkTrace {
             window,
             kind,
+            pid: None,
             declared: None,
             current: None,
             observed: None,
@@ -82,6 +95,13 @@ impl ParkTrace {
             attempt: None,
             detail: None,
         }
+    }
+
+    /// For a record about an app rather than one window.
+    pub fn app(pid: Pid, kind: ParkTraceKind) -> Self {
+        let mut t = Self::new(WindowId(0), kind);
+        t.pid = Some(pid);
+        t
     }
 
     pub fn observed(mut self, f: Rect) -> Self {
