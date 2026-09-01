@@ -3,6 +3,8 @@
 //!
 //! v0's bindings, and only these (no inventing keys the user hasn't asked for):
 //!   - Cmd+Left / Cmd+Right      → previous / next workspace
+//!   - Cmd+1 … Cmd+9             → jump straight to that workspace (a
+//!     workspace that doesn't exist is a no-op)
 //!   - Cmd+Shift+Left / Right    → move the focused window to the other
 //!     monitor, dragging focus and mouse along with it
 //!   - Ctrl+Cmd+Left / Right     → carry the focused window to the adjacent
@@ -30,7 +32,7 @@
 //! chord: Cmd+Shift+arrows are claimed (the user gave up select-to-line for
 //! them, same trade as Cmd+arrows), but Cmd+Alt+arrows etc. pass through.
 
-use ordo_core::HotkeyAction;
+use ordo_core::{HotkeyAction, WorkspaceId};
 
 /// macOS virtual key codes for the keys we bind.
 mod code {
@@ -43,6 +45,11 @@ mod code {
     pub const R: u16 = 0x0F;
     pub const S: u16 = 0x01;
     pub const END: u16 = 0x77;
+
+    /// Virtual keycodes for the top-row digits 1..9, in order. GOTCHA: these
+    /// are not sequential and 5/6 are transposed — the layout is physical, not
+    /// numeric, so indexing this table is the only safe way to map a digit.
+    pub const DIGITS: [u16; 9] = [0x12, 0x13, 0x14, 0x15, 0x17, 0x16, 0x1A, 0x1C, 0x19];
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -92,6 +99,17 @@ pub fn match_chord(keycode: u16, m: Mods) -> Option<Chord> {
         return Some(Chord::SaveState);
     }
 
+    // Cmd+1..9: jump straight to that workspace. Swallowed like the other
+    // Cmd chords, so it costs the apps their Cmd-digit shortcuts (browser and
+    // terminal tab switching, most visibly) for as long as Ordo is engaged —
+    // the same trade already accepted for Cmd+arrows. A workspace that does
+    // not exist is a no-op, so a wide binding here is harmless.
+    if only_cmd(m) {
+        if let Some(i) = code::DIGITS.iter().position(|c| *c == keycode) {
+            return Some(Chord::Hotkey(WorkspaceSwitchTo(WorkspaceId(i as u8 + 1))));
+        }
+    }
+
     match keycode {
         code::LEFT if only_cmd(m) => Some(Chord::Hotkey(WorkspacePrev)),
         code::RIGHT if only_cmd(m) => Some(Chord::Hotkey(WorkspaceNext)),
@@ -128,6 +146,7 @@ fn cmd_ctrl(m: Mods) -> bool {
 mod tests {
     use super::*;
     use ordo_core::HotkeyAction::*;
+    use ordo_core::WorkspaceId;
 
     fn mods(cmd: bool, alt: bool, shift: bool, ctrl: bool) -> Mods {
         Mods {
@@ -136,6 +155,38 @@ mod tests {
             shift,
             ctrl,
         }
+    }
+
+    /// Digit keycodes are not sequential and 5/6 are transposed, so a mapping
+    /// that looks right can silently send you to the wrong workspace. Pinned
+    /// against the literal codes rather than the table it is derived from.
+    #[test]
+    fn cmd_digit_jumps_to_that_workspace() {
+        let cmd = mods(true, false, false, false);
+        for (keycode, want) in [
+            (0x12, 1u8),
+            (0x13, 2),
+            (0x14, 3),
+            (0x15, 4),
+            (0x17, 5),
+            (0x16, 6),
+            (0x1A, 7),
+            (0x1C, 8),
+            (0x19, 9),
+        ] {
+            assert_eq!(
+                match_chord(keycode, cmd),
+                Some(Chord::Hotkey(WorkspaceSwitchTo(WorkspaceId(want)))),
+                "keycode {keycode:#x}"
+            );
+        }
+        // Other modifier combinations stay with the app — Cmd+Shift+1 and
+        // friends are still the app's to use.
+        assert_eq!(match_chord(0x12, mods(true, false, true, false)), None);
+        assert_eq!(match_chord(0x12, mods(true, true, false, false)), None);
+        assert_eq!(match_chord(0x12, mods(false, false, false, false)), None);
+        // 0 is not bound: workspace 10 would need it and nothing asks for one.
+        assert_eq!(match_chord(0x1D, cmd), None);
     }
 
     #[test]

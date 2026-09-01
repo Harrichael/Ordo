@@ -38,7 +38,10 @@ The two rules that make it work:
 
 ## Features (v0)
 
-- **Workspace switching**: `Cmd+Left` / `Cmd+Right` to the adjacent workspace.
+- **Workspace switching**: `Cmd+Left` / `Cmd+Right` to the adjacent workspace,
+  or `Cmd+1`…`Cmd+9` to jump straight to one. Like the arrows, the digits are
+  swallowed while Ordo is engaged, so apps lose their `Cmd`-digit shortcuts
+  (browser and terminal tab switching, most noticeably).
 - **MRU window focus**: `Alt+Tab` (in workspace), `Alt+Shift+Tab` (+ monitor),
   `Alt+Backtick` (+ app), `Ctrl+Alt+Tab` (the *other* monitor). The mouse warps
   to the focused window's center.
