@@ -150,6 +150,13 @@ pub struct WindowSnap {
     pub bundle_id: Option<String>,
     pub title: String,
     pub frame: Rect,
+    /// The window's kind as the app declares it (`AXSubrole` on macOS):
+    /// AXStandardWindow, AXDialog, AXFloatingWindow, AXSystemFloatingWindow.
+    /// An observation like any other here — the core does not act on it yet.
+    /// `serde(default)` because logs written before this field exist must
+    /// still replay.
+    #[serde(default)]
+    pub subrole: Option<String>,
 }
 
 /// The workspace layer, as the backend tells it. Absence means UNKNOWN, never

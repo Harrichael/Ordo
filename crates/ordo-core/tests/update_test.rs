@@ -95,6 +95,7 @@ fn win(id: u32, pid: i32, workspace: u8, frame: Rect) -> Win {
             bundle_id: None,
             title: format!("w{id}"),
             frame,
+            subrole: None,
         },
         workspace: ws(workspace),
     }

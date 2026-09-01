@@ -33,6 +33,13 @@ pub struct AxWindow {
     pub bundle_id: Option<String>,
     pub title: String,
     pub frame: Rect,
+    /// `AXSubrole`: AXStandardWindow, AXDialog, AXFloatingWindow,
+    /// AXSystemFloatingWindow… Read but not yet acted on. Ordo currently
+    /// manages every window an app exposes through AXWindows, which is how a
+    /// transient Outlook reminder toast acquired a permanent workspace claim.
+    /// Logged first so the classifier is chosen against what apps actually
+    /// report rather than what the conventions say they should.
+    pub subrole: Option<String>,
 }
 
 pub struct AxScan {
@@ -104,6 +111,13 @@ fn read_window(win: *const AXUIElement, app: Pid, bundle_id: Option<String>) -> 
             })
             .unwrap_or_default()
     };
+    let subrole = unsafe {
+        copy_attr(win_ref, "AXSubrole").and_then(|p| {
+            let s = super::cf::string_value(p);
+            sys::CFRelease(p);
+            s
+        })
+    };
     Some(AxWindow {
         id,
         app,
@@ -115,6 +129,7 @@ fn read_window(win: *const AXUIElement, app: Pid, bundle_id: Option<String>) -> 
             w: size.width,
             h: size.height,
         },
+        subrole,
     })
 }
 

@@ -99,6 +99,7 @@ fn win(id: u32, pid: i32, x: f64) -> WindowSnap {
             w: 400.0,
             h: 300.0,
         },
+        subrole: None,
     }
 }
 

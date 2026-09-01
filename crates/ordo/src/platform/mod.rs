@@ -165,6 +165,7 @@ impl WorldSource for MacWorldSource {
                 bundle_id: w.bundle_id.clone(),
                 title: w.title.clone(),
                 frame: believed.get(&w.id).copied().unwrap_or(w.frame),
+                subrole: w.subrole.clone(),
             })
             .collect();
 
