@@ -46,8 +46,16 @@ pub trait Desktop {
     fn set_frames(&self, writes: &[(Pid, WindowId, Rect)]);
     fn set_app_hidden(&self, pid: Pid, hidden: bool);
     fn focused_window(&self) -> Option<WindowId>;
-    /// The main display's frame — the anchor for the park corner.
+    /// The main display's frame — where a re-homed window must land, because
+    /// that is where the user is looking.
     fn main_display(&self) -> Rect;
+
+    /// Every display's frame. Needed because hiding a window is a question
+    /// about the whole arrangement, not the main screen: macOS keeps a parked
+    /// window's title bar on-screen, so only the HORIZONTAL escape hides it,
+    /// and escaping past the main display's right edge simply lands the window
+    /// on whatever display sits to the right.
+    fn displays(&self) -> Vec<Rect>;
     /// Which of `ids` still exist per the WINDOW SERVER's full window list —
     /// authoritative death evidence, unlike an AX scan (one slow app drops
     /// its whole window set from a scan). Must consult all windows, not just

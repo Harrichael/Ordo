@@ -54,6 +54,10 @@ impl Desktop for AxDesktop {
             })
     }
 
+    fn displays(&self) -> Vec<Rect> {
+        display::active_displays().iter().map(|d| d.frame).collect()
+    }
+
     fn existing_windows(&self, ids: &[WindowId]) -> Option<std::collections::HashSet<WindowId>> {
         let all = super::zorder::all_windows()?;
         let all: std::collections::HashSet<WindowId> = all.into_iter().collect();
