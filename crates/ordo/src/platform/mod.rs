@@ -42,6 +42,8 @@ use ordo_core::{
     WorldSnapshot,
 };
 
+use ordo_emulated::{ParkTrace, ParkTraceKind};
+
 use crate::backend::WorkspaceBackend;
 use crate::ports::WorldSource;
 
@@ -69,6 +71,13 @@ pub struct MacWorldSource {
     /// rescued — a rescue gather frees windows the ledger still calls parked,
     /// and fighting the gather would be worse than any phantom.
     intercepting: Arc<AtomicBool>,
+    /// Last RAW frame logged per window, so the trace records movement rather
+    /// than repeating a still picture every snapshot. Without this the table
+    /// grows by every tracked window every two seconds; with it, a settled
+    /// desktop writes nothing.
+    last_raw: HashMap<WindowId, Rect>,
+    /// Drained by the engine after each `snapshot()`.
+    trace: Vec<ParkTrace>,
 }
 
 impl MacWorldSource {
@@ -76,6 +85,8 @@ impl MacWorldSource {
         MacWorldSource {
             backend,
             intercepting,
+            last_raw: HashMap::new(),
+            trace: Vec::new(),
         }
     }
 }
@@ -111,6 +122,30 @@ impl WorldSource for MacWorldSource {
         // Mechanism artifacts (park slivers) never reach the core: the
         // backend substitutes the promise each one encodes.
         let believed = self.backend.borrow().believed_frames(&frames);
+
+        // The substitution above is why no other channel can see parking, so
+        // capture the raw truth here, before it is laundered — on movement
+        // only, and paired with the belief it was replaced by.
+        self.trace
+            .extend(self.backend.borrow_mut().take_park_trace());
+        for (w, (_, raw)) in &frames {
+            if self.last_raw.get(w).is_some_and(|p| p == raw) {
+                continue;
+            }
+            self.last_raw.insert(*w, *raw);
+            let mut t = ParkTrace::new(*w, ParkTraceKind::Moved).observed(*raw);
+            if let Some(b) = believed.get(w) {
+                t = t.believed(*b);
+            }
+            if let (Some(ws), Some(active)) = (
+                topo.window_ws.get(w).copied(),
+                topo.monitors.first().map(|m| m.active),
+            ) {
+                t = t.ws(ws, active);
+            }
+            self.trace.push(t);
+        }
+        self.last_raw.retain(|w, _| frames.contains_key(w));
 
         let monitors = displays
             .iter()
@@ -160,5 +195,9 @@ impl WorldSource for MacWorldSource {
             focused: scan.focused,
             workspaces,
         }
+    }
+
+    fn take_park_trace(&mut self) -> Vec<ParkTrace> {
+        std::mem::take(&mut self.trace)
     }
 }

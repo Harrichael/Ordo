@@ -7,6 +7,7 @@
 //! live in [`crate::platform`]; the tests script a fake world.
 
 use ordo_core::{Effect, OpOutcome, WindowId, WorldSnapshot};
+use ordo_emulated::ParkTrace;
 
 /// Produces a full observation of the world on demand. The engine never trusts
 /// incremental hints — a hint only prompts a call to this.
@@ -16,6 +17,14 @@ use ordo_core::{Effect, OpOutcome, WindowId, WorldSnapshot};
 /// thread. External producers reach the engine through a channel instead.
 pub trait WorldSource {
     fn snapshot(&mut self) -> WorldSnapshot;
+
+    /// Drain diagnostic records of the workspace mechanism from the snapshot
+    /// just built. Telemetry, not record: the core never sees these and the
+    /// replay does not depend on them. Empty for sources with no mechanism to
+    /// hide (native Spaces, test fakes).
+    fn take_park_trace(&mut self) -> Vec<ParkTrace> {
+        Vec::new()
+    }
 }
 
 /// Carries out a core [`Effect`] against the OS.

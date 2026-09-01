@@ -9,6 +9,7 @@ use ordo_core::{Pid, Rect, WindowId, WorkspaceId};
 
 use crate::ledger::{Claim, Ledger, MoveAction};
 use crate::statefile::{self, PersistedState, PersistedWindow};
+use crate::trace::{ParkTrace, ParkTraceKind};
 use crate::Desktop;
 
 /// How much of a parked window stays on-screen. macOS refuses to keep a fully
@@ -55,6 +56,12 @@ pub struct EmulatedWorkspaces {
     /// True during a fresh session (the R chord): the state file is neither
     /// read nor written, so O can still bring the pre-R organization back.
     suspended: bool,
+    /// Diagnostic record of what this model did to windows' frames, drained by
+    /// the shell each snapshot. See [`crate::trace`] for why it must exist:
+    /// every other channel sees the substituted belief, so without this the
+    /// parking mechanism is invisible when it works and misleading when it
+    /// doesn't.
+    trace: Vec<ParkTrace>,
 }
 
 impl EmulatedWorkspaces {
@@ -68,6 +75,21 @@ impl EmulatedWorkspaces {
             state_path: None,
             boot_time: statefile::boot_time_sec(),
             suspended: false,
+            trace: Vec::new(),
+        }
+    }
+
+    /// Drain the diagnostic trace. The shell calls this every snapshot; an
+    /// undrained trace is capped rather than grown without bound, because a
+    /// paused or observe-mode daemon never drains.
+    pub fn take_trace(&mut self) -> Vec<ParkTrace> {
+        std::mem::take(&mut self.trace)
+    }
+
+    fn note(&mut self, t: ParkTrace) {
+        const CAP: usize = 4096;
+        if self.trace.len() < CAP {
+            self.trace.push(t);
         }
     }
 
@@ -363,6 +385,26 @@ impl EmulatedWorkspaces {
                 .saved
                 .get(&w)
                 .is_some_and(|s| (f.x - s.x).abs() <= 1.0 && (f.y - s.y).abs() <= 1.0);
+            if own_stale_restore || systemic {
+                // Forgiveness is the decision that hid an app refusing to stay
+                // parked: it looks identical to our own restore still landing,
+                // and it was previously silent, so the window was excused on
+                // every pass forever with nothing written down.
+                let t = ParkTrace::new(w, ParkTraceKind::Suppressed)
+                    .observed(*f)
+                    .ws(
+                        *self.ledger.window_ws().get(&w).unwrap_or(&current),
+                        current,
+                    )
+                    .at_park(false)
+                    .attempt(self.enforce_attempts.get(&w).copied().unwrap_or(0))
+                    .detail(if systemic {
+                        "main display changed; whole pass uncounted"
+                    } else {
+                        "frame equals its own promise; read as our restore in flight"
+                    });
+                self.note(t);
+            }
             if !own_stale_restore && !systemic {
                 // A freshly issued park looks like a phantom until the app
                 // applies it, so the first "attempt" is usually just that
@@ -387,7 +429,18 @@ impl EmulatedWorkspaces {
             // gets the corner write again; one that was never parked (the
             // blind spot) parks properly, capturing its promise on the way.
             if self.parked.contains(&w) {
-                writes.push((*pid, w, park_frame(*f, main)));
+                let want = park_frame(*f, main);
+                let t = ParkTrace::new(w, ParkTraceKind::Reassert)
+                    .observed(*f)
+                    .requested(want)
+                    .ws(
+                        *self.ledger.window_ws().get(&w).unwrap_or(&current),
+                        current,
+                    )
+                    .at_park(false)
+                    .attempt(self.enforce_attempts.get(&w).copied().unwrap_or(0));
+                self.note(t);
+                writes.push((*pid, w, want));
             } else {
                 let write = self.park(w, frames, main);
                 newly_parked |= write.is_some();
@@ -399,6 +452,17 @@ impl EmulatedWorkspaces {
                 "ordo: window {} kept escaping its park — adopting it onto workspace {}",
                 w.0, current.0
             );
+            let mut t = ParkTrace::new(w, ParkTraceKind::Adopted)
+                .ws(
+                    *self.ledger.window_ws().get(&w).unwrap_or(&current),
+                    current,
+                )
+                .attempt(ENFORCE_LIMIT)
+                .detail("declaration rewritten from the screen");
+            if let Some((_, f)) = frames.get(&w) {
+                t = t.observed(*f);
+            }
+            self.note(t);
             self.ledger.assign_window(w, current);
             self.drop_park_bookkeeping(&[w]);
             // The adoptee's app may be dock-dimmed (that's how most escapes
@@ -519,12 +583,24 @@ impl EmulatedWorkspaces {
         if at_park_position(f, main) {
             self.parked.insert(window);
             self.enforce_attempts.remove(&window);
+            let t = ParkTrace::new(window, ParkTraceKind::Park)
+                .observed(*f)
+                .at_park(true)
+                .detail("already at the corner; promise left untouched");
+            self.note(t);
             return None;
         }
-        self.saved.insert(window, *f);
+        let (pid, f) = (*pid, *f);
+        self.saved.insert(window, f);
         self.parked.insert(window);
         self.enforce_attempts.remove(&window);
-        Some((*pid, window, park_frame(*f, main)))
+        let want = park_frame(f, main);
+        let t = ParkTrace::new(window, ParkTraceKind::Park)
+            .observed(f)
+            .requested(want)
+            .at_park(false);
+        self.note(t);
+        Some((pid, window, want))
     }
 
     fn restore(
@@ -545,21 +621,30 @@ impl EmulatedWorkspaces {
         if !was_parked && !at_park_position(f, main) {
             return None;
         }
-        match self.saved.get(&window) {
+        let (pid, f) = (*pid, *f);
+        let (kind, want) = match self.saved.get(&window).copied() {
             // A promise that is itself a park position is not a promise. It is
             // residue from before the corner was recognizable (see
             // `at_park_position`), and it was persisted to disk, so it outlives
             // the bug that wrote it. Honoring it re-parks the window the instant
             // its workspace comes up — the window you cannot switch to.
-            Some(s) if at_park_position(s, main) => Some((*pid, window, rehome_into(s, main))),
-            Some(s) => Some((*pid, window, *s)),
+            Some(s) if at_park_position(&s, main) => {
+                (ParkTraceKind::PoisonedPromise, rehome_into(&s, main))
+            }
+            Some(s) => (ParkTraceKind::Restore, s),
             // Parked with no promise (its real frame was never trustworthily
             // seen — see park()'s sliver guard): don't leave it a 1px sliver
             // on the now-visible workspace. Re-home it somewhere reachable;
             // the next park captures its real frame and it self-heals.
-            None if at_park_position(f, main) => Some((*pid, window, rehome_into(f, main))),
-            None => None,
-        }
+            None if at_park_position(&f, main) => (ParkTraceKind::Rehome, rehome_into(&f, main)),
+            None => return None,
+        };
+        let t = ParkTrace::new(window, kind)
+            .observed(f)
+            .requested(want)
+            .at_park(at_park_position(&f, main));
+        self.note(t);
+        Some((pid, window, want))
     }
 
     /// Dock dimming: hide (Cmd+H-style) every app whose known windows are all
@@ -844,6 +929,46 @@ mod tests {
         b.switch_workspace(&d, ws(1));
         assert_eq!(d.frame(w(1)), rect(100.0, 100.0));
         assert!(at_park_position(&d.frame(w(2)), MAIN));
+    }
+
+    /// The trace exists because every other channel is laundered: the core is
+    /// told a parked window's promise, so the corner it physically occupies
+    /// appears nowhere. A park must therefore be legible here — with the frame
+    /// actually requested — even while `believed_frames` hides it.
+    #[test]
+    fn the_trace_records_the_park_the_snapshot_hides() {
+        let d = FakeDesktop::new(&[(w(1), Pid(10), rect(100.0, 100.0))]);
+        let mut b = EmulatedWorkspaces::new(3);
+        b.note_scan(&d, &d.scan());
+        b.take_trace(); // discard adoption noise from the scan
+
+        b.move_window_to_workspace(&d, w(1), ws(2)).unwrap();
+
+        let frames = frames_of(&d);
+        let believed = b.believed_frames(&d, &frames);
+        assert_eq!(
+            believed.get(&w(1)),
+            Some(&rect(100.0, 100.0)),
+            "the snapshot still shows the promise, not the corner"
+        );
+
+        let trace = b.take_trace();
+        let park = trace
+            .iter()
+            .find(|t| t.kind == ParkTraceKind::Park)
+            .expect("the park is on the record");
+        assert_eq!(
+            park.observed,
+            Some(rect(100.0, 100.0)),
+            "raw frame, pre-park"
+        );
+        let want = park.requested.expect("the frame we asked the OS for");
+        assert!(
+            at_park_position(&want, MAIN),
+            "and it names the corner the snapshot never shows: {want:?}"
+        );
+        // Draining is a move, not a copy: a second read must not double-count.
+        assert!(b.take_trace().is_empty());
     }
 
     #[test]

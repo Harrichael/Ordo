@@ -21,8 +21,10 @@
 
 pub mod ledger;
 pub mod statefile;
+pub mod trace;
 pub mod workspaces;
 
+pub use trace::{ParkTrace, ParkTraceKind};
 pub use workspaces::{EmulatedWorkspaces, WorkspaceOutOfRange};
 
 use ordo_core::{Pid, Rect, WindowId};

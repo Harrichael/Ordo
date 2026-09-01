@@ -85,11 +85,25 @@ impl Engine {
         &self.state
     }
 
+    /// Move the world source's diagnostic account of the workspace mechanism
+    /// into the log. Kept off the event stream deliberately: it is telemetry,
+    /// and a replay must not depend on it.
+    fn drain_park_trace(&mut self) {
+        let traces = self.world.take_park_trace();
+        if traces.is_empty() {
+            return;
+        }
+        let _ = self
+            .logger
+            .log_park_trace(&traces, self.clock.now().wall_ms);
+    }
+
     /// Take a fresh observation and process it. The engine's snapshots always
     /// originate here (or from a `RequestRescan` cascade) — never from an
     /// external producer, which cannot touch the thread-affine world source.
     pub fn observe(&mut self, trigger: RescanTrigger) {
         let snap = self.world.snapshot();
+        self.drain_park_trace();
         // No displays means the world is unobservable, not empty — displays
         // asleep make every window "missing", and believing that once erased
         // the whole model over a weekend. Discard the blind scan; the next
@@ -226,6 +240,7 @@ impl Engine {
             // event, keeping the cascade single-threaded.
             Effect::RequestRescan { reason } => {
                 let snap = self.world.snapshot();
+                self.drain_park_trace();
                 queue.push_back(Event::WorldObserved {
                     at: self.clock.now(),
                     trigger: reason.clone(),

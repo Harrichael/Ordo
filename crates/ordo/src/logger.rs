@@ -22,6 +22,8 @@
 
 use std::path::{Path, PathBuf};
 
+use ordo_emulated::ParkTrace;
+
 use crate::ports::RestackStats;
 use ordo_core::{Effect, Event, Note, OpId, OpOutcome, State};
 use rusqlite::{params, Connection};
@@ -194,6 +196,35 @@ impl Logger {
             params![self.run_id, op.0 as i64, now_wall_ms, outcome_str, detail],
         )?;
         Ok(())
+    }
+
+    /// Record the workspace mechanism's own account of itself. Kind and window
+    /// are columns because every question starts by filtering on them; the rest
+    /// rides as JSON, since this is a diagnostic channel whose shape should be
+    /// free to change without a migration.
+    pub fn log_park_trace(
+        &mut self,
+        traces: &[ParkTrace],
+        now_wall_ms: i64,
+    ) -> rusqlite::Result<()> {
+        if traces.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        for t in traces {
+            tx.execute(
+                "INSERT INTO park_trace (run_id, wall_ms, window, kind, payload)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    self.run_id,
+                    now_wall_ms,
+                    t.window.0 as i64,
+                    format!("{:?}", t.kind),
+                    serde_json::to_string(t).unwrap_or_else(|_| "{}".into()),
+                ],
+            )?;
+        }
+        tx.commit()
     }
 
     pub fn log_restack_stats(
@@ -373,6 +404,14 @@ CREATE TABLE IF NOT EXISTS checkpoints (
     payload TEXT NOT NULL,
     PRIMARY KEY (run_id, seq)
 );
+CREATE TABLE IF NOT EXISTS park_trace (
+    run_id   INTEGER NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+    wall_ms  INTEGER NOT NULL,
+    window   INTEGER NOT NULL,
+    kind     TEXT NOT NULL,
+    payload  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS park_trace_window ON park_trace (run_id, window, wall_ms);
 CREATE TABLE IF NOT EXISTS restacks (
     restack_id       INTEGER PRIMARY KEY,
     run_id           INTEGER NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,

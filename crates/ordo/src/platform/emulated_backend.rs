@@ -141,6 +141,10 @@ impl WorkspaceBackend for EmulatedBackend {
         self.model.believed_frames(&self.desktop, frames)
     }
 
+    fn take_park_trace(&mut self) -> Vec<ordo_emulated::ParkTrace> {
+        self.model.take_trace()
+    }
+
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             // The whole point of emulation: we can mint workspaces freely.

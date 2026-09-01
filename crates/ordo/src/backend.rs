@@ -19,6 +19,7 @@
 use std::collections::HashMap;
 
 use ordo_core::{MonitorId, Pid, Rect, WindowId, WorkspaceId};
+use ordo_emulated::ParkTrace;
 
 pub type Result<T> = std::result::Result<T, BackendError>;
 
@@ -132,6 +133,14 @@ pub trait WorkspaceBackend {
     /// acting. Native has no such mechanism; the default is empty.
     fn believed_frames(&self, _frames: &HashMap<WindowId, (Pid, Rect)>) -> HashMap<WindowId, Rect> {
         HashMap::new()
+    }
+
+    /// Drain the backend's diagnostic record of its own frame mechanics.
+    /// Emulation hides parking from every other channel (see
+    /// [`ordo_emulated::trace`]); this is the only way it reaches the log.
+    /// Native parks nothing, so the default is empty.
+    fn take_park_trace(&mut self) -> Vec<ParkTrace> {
+        Vec::new()
     }
 
     fn capabilities(&self) -> Capabilities;
