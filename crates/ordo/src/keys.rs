@@ -3,8 +3,9 @@
 //!
 //! v0's bindings, and only these (no inventing keys the user hasn't asked for):
 //!   - Cmd+Left / Cmd+Right      → previous / next workspace
-//!   - Cmd+1 … Cmd+9             → jump straight to that workspace (a
-//!     workspace that doesn't exist is a no-op)
+//!   - Cmd+Alt+1 … Cmd+Alt+9     → jump straight to that workspace (a
+//!     workspace that doesn't exist is a no-op). Alt-qualified so apps keep
+//!     their Cmd-digit tab switching.
 //!   - Cmd+Shift+Left / Right    → move the focused window to the other
 //!     monitor, dragging focus and mouse along with it
 //!   - Ctrl+Cmd+Left / Right     → carry the focused window to the adjacent
@@ -99,12 +100,11 @@ pub fn match_chord(keycode: u16, m: Mods) -> Option<Chord> {
         return Some(Chord::SaveState);
     }
 
-    // Cmd+1..9: jump straight to that workspace. Swallowed like the other
-    // Cmd chords, so it costs the apps their Cmd-digit shortcuts (browser and
-    // terminal tab switching, most visibly) for as long as Ordo is engaged —
-    // the same trade already accepted for Cmd+arrows. A workspace that does
-    // not exist is a no-op, so a wide binding here is harmless.
-    if only_cmd(m) {
+    // Cmd+Alt+1..9: jump straight to that workspace. Alt is what keeps the
+    // apps' Cmd-digit shortcuts — browser and terminal tab switching — which
+    // are used far too often to swallow, unlike the Cmd+arrows Ordo already
+    // takes. A workspace that does not exist is a no-op.
+    if cmd_alt(m) {
         if let Some(i) = code::DIGITS.iter().position(|c| *c == keycode) {
             return Some(Chord::Hotkey(WorkspaceSwitchTo(WorkspaceId(i as u8 + 1))));
         }
@@ -128,6 +128,11 @@ pub fn match_chord(keycode: u16, m: Mods) -> Option<Chord> {
 /// Cmd, and none of the others — so Cmd+Alt/Ctrl+arrow keeps working.
 fn only_cmd(m: Mods) -> bool {
     m.cmd && !m.alt && !m.shift && !m.ctrl
+}
+
+/// Cmd+Alt exactly.
+fn cmd_alt(m: Mods) -> bool {
+    m.cmd && m.alt && !m.shift && !m.ctrl
 }
 
 /// Cmd+Shift exactly.
@@ -161,8 +166,8 @@ mod tests {
     /// that looks right can silently send you to the wrong workspace. Pinned
     /// against the literal codes rather than the table it is derived from.
     #[test]
-    fn cmd_digit_jumps_to_that_workspace() {
-        let cmd = mods(true, false, false, false);
+    fn cmd_alt_digit_jumps_to_that_workspace() {
+        let chord = mods(true, true, false, false);
         for (keycode, want) in [
             (0x12, 1u8),
             (0x13, 2),
@@ -175,18 +180,19 @@ mod tests {
             (0x19, 9),
         ] {
             assert_eq!(
-                match_chord(keycode, cmd),
+                match_chord(keycode, chord),
                 Some(Chord::Hotkey(WorkspaceSwitchTo(WorkspaceId(want)))),
                 "keycode {keycode:#x}"
             );
         }
-        // Other modifier combinations stay with the app — Cmd+Shift+1 and
-        // friends are still the app's to use.
+        // Bare Cmd+digit is deliberately NOT ours: tab switching is used far
+        // too often to swallow. Nor is any other combination.
+        assert_eq!(match_chord(0x12, mods(true, false, false, false)), None);
         assert_eq!(match_chord(0x12, mods(true, false, true, false)), None);
-        assert_eq!(match_chord(0x12, mods(true, true, false, false)), None);
+        assert_eq!(match_chord(0x12, mods(false, true, false, false)), None);
         assert_eq!(match_chord(0x12, mods(false, false, false, false)), None);
         // 0 is not bound: workspace 10 would need it and nothing asks for one.
-        assert_eq!(match_chord(0x1D, cmd), None);
+        assert_eq!(match_chord(0x1D, chord), None);
     }
 
     #[test]
