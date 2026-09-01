@@ -283,6 +283,15 @@ impl<W: WorldSource> WorldSource for SubscribingWorld<W> {
             .subscribe(snap.windows.iter().map(|w| w.id.0).collect());
         snap
     }
+
+    /// Forwarded, not defaulted. This decorator sits between the engine and the
+    /// real source, so inheriting a trait default here silently swallows
+    /// whatever the inner source produced — which is exactly what happened to
+    /// the park trace: the table stayed empty while the model filled a buffer
+    /// nobody drained. Every WorldSource method added later needs a line here.
+    fn take_park_trace(&mut self) -> Vec<ordo_emulated::ParkTrace> {
+        self.inner.take_park_trace()
+    }
 }
 
 #[cfg(test)]

@@ -20,11 +20,16 @@ pub trait WorldSource {
 
     /// Drain diagnostic records of the workspace mechanism from the snapshot
     /// just built. Telemetry, not record: the core never sees these and the
-    /// replay does not depend on them. Empty for sources with no mechanism to
-    /// hide (native Spaces, test fakes).
-    fn take_park_trace(&mut self) -> Vec<ParkTrace> {
-        Vec::new()
-    }
+    /// replay does not depend on them. Sources with no mechanism to hide
+    /// (native Spaces, test fakes) return empty.
+    ///
+    /// Deliberately NOT defaulted. `SubscribingWorld` decorates this trait, and
+    /// while this method had a default that wrapper inherited the empty one
+    /// instead of forwarding — the engine drained the decorator, the real source
+    /// kept filling a buffer nobody read, and the table stayed empty with
+    /// nothing failing. Requiring the method makes that omission a compile
+    /// error, which is the only reason it was found at all.
+    fn take_park_trace(&mut self) -> Vec<ParkTrace>;
 }
 
 /// Carries out a core [`Effect`] against the OS.

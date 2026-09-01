@@ -34,6 +34,11 @@ impl WorldSource for ScriptedWorld {
         self.at.set(i + 1);
         self.snaps[i].clone()
     }
+
+    /// Scripted snapshots come from fixtures, not a parking mechanism.
+    fn take_park_trace(&mut self) -> Vec<ordo_emulated::ParkTrace> {
+        Vec::new()
+    }
 }
 
 /// Reports every workspace switch as OS-successful, so the engine's cascade
