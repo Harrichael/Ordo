@@ -41,8 +41,12 @@ pub enum ParkTraceKind {
     PoisonedPromise,
     /// Enforcement saw a violation but did NOT count it, and why.
     Suppressed,
-    /// Enforcement rewrote the declaration to match the screen.
-    Adopted,
+    /// Enforcement hit its write limit and stood down: the declaration is
+    /// KEPT and no further writes are issued; the window stays visibly
+    /// misplaced until a user command resolves it. Never a rewrite — a
+    /// declaration must not follow the screen. (Rows in old logs with kind
+    /// `Adopted` are from before this rule was enforced here.)
+    Standoff,
     /// A workspace switch began: the boundary that groups everything after it.
     Switch,
     /// Dock dimming un-hid an app (Cmd+H cleared), revealing EVERY window it

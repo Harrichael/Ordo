@@ -1,27 +1,41 @@
 # Intent vs. observation: the data-ownership audit
 
-Status: **being implemented in reviewed steps** (2026-08-31; originally an
-exploration plan). Michael approved the program after the Opus design review
-(docs/intent-vs-observation-review.md): hotfixes (park sliver guard,
-S-after-R merge) → ordo-emulated crate extraction → snapshot seam split
-(observation vs workspace-word channels, believed frames) → CG-probe death
-evidence + (id,pid) identity → enforcement-as-assertion → declared-focus
-command context. The reconciler (docs/desired-state-reconciler.md) stays
-PAUSED; re-evaluate it against the finished ownership model.
+Status: **implemented; principle locked** (2026-09-01; originally an
+exploration plan, then implemented in reviewed steps). Michael approved the
+program after the Opus design review (docs/intent-vs-observation-review.md):
+hotfixes (park sliver guard, S-after-R merge) → ordo-emulated crate
+extraction → snapshot seam split (observation vs workspace-word channels,
+believed frames) → CG-probe death evidence + (id,pid) identity →
+enforcement-as-assertion → declared-focus command context. One piece of the
+review was later REVERSED: adopt-at-the-limit (see the principle below).
+The reconciler (docs/desired-state-reconciler.md) stays PAUSED; re-evaluate
+it against the finished ownership model.
 
-## The principle (Michael's formulation)
+## The principle (Michael's formulation, final form)
 
 - **Workspace navigation is intent — declarative.** "I am on workspace 2" and
-  "this is a workspace-3 window" are declarations. Only the user (or an
-  explicitly named policy acting for the user) may write them.
+  "this is a workspace-3 window" are declarations. The ONLY writers are
+  Ordo's own commands: an explicit user command (switch, carry/move), rescue,
+  and a window's BIRTH (a brand-new window has no prior intent, so it files
+  onto the current workspace — the one case with nothing to preserve).
+  Nothing else: not an app raising, moving, or un-hiding a window, not a
+  notification, not an observation of any kind.
 - **Window placement within a workspace is observational.** Where a visible
   window sits on its own workspace is whatever the world says it is; belief
-  follows reality there, freely.
+  follows reality there, freely. Ordo remembers a parked window's frame only
+  as a promise to restore it.
 - **An observation that contradicts a declaration is NOT a valid observation
   of that declared fact.** A ws3 window visibly standing on ws2 does not mean
   "it's a ws2 window now" and does not mean "windows just live there" — it is
-  a *violation* to be either corrected (assert the declaration) or explicitly
-  adopted by a named policy. Never silently absorbed.
+  a *violation* to be corrected on screen (assert the declaration) or
+  surfaced to the user. Never absorbed into the declaration. Equivalently:
+  a declaration must never travel through the observation channel.
+- **Enforcement therefore never adopts.** This reverses the review's
+  adopt-at-the-limit recommendation (2026-09-01): at its write limit,
+  enforcement stands down loudly (stderr + a Standoff trace) and leaves the
+  window visibly misplaced until the next user command. Losing where the
+  user filed a window is silent and permanent; a misplaced window is obvious
+  and self-heals on the next switch.
 
 Everything that went wrong this week is a category violation — observation
 writing into intent-owned data:
@@ -119,22 +133,18 @@ Categories: **D** declared (only commands/named policies write), **O** observed
   id + creation hint?).
 - Fight-or-adopt per datum: e.g. user deliberately drags a sliver out — adopt
   (reassign to current ws) or fight (re-park)? Today: fight with damping.
+  RESOLVED 2026-09-01: fight foreign writes with the damped budget, then
+  stand down and keep the declaration — never adopt (see the principle).
 - Native backend: which of these ownerships flip (assignment is observable
   there; `monitor_ws` is OS-co-owned)?
 
-## Context for resumption (post-compaction)
+## Context for resumption (historical; superseded 2026-09-01)
 
-- **Daemon is STALE**: running run 41 (started 08-31 10:38) = pre-revert
-  binary — still has the old double-press Ctrl+Alt+Cmd+R (destructive reset).
-  Michael's later refresh silently didn't happen (no run 42). The built
-  binary on disk has: R/S/O bring-up model (R=fresh single press, S=resume+
-  save, O=reload file) and the conditional settle sleep. Do not restart
-  without Michael's go; warn him R is dangerous until refresh.
-- **Uncommitted**: conditional settle sleep (zorder.rs), issues.txt overlap
-  verdict, this doc. Committed+pushed: 8b1bac9 (persistence, amnesia fixes,
-  R/S/O), 1a6ba30 (event hints, settle cap, phantom band-aid).
-- **Dangling**: nohup.out is git-tracked by accident (commit 8b1bac9) and
-  keeps growing — Michael hasn't answered whether to gitignore+untrack it.
+The operational notes that lived here (stale run-41 daemon, uncommitted
+files, nohup.out) described the 2026-08-31 working session and are long
+stale — trust the git log and the running daemon, not this section. Still
+true and worth keeping:
+
 - Useful queries live in the incident rows above; the log DB is
   ~/Library/Application Support/Ordo/log.db (WAL, live), state file
   state.json alongside it.

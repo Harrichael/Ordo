@@ -115,7 +115,7 @@ impl WorldSource for MacWorldSource {
             // The corrective write lands after this snapshot was read, so the
             // snapshot still shows the phantom; the next rescan absorbs the
             // fix as an (unattributed) external delta. Acceptable for a
-            // standing-invariant band-aid.
+            // standing-invariant check.
             self.backend.borrow_mut().enforce_placement(&frames);
         }
 

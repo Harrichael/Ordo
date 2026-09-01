@@ -110,19 +110,19 @@ pub trait WorkspaceBackend {
     /// as the new durable state. Idempotent when persistence is already on.
     fn resume_persistence(&mut self) {}
 
-    /// Re-assert placement promises this backend has made, given the frames
-    /// the enumerator already read (no backend re-enumerates on its own).
+    /// Assert this backend's placement declarations, given the frames the
+    /// enumerator already read (no backend re-enumerates on its own).
     /// Called once per rescan, and only while Ordo is actively driving —
     /// never when paused or rescued, where fighting a gather would be worse
     /// than any phantom.
     ///
-    /// Band-aid until placement writes get a single owner
-    /// (docs/desired-state-reconciler.md): under rapid switching a stale
-    /// restore can land AFTER the park that superseded it, leaving a
-    /// "phantom" — a window visibly on-screen that the ledger says is parked.
-    /// Nothing delta-driven ever fires on a phantom that has already settled,
-    /// so the invariant needs a standing check. Native makes no placement
-    /// promises; the default is a no-op.
+    /// A standing check by design: under rapid switching a stale restore can
+    /// land AFTER the park that superseded it, leaving a "phantom" — a window
+    /// visibly on-screen that the ledger says is parked — and nothing
+    /// delta-driven ever fires on a phantom that has already settled.
+    /// Corrections write FRAMES only; a declaration is never rewritten from
+    /// what the screen shows. Native makes no placement promises; the
+    /// default is a no-op.
     fn enforce_placement(&mut self, _frames: &HashMap<WindowId, (Pid, Rect)>) {}
 
     /// The backend's better knowledge of some windows' real frames, keyed by

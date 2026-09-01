@@ -1,9 +1,17 @@
 //! The emulated workspace backend: Ordo owns workspaces outright.
 //!
 //! Everything lives in one native Space. A window on a hidden workspace is
-//! parked off-screen (bottom-right corner, a sliver left visible because macOS
-//! forcibly re-homes fully-off-screen windows). Switching parks the outgoing
-//! workspace's windows and restores the incoming one's to their saved frames.
+//! parked off-screen (flush to the bottom of the main display, right-aligned
+//! within it, a sliver left visible because macOS forcibly re-homes
+//! fully-off-screen windows). Switching parks the outgoing workspace's
+//! windows and restores the incoming one's to their saved frames.
+//!
+//! Two kinds of data, and the split is the architecture: DECLARATIONS (a
+//! window's workspace, the visible workspace) are written only by Ordo's own
+//! commands — user switch/move, rescue, and a window's birth; OBSERVATIONS
+//! (frames, existence, focus) are authoritative about the world, never about
+//! intent. An observation contradicting a declaration is a violation to
+//! correct on screen or surface, never to absorb into the declaration.
 //!
 //! This crate is the whole emulated model — the pure [`ledger::Ledger`]
 //! bookkeeping, the [`statefile`] persistence of its promises, and the

@@ -255,24 +255,34 @@ named the symptom yet — candidates, ranked:
   filters (Alt+Tab/backtick/shift-tab) leak across workspaces/monitors —
   window `monitor` is derived from frame center and flips displays through
   the park corner on every transit.
-  Band-aid (this commit): WorkspaceBackend::enforce_placement — a standing
+  Band-aid (that commit): WorkspaceBackend::enforce_placement — a standing
   check per rescan, emulated impl re-parks any believed-parked window not at
   its sliver, damped at 3 per window (mirrors core damping), reset when it
   parks clean or unparks; gated on the intercepting flag so a paused/rescued
   daemon never fights a rescue gather. The re-park write lands post-snapshot
   and is absorbed as an External delta next rescan — attribution honesty is
-  deliberately sacrificed; this dies at reconciler R3 when plan() owns
-  park/restore and the phantom becomes just another goal-vs-belief diff.
-  REAL FIX: the reconciler (docs/desired-state-reconciler.md) — the fifth and
-  sixth members of the staleness class (carry mis-target via lagging believed
-  focus; phantom via unowned frame writes) both land in its R1-R5 scope, and
-  the phantom one is NOT cheaply fixable under the current model. Michael has
-  agreed to review the rearchitecture plan next (2026-08-28).
-- INTENT VS OBSERVATION (2026-08-31): the architecture exploration that now
-  gates everything, including the reconciler (PAUSED by Michael). Workspace
-  assignment is a DECLARATION; observation must never rewrite it — the week's
-  bugs are all category violations. Full data-ownership audit, incident map,
-  candidate tweaks, and open questions: docs/intent-vs-observation.md.
+  deliberately sacrificed.
+  PROMOTED FROM BAND-AID 2026-09-01 (enforcement = declaration assertion):
+  enforcement iterates the LEDGER (not the parked set), judges compliance
+  against the park frame Ordo last REQUESTED (macOS lands parks pulled back
+  27-124pt, measured; a constant corner box misread the deep landings as
+  escapes), exempts Ordo's own writes from the budget (saved-promise match
+  or last-requested match), withholds duplicate re-park writes while one is
+  in flight, and at the limit STANDS DOWN loudly — the declaration is never
+  rewritten from the screen (adoption removed; ParkTraceKind::Standoff).
+  The park corner is also right-aligned within the main display now: the old
+  right-edge corner straddled the second display, made the WindowServer
+  clamp one identical request three different ways, and left a visible
+  window-wide band on the second display.
+- INTENT VS OBSERVATION (2026-08-31; principle LOCKED 2026-09-01): the
+  architecture rule that now gates everything, including the reconciler
+  (PAUSED by Michael). Workspace assignment is a DECLARATION — writers are
+  user commands, rescue, and a window's birth, nothing else; observation
+  must never rewrite one (a violation is corrected on screen or surfaced,
+  never absorbed) — the week's bugs are all category violations. Full
+  data-ownership audit, incident map, and the final form of the principle:
+  docs/intent-vs-observation.md. Enforcement's adopt-at-the-limit is gone
+  (2026-09-01): it stands down loudly and keeps the declaration.
 - WEEKEND AMNESIA + PERSISTENCE — diagnosed and fixed 2026-08-31. Over a
   sleeping weekend, displays vanished and AX scans came back empty; the
   daemon read that as "every window closed": ledger.forget_missing erased all

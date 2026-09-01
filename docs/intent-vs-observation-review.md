@@ -1,7 +1,13 @@
 # Opus design review of docs/intent-vs-observation.md
 
 Status: independent subagent review (Opus, 2026-08-31), reproduced verbatim.
-Nothing here is implemented or agreed yet — Michael decides what stands.
+Michael has since decided what stands (2026-09-01): most of it was adopted,
+but the review's adopt-at-the-limit recommendation (end of candidate 2, and
+recommended answer 4) is REVERSED — enforcement never rewrites a declaration;
+at the limit it stands down loudly and leaves the window visibly misplaced
+(see docs/intent-vs-observation.md, "The principle", and
+`enforce_placement`'s doc in ordo-emulated). The body below is unedited
+history; where it argues for adoption, the principle overrides it.
 
 ---
 
