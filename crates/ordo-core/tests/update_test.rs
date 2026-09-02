@@ -149,6 +149,14 @@ fn hotkey(action: HotkeyAction) -> Event {
     Event::Hotkey { at: ts(), action }
 }
 
+fn gesture(gesture: Gesture) -> Event {
+    Event::Gesture { at: ts(), gesture }
+}
+
+fn click(x: f64, y: f64) -> Event {
+    gesture(Gesture::MouseDown { at: Point { x, y } })
+}
+
 /// Boot the standard world, then focus each window in `focus_seq` in order,
 /// so the MRU history is exactly `focus_seq` reversed-into-front order.
 fn booted(focus_seq: &[u32]) -> State {
@@ -574,37 +582,12 @@ fn round_trip_through_empty_workspace_refocuses_the_same_window() {
 }
 
 #[test]
-fn external_focus_on_a_hidden_workspaces_window_is_followed() {
-    // The user Cmd+Tabbed to w2, which is parked on workspace 2: Ordo brings
-    // workspace 2 over, mirroring native Spaces.
+fn a_witnessed_switch_to_a_hidden_window_is_followed_and_an_unwitnessed_one_is_held() {
+    // w2 is parked on workspace 2; the user is on workspace 1 with w1.
     let mut wins = std_windows();
     wins[1].workspace = ws(2);
-    let step = update(
+    let s = update(
         &booted(&[1]),
-        &observed(
-            vec![mon_a(1), mon_b(1)],
-            wins,
-            Some(2),
-            RescanTrigger::Periodic,
-        ),
-    );
-    assert!(step
-        .effects
-        .iter()
-        .any(|e| matches!(e, Effect::SwitchWorkspace { target, .. } if *target == ws(2))));
-    assert!(step
-        .notes
-        .iter()
-        .any(|n| matches!(n, Note::FollowedFocus { window, target }
-            if *window == wid(2) && *target == ws(2))));
-
-    // But a focus change we caused ourselves is not followed: mid-switch,
-    // focus lands on the destination window while the monitors still show
-    // the old workspace — that's our own op's echo, not a Cmd+Tab.
-    let mut wins = std_windows();
-    wins[1].workspace = ws(2);
-    let mid = update(
-        &booted(&[2, 1]),
         &observed(
             vec![mon_a(1), mon_b(1)],
             wins.clone(),
@@ -613,26 +596,160 @@ fn external_focus_on_a_hidden_workspaces_window_is_followed() {
         ),
     )
     .state;
-    let issued = update(&mid, &hotkey(HotkeyAction::WorkspaceNext));
-    let obs = update(
-        &issued.state,
+    assert_eq!(
+        s.focus_intent(),
+        FocusIntent::Deferred,
+        "nothing commanded yet"
+    );
+
+    // Focus appears on w2 out of nowhere: nobody can type into a parked
+    // window, so the visible workspace's MRU window is declared and focus
+    // pulled back there. The workspace does not move.
+    let held = update(
+        &s,
+        &observed(
+            vec![mon_a(1), mon_b(1)],
+            wins.clone(),
+            Some(2),
+            RescanTrigger::Periodic,
+        ),
+    );
+    assert_eq!(
+        count_switches(&held.effects),
+        0,
+        "a fling is not navigation"
+    );
+    assert_eq!(focus_targets(&held.effects), vec![wid(1)]);
+    assert!(held.notes.contains(&Note::HeldFocus {
+        window: wid(1),
+        from: wid(2),
+        from_app: Pid(200),
+    }));
+    assert_eq!(held.state.focus_intent(), FocusIntent::Window(wid(1)));
+
+    // The same observation right after Cmd+Tab is the user going to w2:
+    // Ordo brings workspace 2 over, as native Spaces would, and w2 heads
+    // both the declaration and the restack.
+    let cmd_tab = update(&s, &gesture(Gesture::SystemSwitch));
+    assert!(cmd_tab.notes.contains(&Note::GestureClassified {
+        gesture: Gesture::SystemSwitch,
+        armed: true,
+        within: None,
+    }));
+    let after_cmd_tab = cmd_tab.state;
+    assert_eq!(after_cmd_tab.focus_intent(), FocusIntent::Deferred);
+    let followed = update(
+        &after_cmd_tab,
         &observed(
             vec![mon_a(1), mon_b(1)],
             wins,
             Some(2),
-            RescanTrigger::PostEffect { op: OpId(2) },
+            RescanTrigger::Periodic,
         ),
     );
-    assert_eq!(count_switches(&obs.effects), 0, "no follow of our own echo");
+    assert!(followed
+        .effects
+        .iter()
+        .any(|e| matches!(e, Effect::SwitchWorkspace { target, .. } if *target == ws(2))));
+    assert!(
+        focus_targets(&followed.effects).is_empty(),
+        "the user already has the focus they asked for"
+    );
+    assert!(followed.notes.contains(&Note::FollowedFocus {
+        window: wid(2),
+        target: ws(2)
+    }));
+    assert_eq!(followed.state.focus_intent(), FocusIntent::Window(wid(2)));
 }
 
 #[test]
-fn late_focus_echo_inside_the_settle_window_is_held_not_followed() {
+fn a_click_into_a_visible_window_does_not_license_a_follow_but_a_click_elsewhere_does() {
+    // Same world: w2 parked on workspace 2, w1 (100,100 400x300) visible.
+    let mut wins = std_windows();
+    wins[1].workspace = ws(2);
+    let obs = |focused: u32| {
+        observed(
+            vec![mon_a(1), mon_b(1)],
+            wins.clone(),
+            Some(focused),
+            RescanTrigger::Periodic,
+        )
+    };
+    let s = update(&booted(&[1]), &obs(1)).state;
+
+    // A click INTO w1 keys w1 (or a sheet of it) — so focus turning up on
+    // parked w2 afterwards is a fling, not the click's doing.
+    let clicked = update(&s, &click(200.0, 200.0));
+    assert!(clicked.notes.contains(&Note::GestureClassified {
+        gesture: Gesture::MouseDown {
+            at: Point { x: 200.0, y: 200.0 }
+        },
+        armed: false,
+        within: Some(wid(1)),
+    }));
+    let clicked_w1 = clicked.state;
+    assert_eq!(clicked_w1.focus_intent(), FocusIntent::Deferred);
+    let fling = update(&clicked_w1, &obs(2));
+    assert_eq!(count_switches(&fling.effects), 0);
+    assert_eq!(focus_targets(&fling.effects), vec![wid(1)]);
+
+    // A click outside every visible window — the Dock, say — can be aimed at
+    // anything, and a hidden landing right after it is the user navigating.
+    let dock = update(&s, &click(960.0, 1075.0));
+    assert!(dock.notes.contains(&Note::GestureClassified {
+        gesture: Gesture::MouseDown {
+            at: Point {
+                x: 960.0,
+                y: 1075.0
+            }
+        },
+        armed: true,
+        within: None,
+    }));
+    let clicked_dock = dock.state;
+    let followed = update(&clicked_dock, &obs(2));
+    assert_eq!(count_switches(&followed.effects), 1);
+    assert!(followed
+        .notes
+        .iter()
+        .any(|n| matches!(n, Note::FollowedFocus { .. })));
+
+    // A gesture explains exactly the observation after it. One uneventful
+    // observation later, the same landing is a fling again.
+    let quiet = update(&clicked_dock, &obs(1)).state;
+    let late = update(&quiet, &obs(2));
+    assert_eq!(count_switches(&late.effects), 0, "the gesture was spent");
+    assert_eq!(focus_targets(&late.effects), vec![wid(1)]);
+
+    // A command in between spends it too: Dock click, then Cmd+Right to the
+    // empty workspace 3. Its own post-effect snapshot shows w1 still focused
+    // — parking does not defocus — and now hidden. That is the switch's
+    // doing, not the click's; bouncing back to workspace 1 would be wrong.
+    let switched = update(
+        &clicked_dock,
+        &hotkey(HotkeyAction::WorkspaceSwitchTo(ws(3))),
+    )
+    .state;
+    let after = update(
+        &switched,
+        &observed(
+            vec![mon_a(3), mon_b(3)],
+            wins.clone(),
+            Some(1),
+            RescanTrigger::PostEffect { op: OpId(1) },
+        ),
+    );
+    assert_eq!(count_switches(&after.effects), 0, "no bounce back");
+}
+
+#[test]
+fn a_stray_focus_under_a_standing_declaration_is_reasserted_however_late_it_arrives() {
     // Run 38's snap-back, replayed: rapid switching leaves focus grants in
     // flight, and an app can land (or duplicate) one seconds later — after
     // the switch and its focus expectation have both confirmed and cleared.
-    // Inside the settle window that arrival is our own echo: hold the
-    // workspace, pull focus back. Past the window it's the user navigating.
+    // The declaration does not expire with the expectation: the stray focus
+    // contradicts it, so it is re-asserted, at 500ms and equally at 3s. Only
+    // a witnessed gesture makes such a landing navigation.
     let at = |mono_ns: u64| Ts {
         wall_ms: 0,
         mono_ns,
@@ -655,37 +772,27 @@ fn late_focus_echo_inside_the_settle_window_is_held_not_followed() {
         },
     )
     .state;
+    assert_eq!(s.focus_intent(), FocusIntent::Window(wid(2)));
     // ...and the very next snapshot confirms everything: monitors on ws2,
-    // focus on w2. All expectations resolve; the old guards are now down.
+    // focus on w2. All expectations resolve.
     let s = update(&s, &obs(1_200_000_000, 2, wins.clone(), 2)).state;
+    assert!(s.pending.is_empty());
 
     // 500ms after the switch, the stale grant echoes: focus pops back to w1
-    // on hidden ws1. Held, not followed.
-    let held = update(&s, &obs(1_500_000_000, 2, wins.clone(), 1));
-    assert_eq!(count_switches(&held.effects), 0, "no snap-back");
-    assert_eq!(
-        focus_targets(&held.effects),
-        vec![wid(2)],
-        "focus pulled back to the current workspace's MRU window"
-    );
-    assert!(held
+    // on hidden ws1. Re-asserted, not followed.
+    let early = update(&s, &obs(1_500_000_000, 2, wins.clone(), 1));
+    assert_eq!(count_switches(&early.effects), 0, "no snap-back");
+    assert_eq!(focus_targets(&early.effects), vec![wid(2)]);
+    assert!(early
         .notes
-        .iter()
-        .any(|n| matches!(n, Note::HeldFocusSettling { window } if *window == wid(2))));
+        .contains(&Note::FocusReasserted { window: wid(2) }));
 
-    // The pull-back confirms; well past the settle window the same focus
-    // change is genuine navigation (Cmd+Tab) and is followed.
-    let s = update(&held.state, &obs(1_600_000_000, 2, wins.clone(), 2)).state;
-    let followed = update(&s, &obs(4_000_000_000, 2, wins, 1));
-    assert!(followed
-        .effects
-        .iter()
-        .any(|e| matches!(e, Effect::SwitchWorkspace { target, .. } if *target == ws(1))));
-    assert!(followed
-        .notes
-        .iter()
-        .any(|n| matches!(n, Note::FollowedFocus { window, target }
-            if *window == wid(1) && *target == ws(1))));
+    // The re-assertion lands. Well past any settle window the same stray
+    // landing is still a violation — no gesture, no navigation.
+    let s = update(&early.state, &obs(1_600_000_000, 2, wins.clone(), 2)).state;
+    let late = update(&s, &obs(4_000_000_000, 2, wins, 1));
+    assert_eq!(count_switches(&late.effects), 0);
+    assert_eq!(focus_targets(&late.effects), vec![wid(2)]);
 }
 
 #[test]
@@ -727,10 +834,52 @@ fn closing_a_window_never_follows_focus_to_another_workspace() {
         vec![wid(1)],
         "focus returns to this workspace's MRU window"
     );
-    assert!(step
-        .notes
-        .iter()
-        .any(|n| matches!(n, Note::HeldFocusOnClose { window } if *window == wid(1))));
+    assert!(step.notes.contains(&Note::HeldFocus {
+        window: wid(1),
+        from: wid(2),
+        from_app: Pid(200),
+    }));
+
+    // The same when the window closing is the DECLARED one: Alt+Tab to w3,
+    // confirmed, then Cmd+W. A declaration about a window that no longer
+    // exists is vacuous, so the hidden landing is held exactly as above.
+    let mut wins = std_windows();
+    wins[1].workspace = ws(2);
+    let s = update(
+        &booted(&[2, 3, 1]),
+        &observed(
+            vec![mon_a(1), mon_b(1)],
+            wins.clone(),
+            Some(1),
+            RescanTrigger::Periodic,
+        ),
+    )
+    .state;
+    let s = update(&s, &hotkey(HotkeyAction::MruWorkspace)).state; // -> w3
+    assert_eq!(s.focus_intent(), FocusIntent::Window(wid(3)));
+    let s = update(
+        &s,
+        &observed(
+            vec![mon_a(1), mon_b(1)],
+            wins.clone(),
+            Some(3),
+            RescanTrigger::Periodic,
+        ),
+    )
+    .state;
+    wins.retain(|w| w.snap.id != wid(3));
+    let closed = update(
+        &s,
+        &observed(
+            vec![mon_a(1), mon_b(1)],
+            wins,
+            Some(2),
+            RescanTrigger::Periodic,
+        ),
+    );
+    assert_eq!(count_switches(&closed.effects), 0);
+    assert_eq!(focus_targets(&closed.effects), vec![wid(1)]);
+    assert_eq!(closed.state.focus_intent(), FocusIntent::Window(wid(1)));
 }
 
 #[test]
@@ -832,6 +981,7 @@ fn new_window_is_corralled_to_the_focused_workspace_and_monitor() {
         .effects
         .iter()
         .any(|e| matches!(e, Effect::RequestRescan { .. })));
+    assert_eq!(obs.state.focus_intent(), FocusIntent::Window(wid(9)));
 }
 
 #[test]
@@ -854,6 +1004,11 @@ fn plain_rescans_never_corral() {
         e,
         Effect::MoveWindowToWorkspace { .. } | Effect::SetWindowFrame { .. }
     )));
+    // But the focused newcomer IS declared: apps whose observer never
+    // attached announce no births, and their new windows must not have
+    // focus yanked back to whatever was declared before.
+    assert_eq!(obs.state.focus_intent(), FocusIntent::Window(wid(9)));
+    assert!(focus_targets(&obs.effects).is_empty());
 }
 
 #[test]
@@ -1238,6 +1393,77 @@ fn carry_moves_the_focused_window_and_switches_with_it() {
 }
 
 #[test]
+fn a_carry_rides_on_top_of_the_destination_and_survives_a_fling_to_a_sibling() {
+    // w2 and w3 live on workspace 2; w1 (same app as w3) is carried there.
+    // Run 51: every carry's restack omitted the carried window — its
+    // assignment was still pending, so the destination's MRU stack didn't
+    // contain it — and AppKit keyed the resident sibling at the head instead.
+    // The next carry chord then read that flung focus and did nothing.
+    let mut wins = std_windows();
+    wins[1].workspace = ws(2);
+    wins[2].workspace = ws(2);
+    let s = update(
+        &booted(&[2, 3, 1]), // history [1, 3, 2]
+        &observed(
+            vec![mon_a(1), mon_b(1)],
+            wins.clone(),
+            Some(1),
+            RescanTrigger::Periodic,
+        ),
+    )
+    .state;
+
+    let carried = update(&s, &hotkey(HotkeyAction::CarryFocusedToWorkspaceNext));
+    let restack = carried
+        .effects
+        .iter()
+        .find_map(|e| match e {
+            Effect::RestackWindows { order } => Some(order.clone()),
+            _ => None,
+        })
+        .expect("restack effect");
+    assert_eq!(
+        restack,
+        vec![wid(1), wid(3), wid(2)],
+        "carried window on top"
+    );
+    assert!(
+        focus_targets(&carried.effects).is_empty(),
+        "it keeps its focus"
+    );
+    assert_eq!(carried.state.focus_intent(), FocusIntent::Window(wid(1)));
+
+    // The world lands the carry but keys sibling w3 instead of w1.
+    wins[0].workspace = ws(2);
+    let flung = update(
+        &carried.state,
+        &observed(
+            vec![mon_a(2), mon_b(2)],
+            wins.clone(),
+            Some(3),
+            RescanTrigger::PostEffect { op: OpId(2) },
+        ),
+    );
+    assert_eq!(count_switches(&flung.effects), 0);
+    assert_eq!(focus_targets(&flung.effects), vec![wid(1)], "re-asserted");
+    assert_eq!(
+        flung.state.focus_history.iter().next(),
+        Some(wid(1)),
+        "the fling did not reorder MRU"
+    );
+
+    // The next chord carries w1 — the declaration — not the flung-to w3.
+    let again = update(
+        &flung.state,
+        &hotkey(HotkeyAction::CarryFocusedToWorkspaceNext),
+    );
+    assert!(again.effects.iter().any(|e| {
+        matches!(e, Effect::AssignWindowToWorkspace { window, target, .. }
+            if *window == wid(1) && *target == ws(3))
+    }));
+}
+
+#[test]
 fn a_carry_mid_handoff_takes_the_granted_window_not_the_stale_focus() {
     // Run 38 seq 20447: Alt+Tab issued a focus grant, the user carried before
     // the echo arrived, and the carry read observation-lagged focus — moving
@@ -1278,6 +1504,399 @@ fn carry_at_the_edge_or_with_nothing_focused_does_nothing() {
     )
     .effects
     .is_empty());
+}
+
+// --- focus: declaration vs observation ----------------------------------------
+
+#[test]
+fn a_grant_that_never_lands_is_reasserted_then_stood_down_and_the_standoff_holds() {
+    // Run 51: 36 of 255 switch grants never landed and were never retried.
+    // Here the switch's grant to w2 is ignored forever (focus stays on parked
+    // w1). Ordo re-asserts under the damping limit, then stands down once and
+    // loudly — and never reads the stuck focus as navigation back to ws1.
+    //
+    // The part that matters is AFTER the stand-down, so the world is observed
+    // long past it. Focus is still on a hidden window — the very shape the
+    // visible-key-window invariant corrects — but the standoff has already
+    // shown this window will not yield, and re-declaring against the same
+    // evidence would raise the parked window every few seconds forever. The
+    // concession has to hold until a command or the world moves.
+    let mut wins = std_windows();
+    wins[1].workspace = ws(2);
+    let on_ws2 = |focused: u32| {
+        observed(
+            vec![mon_a(2), mon_b(2)],
+            wins.clone(),
+            Some(focused),
+            RescanTrigger::Periodic,
+        )
+    };
+    let s = update(
+        &booted(&[2, 1]),
+        &observed(
+            vec![mon_a(1), mon_b(1)],
+            wins.clone(),
+            Some(1),
+            RescanTrigger::Periodic,
+        ),
+    )
+    .state;
+
+    // Drive the stuck world for `rounds` observations after `first`, returning
+    // (grants, stand-downs, switches, holds) — every kind of write or
+    // re-declaration the fight could produce.
+    let fight = |first: Step, rounds: usize| {
+        let mut step = first;
+        let mut grants = focus_targets(&step.effects).len();
+        let mut diverged = 0;
+        let mut switches = 0;
+        let mut held = 0;
+        for _ in 0..rounds {
+            step = update(&step.state, &on_ws2(1));
+            grants += focus_targets(&step.effects).len();
+            switches += count_switches(&step.effects);
+            diverged += step
+                .notes
+                .iter()
+                .filter(|n| {
+                    **n == Note::FocusDiverged {
+                        window: wid(2),
+                        winner: Some(wid(1)),
+                        winner_app: Some(Pid(100)),
+                    }
+                })
+                .count();
+            held += step
+                .notes
+                .iter()
+                .filter(|n| matches!(n, Note::HeldFocus { .. }))
+                .count();
+        }
+        (step, grants, diverged, switches, held)
+    };
+
+    let switched = update(&s, &hotkey(HotkeyAction::WorkspaceNext));
+    assert_eq!(focus_targets(&switched.effects), vec![wid(2)]);
+    let (step, grants, diverged, switches, held) = fight(switched, 60);
+    assert_eq!(
+        grants, 4,
+        "the command's grant + 3 damped re-assertions, then nothing"
+    );
+    assert_eq!(diverged, 1, "stood down once, and stayed down");
+    assert_eq!(switches, 0, "a stuck focus is never followed");
+    assert_eq!(
+        held, 0,
+        "the invariant does not re-litigate the window that won the slot"
+    );
+    assert_eq!(
+        step.state.focus_intent(),
+        FocusIntent::Deferred,
+        "the lost claim is retired, not left to misdirect the next chord"
+    );
+
+    // A command is fresh evidence that the user wants the slot moved: Alt+Tab
+    // to w2 re-opens the fight with a full budget, which ends the same way.
+    let retried = update(&step.state, &hotkey(HotkeyAction::MruWorkspace));
+    assert_eq!(focus_targets(&retried.effects), vec![wid(2)]);
+    let (step, grants, diverged, _, held) = fight(retried, 60);
+    assert_eq!(grants, 4);
+    assert_eq!(diverged, 1);
+    assert_eq!(held, 0);
+
+    // Once the world agrees the concession is spent, and a later fling to the
+    // same hidden window is a fresh violation for the invariant to hold.
+    let agreed = update(&step.state, &on_ws2(2)).state;
+    let flung = update(&agreed, &on_ws2(1));
+    assert_eq!(focus_targets(&flung.effects), vec![wid(2)]);
+    assert!(flung.notes.contains(&Note::HeldFocus {
+        window: wid(2),
+        from: wid(1),
+        from_app: Pid(100),
+    }));
+}
+
+#[test]
+fn a_standoff_is_conceded_to_the_app_not_to_whichever_of_its_windows_was_key() {
+    // AppKit key-window ownership is per-application: the app that beat the
+    // grant decides which of ITS windows is key, and hops between them are
+    // routine (Chrome's key window wandered through run 51's standoff; Cmd+H
+    // churn does the same). The shape of the test above, except the side
+    // that won has two hidden windows and alternates focus between them. A
+    // concession keyed on the window is spent by every hop, and the loop it
+    // exists to stop comes back at full rate.
+    //
+    // w1 and w3 (pid 100) and w4 (pid 300) stay hidden on ws1; w2 is the
+    // visible MRU head on ws2.
+    let mut wins = std_windows();
+    wins[1].workspace = ws(2);
+    wins.push(win(4, 300, 1, rect(300.0, 700.0)));
+    let on_ws2 = |focused: Option<u32>| {
+        observed(
+            vec![mon_a(2), mon_b(2)],
+            wins.clone(),
+            focused,
+            RescanTrigger::Periodic,
+        )
+    };
+    let s = update(
+        &booted(&[2, 1]),
+        &observed(
+            vec![mon_a(1), mon_b(1)],
+            wins.clone(),
+            Some(1),
+            RescanTrigger::Periodic,
+        ),
+    )
+    .state;
+    let tally = |step: &Step| {
+        let count = |f: fn(&Note) -> bool| step.notes.iter().filter(|n| f(n)).count();
+        (
+            focus_targets(&step.effects).len(),
+            count(|n| matches!(n, Note::FocusDiverged { .. })),
+            count(|n| matches!(n, Note::HeldFocus { .. })),
+        )
+    };
+
+    let mut step = update(&s, &hotkey(HotkeyAction::WorkspaceNext));
+    let (mut grants, mut diverged, mut held) = tally(&step);
+    for i in 0..60 {
+        let who = if i % 2 == 0 { 1 } else { 3 };
+        step = update(&step.state, &on_ws2(Some(who)));
+        let (g, d, h) = tally(&step);
+        grants += g;
+        diverged += d;
+        held += h;
+    }
+    assert_eq!(
+        grants, 4,
+        "the command's grant + 3 damped re-assertions, then nothing"
+    );
+    assert_eq!(
+        diverged, 1,
+        "stood down once, and stayed down through every hop"
+    );
+    assert_eq!(held, 0, "a hop within the app is not the world moving on");
+    assert_eq!(step.state.focus_intent(), FocusIntent::Deferred);
+
+    // A focus vacuum is not the app relenting: nobody else took the slot, so
+    // when the same app re-keys a hidden window nothing is re-litigated.
+    let vacuum = update(&step.state, &on_ws2(None));
+    assert!(vacuum.effects.is_empty());
+    let rekeyed = update(&vacuum.state, &on_ws2(Some(3)));
+    assert!(rekeyed.effects.is_empty());
+    assert_eq!(tally(&rekeyed).2, 0);
+
+    // A DIFFERENT app taking the slot — even into another hidden window — is
+    // the world moving on: the invariant holds against it afresh.
+    let usurped = update(&rekeyed.state, &on_ws2(Some(4)));
+    assert_eq!(focus_targets(&usurped.effects), vec![wid(2)]);
+    assert!(usurped.notes.contains(&Note::HeldFocus {
+        window: wid(2),
+        from: wid(4),
+        from_app: Pid(300),
+    }));
+}
+
+#[test]
+fn a_grant_landing_on_a_sibling_is_corrected_and_does_not_reorder_mru() {
+    // Chrome keeps its own key window: a grant to w2 lands on its sibling w4
+    // (same app, same workspace). The grant is retried once its expectation
+    // has expired, and the sibling's stolen focus never becomes "most recent".
+    let wins = vec![
+        win(1, 100, 1, rect(100.0, 100.0)),
+        win(2, 200, 2, rect(2000.0, 100.0)),
+        win(3, 100, 1, rect(600.0, 500.0)),
+        win(4, 200, 2, rect(2400.0, 500.0)),
+    ];
+    let obs = |active: u8, focused: u32| {
+        observed(
+            vec![mon_a(active), mon_b(active)],
+            wins.clone(),
+            Some(focused),
+            RescanTrigger::Periodic,
+        )
+    };
+    // History built while ws2 was up: w4, then w2; then the user is on ws1.
+    let mut s = update(
+        &State::new(),
+        &observed(
+            vec![mon_a(2), mon_b(2)],
+            wins.clone(),
+            Some(4),
+            RescanTrigger::Startup,
+        ),
+    )
+    .state;
+    for (active, focused) in [(2, 2), (1, 1)] {
+        s = update(&s, &obs(active, focused)).state;
+    }
+    let step = update(&s, &hotkey(HotkeyAction::WorkspaceNext));
+    assert_eq!(focus_targets(&step.effects), vec![wid(2)]);
+
+    let mut s = step.state;
+    let mut regrants = 0;
+    for _ in 0..3 {
+        let next = update(&s, &obs(2, 4)); // sibling holds key
+        regrants += focus_targets(&next.effects).len();
+        assert_eq!(count_switches(&next.effects), 0);
+        s = next.state;
+    }
+    assert_eq!(
+        regrants, 1,
+        "one retry, after the grant's expectation expired"
+    );
+    assert_eq!(s.focus_history.iter().next(), Some(wid(2)));
+    assert_eq!(s.focus_intent(), FocusIntent::Window(wid(2)));
+}
+
+#[test]
+fn mru_records_declarations_and_only_the_os_s_visible_choice_when_deferred() {
+    let s = booted(&[3, 2, 1]); // history [1, 2, 3], all on ws1
+    let step = update(&s, &hotkey(HotkeyAction::MruWorkspace)); // -> w2
+    assert_eq!(
+        step.state.focus_history.iter().next(),
+        Some(wid(2)),
+        "declared before any observation confirms it"
+    );
+
+    // The world keys w3 instead: the declaration stands and so does the order.
+    let flung = update(
+        &step.state,
+        &observed(
+            vec![mon_a(1), mon_b(1)],
+            std_windows(),
+            Some(3),
+            RescanTrigger::Periodic,
+        ),
+    );
+    assert_eq!(flung.state.focus_history.iter().next(), Some(wid(2)));
+    assert_eq!(flung.state.focus_intent(), FocusIntent::Window(wid(2)));
+
+    // After a click the OS owns the slot, and its choice is the record.
+    let clicked = update(&flung.state, &click(700.0, 600.0)).state; // inside w3
+    let seen = update(
+        &clicked,
+        &observed(
+            vec![mon_a(1), mon_b(1)],
+            std_windows(),
+            Some(3),
+            RescanTrigger::Periodic,
+        ),
+    );
+    assert!(seen.effects.is_empty(), "nothing to enforce while deferred");
+    assert_eq!(seen.state.focus_history.iter().next(), Some(wid(3)));
+}
+
+#[test]
+fn a_fling_after_a_birth_on_an_empty_workspace_is_reasserted_not_followed() {
+    // Run 51 seq 12750-12769: switch to empty ws5; Cmd+N; the new window is
+    // born and focused; 32ms later macOS flings focus to a kitty window on
+    // ws4; follow-the-focus switched there. The birth is a command that
+    // declares the newborn, so the fling meets a standing declaration.
+    let s = booted(&[1]);
+    let away = update(&s, &hotkey(HotkeyAction::WorkspaceNext)); // ws2 is empty
+    assert!(focus_targets(&away.effects).is_empty());
+    assert_eq!(away.state.focus_intent(), FocusIntent::Deferred);
+
+    // Parked: focus still sits on hidden w1 with nothing here to pull it to.
+    let parked = update(
+        &away.state,
+        &observed(
+            vec![mon_a(2), mon_b(2)],
+            std_windows(),
+            Some(1),
+            RescanTrigger::PostEffect { op: OpId(1) },
+        ),
+    );
+    assert_eq!(count_switches(&parked.effects), 0);
+    assert!(focus_targets(&parked.effects).is_empty());
+
+    let mut wins = std_windows();
+    wins.push(win(9, 300, 2, rect(100.0, 100.0)));
+    let born = update(
+        &parked.state,
+        &observed(
+            vec![mon_a(2), mon_b(2)],
+            wins.clone(),
+            Some(9),
+            RescanTrigger::AxHint {
+                pid: Some(Pid(300)),
+                kind: AxHintKind::WindowCreated,
+            },
+        ),
+    );
+    assert_eq!(born.state.focus_intent(), FocusIntent::Window(wid(9)));
+
+    let flung = update(
+        &born.state,
+        &observed(
+            vec![mon_a(2), mon_b(2)],
+            wins,
+            Some(1),
+            RescanTrigger::AxHint {
+                pid: Some(Pid(100)),
+                kind: AxHintKind::Other("AXFocusedWindowChanged".into()),
+            },
+        ),
+    );
+    assert_eq!(count_switches(&flung.effects), 0, "not navigation");
+    assert_eq!(focus_targets(&flung.effects), vec![wid(9)]);
+    assert!(flung
+        .notes
+        .contains(&Note::FocusReasserted { window: wid(9) }));
+}
+
+#[test]
+fn a_gesture_hands_focus_to_the_os_and_every_command_takes_it_back() {
+    // Michael's concern: `Deferred` is a standing state, so it must never
+    // outlive the next command. Every hotkey that does anything declares.
+    assert_eq!(State::new().focus_intent(), FocusIntent::Deferred);
+    let s = booted(&[3, 2, 1]);
+    assert_eq!(
+        s.focus_intent(),
+        FocusIntent::Deferred,
+        "start: the OS owns focus"
+    );
+
+    let declared = update(&s, &hotkey(HotkeyAction::MruWorkspace)).state;
+    assert_eq!(declared.focus_intent(), FocusIntent::Window(wid(2)));
+    let deferred = update(&declared, &gesture(Gesture::SystemSwitch)).state;
+    assert_eq!(deferred.focus_intent(), FocusIntent::Deferred);
+
+    // While deferred, a focus change on the visible workspace is not fought.
+    let seen = update(
+        &deferred,
+        &observed(
+            vec![mon_a(1), mon_b(1)],
+            std_windows(),
+            Some(3),
+            RescanTrigger::Periodic,
+        ),
+    );
+    assert!(seen.effects.is_empty());
+
+    // History is now [3, 2, 1] and the OS's choice, w3, is what commands read.
+    for (action, expect) in [
+        (HotkeyAction::MruWorkspace, FocusIntent::Window(wid(2))),
+        (HotkeyAction::MruDemote, FocusIntent::Window(wid(2))),
+        (
+            HotkeyAction::MoveFocusedToOtherMonitor,
+            FocusIntent::Window(wid(3)),
+        ),
+        (
+            HotkeyAction::CarryFocusedToWorkspaceNext,
+            FocusIntent::Window(wid(3)),
+        ),
+    ] {
+        let after = update(&seen.state, &hotkey(action)).state;
+        assert_eq!(after.focus_intent(), expect, "{action:?}");
+    }
+    // A hotkey that does nothing (clamped at the edge) changes nothing.
+    let noop = update(&seen.state, &hotkey(HotkeyAction::WorkspacePrev)).state;
+    assert_eq!(noop, seen.state);
+    // Rescue hands the desktop back wholesale.
+    let rescued = update(&declared, &Event::RescueEngaged { at: ts() }).state;
+    assert_eq!(rescued.focus_intent(), FocusIntent::Deferred);
 }
 
 // --- review fixes --------------------------------------------------------------

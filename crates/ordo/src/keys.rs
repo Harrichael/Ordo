@@ -32,6 +32,11 @@
 //! Modifier matching is deliberately strict so Ordo only swallows the exact
 //! chord: Cmd+Shift+arrows are claimed (the user gave up select-to-line for
 //! them, same trade as Cmd+arrows), but Cmd+Alt+arrows etc. pass through.
+//!
+//! A second, separate table ([`witness`]) names macOS's OWN focus-moving
+//! chords — Cmd+Tab and Cmd+` — which Ordo never swallows but must see: they
+//! are the user's intent about focus, and without a trace of them the focus
+//! change they cause is indistinguishable from an app flinging focus around.
 
 use ordo_core::{HotkeyAction, WorkspaceId};
 
@@ -77,6 +82,32 @@ pub enum Chord {
     /// state. Only meaningful while engaged, so it sits behind the
     /// interception gate like the ordinary hotkeys.
     SaveState,
+}
+
+/// A system focus gesture seen on a key-down. Passed through untouched; the
+/// tap only reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Witness {
+    /// Cmd+Tab (or Cmd+Shift+Tab): the app switcher is now up. It acts when
+    /// Cmd is RELEASED, possibly seconds later, so the tap arms on this and
+    /// reports the gesture on the release.
+    AppSwitcherArmed,
+    /// Cmd+` (or Cmd+Shift+`): the in-app window cycle, which acts at once.
+    WindowCycle,
+}
+
+/// macOS's own focus-moving chords, checked on keys `match_chord` let through.
+/// Alt is excluded because Ordo's own Alt+Tab / Alt+` never reach here, and
+/// Ctrl because Ctrl+Tab is every browser's tab switch, not a focus move.
+pub fn witness(keycode: u16, m: Mods) -> Option<Witness> {
+    if !(m.cmd && !m.alt && !m.ctrl) {
+        return None;
+    }
+    match keycode {
+        code::TAB => Some(Witness::AppSwitcherArmed),
+        code::GRAVE => Some(Witness::WindowCycle),
+        _ => None,
+    }
 }
 
 /// Which chord, if any, a key-down maps to. `None` means "not ours — pass it
@@ -323,6 +354,23 @@ mod tests {
         assert_eq!(match_chord(code::R, mods(false, false, false, false)), None);
         assert_eq!(match_chord(code::S, mods(true, false, false, false)), None);
         // Cmd+S is Save
+    }
+
+    #[test]
+    fn system_switchers_are_witnessed_but_never_claimed() {
+        // Cmd+Tab and Cmd+` are macOS's; Ordo sees them and lets them go.
+        for shift in [false, true] {
+            let m = mods(true, false, shift, false);
+            assert_eq!(match_chord(code::TAB, m), None);
+            assert_eq!(witness(code::TAB, m), Some(Witness::AppSwitcherArmed));
+            assert_eq!(match_chord(code::GRAVE, m), None);
+            assert_eq!(witness(code::GRAVE, m), Some(Witness::WindowCycle));
+        }
+        // Ordo's own Alt-chords and the browsers' Ctrl+Tab are not witnessed.
+        assert_eq!(witness(code::TAB, mods(false, true, false, false)), None);
+        assert_eq!(witness(code::TAB, mods(false, false, false, true)), None);
+        assert_eq!(witness(code::TAB, mods(true, true, false, false)), None);
+        assert_eq!(witness(code::LEFT, mods(true, false, false, false)), None);
     }
 
     #[test]

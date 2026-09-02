@@ -1,30 +1,23 @@
 use serde::{Deserialize, Serialize};
 
 use crate::effect::{CorrectionAxis, Effect, Expectation};
-use crate::event::{AxHintKind, Event, HotkeyAction, OpOutcome, RescanTrigger, WorldSnapshot};
-use crate::ids::{OpId, Rect, WindowId, WorkspaceId, FRAME_EPSILON};
+use crate::event::{
+    AxHintKind, Event, Gesture, HotkeyAction, OpOutcome, RescanTrigger, WorldSnapshot,
+};
+use crate::ids::{OpId, Pid, Rect, WindowId, WorkspaceId, FRAME_EPSILON};
 use crate::reconcile::{self, Delta};
-use crate::state::{Mode, PendingOp, State};
+use crate::state::{FocusIntent, Mode, PendingOp, State};
 
 /// Snapshots an expectation survives unmet before it's declared lost. Three
 /// covers the post-effect rescan plus slop for a slow executor without letting
 /// a dead op suppress external-change attribution for long.
 const EXPECTATION_RESCANS: u8 = 3;
 
-/// Correctives per window (and per tear episode) before we stop fighting and
-/// log instead. An app that re-places its own window wins after this many
-/// rounds — divergence becomes a loud log line, never an effect loop.
+/// Correctives per window (and per tear episode, and per focus declaration)
+/// before we stop fighting and log instead. An app that re-places its own
+/// window or keeps its own key window wins after this many rounds —
+/// divergence becomes a loud log line, never an effect loop.
 const DAMPING_LIMIT: u8 = 3;
-
-/// How long after a switch its focus fallout is still presumed in flight.
-/// Expectations can't cover this: they're one-shot (kitty delivered a
-/// DUPLICATE activation 520ms after its grant — run 38 seq 1410 — after the
-/// first arrival had already consumed the expectation) and they expire on a
-/// rescan count, which event-driven hints have compressed to well under the
-/// measured ~1.6s app landing tail. A blanket wall-clock cap is the blunt but
-/// safe answer; sharper schemes (per-window fallout horizon with early
-/// expiry) are sketched in issues.txt if the lost-follow cost ever shows up.
-const FOCUS_SETTLE_NS: u64 = 2_000_000_000;
 
 /// The result of one pure step. `notes` are deterministic diagnostics — the
 /// core's explanation of what it concluded (echo vs external, ops lost,
@@ -47,19 +40,46 @@ pub enum Note {
     OpFailed { op: OpId, detail: String },
     /// A change we didn't cause. Belief absorbed it.
     External { delta: Delta },
-    /// Focus moved externally to a window on a hidden workspace; we switched
-    /// there to follow it (the Cmd+Tab / Dock-click hole in emulation).
+    /// The verdict `handle_gesture` reached on a witnessed gesture: whether
+    /// it armed a follow and, when a mouse-down did not, which visible window
+    /// swallowed the point. This exists because an UNARMED follow is otherwise
+    /// invisible — the gesture event is logged, the hidden landing is held,
+    /// and nothing in between says why (the same absence-of-evidence hole
+    /// `park_trace` closed for parking). It also proves whether `SystemSwitch`
+    /// reaches the core at all, and shows a Dock click landing inside the
+    /// window beneath an auto-hidden Dock.
+    GestureClassified {
+        gesture: Gesture,
+        armed: bool,
+        within: Option<WindowId>,
+    },
+    /// A witnessed gesture (Cmd+Tab, a Dock click) landed focus on a hidden
+    /// workspace's window; we switched there to follow the user.
     FollowedFocus {
         window: WindowId,
         target: WorkspaceId,
     },
-    /// Focus fell onto a hidden workspace as fallout from a window closing;
-    /// instead of following, focus was pulled back to this window here.
-    HeldFocusOnClose { window: WindowId },
-    /// Focus fell onto a hidden workspace inside the post-switch settle
-    /// window — read as our own grant's late echo, not navigation; focus was
-    /// pulled back to this window here.
-    HeldFocusSettling { window: WindowId },
+    /// Focus fell onto a hidden workspace with no gesture to explain it while
+    /// the OS owned the slot. Nobody can type into an invisible window, so
+    /// Ordo declared the visible workspace's MRU window instead (and the
+    /// re-assertion that follows pulls focus there). `from` is the hidden
+    /// window the pull-back is pulling away from.
+    HeldFocus {
+        window: WindowId,
+        from: WindowId,
+        from_app: Pid,
+    },
+    /// The world contradicted the focus declaration; the grant was re-issued.
+    FocusReasserted { window: WindowId },
+    /// Focus re-assertion hit the damping limit: the app kept its own key
+    /// window. The declaration is retired — the OS owns the slot until the
+    /// next command. `winner` is the key window observed at that moment (its
+    /// app is what the concession is keyed on); `None` is a focus vacuum.
+    FocusDiverged {
+        window: WindowId,
+        winner: Option<WindowId>,
+        winner_app: Option<Pid>,
+    },
     /// Monitors disagreed on workspace without an in-flight switch of ours.
     TearDetected { target: WorkspaceId },
     /// Tear realignment hit the damping limit; we stopped re-aligning.
@@ -74,21 +94,13 @@ pub fn update(state: &State, event: &Event) -> Step {
     let mut notes = Vec::new();
 
     match event {
-        Event::Hotkey { at, action } => {
+        Event::Hotkey { action, .. } => {
             if s.mode == Mode::Active {
-                handle_hotkey(&mut s, *action, at.mono_ns, &mut effects);
+                handle_hotkey(&mut s, *action, &mut effects);
             }
         }
-        Event::WorldObserved { at, trigger, snap } => {
-            handle_snapshot(
-                state,
-                &mut s,
-                at.mono_ns,
-                trigger,
-                snap,
-                &mut effects,
-                &mut notes,
-            );
+        Event::WorldObserved { trigger, snap, .. } => {
+            handle_snapshot(state, &mut s, trigger, snap, &mut effects, &mut notes);
         }
         Event::EffectResult { op, outcome, .. } => {
             handle_effect_result(&mut s, *op, outcome, &mut notes);
@@ -98,6 +110,8 @@ pub fn update(state: &State, event: &Event) -> Step {
             // Ops in flight will never be verified or retried again; keeping
             // them would only misattribute their late echoes.
             s.pending.clear();
+            // The desktop is the user's again, focus included.
+            s.declare_focus(FocusIntent::Deferred);
             // The tap already stopped intercepting on its own fast path; this
             // records the same intent from the core's side and is idempotent.
             effects.push(Effect::SetIntercepting { enabled: false });
@@ -108,6 +122,9 @@ pub fn update(state: &State, event: &Event) -> Step {
             s.mode = Mode::Active;
             effects.push(Effect::SetIntercepting { enabled: true });
         }
+        // Not gated on mode: a gesture while rescued still means the OS owns
+        // focus, which is exactly what a later Engaged must find.
+        Event::Gesture { gesture, .. } => handle_gesture(&mut s, *gesture, &mut notes),
     }
 
     Step {
@@ -135,14 +152,78 @@ fn push_restack(s: &State, ws: WorkspaceId, fx: &mut Vec<Effect>) {
     }
 }
 
-fn handle_hotkey(s: &mut State, action: HotkeyAction, now_ns: u64, fx: &mut Vec<Effect>) {
+/// The user reached for focus through the OS rather than through Ordo. Whatever
+/// Ordo declared is moot — the OS owns the slot until the next command — and
+/// the next observation gets to read a hidden-workspace landing as the user
+/// going there, but only if the gesture could have been aimed there: a click
+/// INTO a window on the visible workspace keys that window (or a sheet or
+/// child Ordo does not model), so a hidden landing after it is a fling.
+fn handle_gesture(s: &mut State, gesture: Gesture, notes: &mut Vec<Note>) {
+    s.declare_focus(FocusIntent::Deferred);
+    let within = match gesture {
+        Gesture::SystemSwitch => None,
+        Gesture::MouseDown { at } => {
+            let here = s.current_workspace();
+            s.windows
+                .values()
+                .find(|r| Some(r.workspace) == here && r.frame.contains(at))
+                .map(|r| r.id)
+        }
+    };
+    // After the declaration, which clears it.
+    s.navigation_gesture = within.is_none();
+    notes.push(Note::GestureClassified {
+        gesture,
+        armed: s.navigation_gesture,
+        within,
+    });
+}
+
+/// What a hotkey resolved to against the current belief, before anything is
+/// minted or emitted. Resolution (which window, which workspace, or nothing
+/// at all) is separated from execution so that `execute` can be total: every
+/// command arm must produce the focus declaration it leaves behind, and a new
+/// hotkey cannot be added without deciding it — the match on `HotkeyAction`
+/// in `resolve` and the match on `Command` in `execute` are both exhaustive,
+/// and `execute` returns a bare `FocusIntent`, not an `Option`.
+enum Command {
+    Switch {
+        target: WorkspaceId,
+    },
+    Carry {
+        window: WindowId,
+        target: WorkspaceId,
+    },
+    Focus {
+        target: WindowId,
+    },
+    Demote {
+        workspace: WorkspaceId,
+        from: WindowId,
+        to: WindowId,
+    },
+    MoveToMonitor {
+        window: WindowId,
+        frame: Rect,
+    },
+}
+
+fn handle_hotkey(s: &mut State, action: HotkeyAction, fx: &mut Vec<Effect>) {
+    // A hotkey that resolves to nothing (clamped at an edge, nothing focused)
+    // touched neither the world nor the declaration.
+    let Some(cmd) = resolve(s, action) else {
+        return;
+    };
+    let focus = execute(s, cmd, fx);
+    s.declare_focus(focus);
+}
+
+fn resolve(s: &State, action: HotkeyAction) -> Option<Command> {
     match action {
         HotkeyAction::WorkspacePrev
         | HotkeyAction::WorkspaceNext
         | HotkeyAction::WorkspaceSwitchTo(_) => {
-            let Some(cur) = s.current_workspace() else {
-                return;
-            };
+            let cur = s.current_workspace()?;
             let target = match action {
                 HotkeyAction::WorkspacePrev if cur.0 > 1 => WorkspaceId(cur.0 - 1),
                 HotkeyAction::WorkspaceNext if cur.0 < s.workspace_count => WorkspaceId(cur.0 + 1),
@@ -151,8 +232,99 @@ fn handle_hotkey(s: &mut State, action: HotkeyAction, now_ns: u64, fx: &mut Vec<
                 {
                     t
                 }
-                _ => return, // clamped at the edge (or already there): nothing to do
+                _ => return None, // clamped at the edge (or already there)
             };
+            Some(Command::Switch { target })
+        }
+
+        HotkeyAction::CarryFocusedToWorkspacePrev | HotkeyAction::CarryFocusedToWorkspaceNext => {
+            let window = s.declared_focus()?;
+            let cur = s.current_workspace()?;
+            // You carry what's with you: dragging a window over from a hidden
+            // workspace would materialize it from nowhere. Read against the
+            // DECLARATION, so a fling onto a parked sibling between two chords
+            // cannot make the second one do nothing (run 51 seq 22484).
+            if s.windows.get(&window)?.workspace != cur {
+                return None;
+            }
+            let target = match action {
+                HotkeyAction::CarryFocusedToWorkspacePrev if cur.0 > 1 => WorkspaceId(cur.0 - 1),
+                HotkeyAction::CarryFocusedToWorkspaceNext if cur.0 < s.workspace_count => {
+                    WorkspaceId(cur.0 + 1)
+                }
+                _ => return None, // clamped at the edge
+            };
+            Some(Command::Carry { window, target })
+        }
+
+        HotkeyAction::MruWorkspace
+        | HotkeyAction::MruMonitor
+        | HotkeyAction::MruApp
+        | HotkeyAction::MruOtherMonitor => {
+            let cur_ws = s.current_workspace()?;
+            let focused = s.declared_focus();
+            let focused_rec = focused.and_then(|w| s.windows.get(&w));
+            // The scoped variants are relative to the focused window; with
+            // nothing focused there is no "same monitor/app" to speak of.
+            if focused_rec.is_none() && action != HotkeyAction::MruWorkspace {
+                return None;
+            }
+            let target = s.focus_history.most_recent(focused, |w| {
+                let Some(r) = s.windows.get(&w) else {
+                    return false;
+                };
+                if r.workspace != cur_ws {
+                    return false;
+                }
+                match action {
+                    HotkeyAction::MruWorkspace => true,
+                    HotkeyAction::MruMonitor => focused_rec.is_some_and(|f| r.monitor == f.monitor),
+                    HotkeyAction::MruOtherMonitor => {
+                        focused_rec.is_some_and(|f| r.monitor != f.monitor)
+                    }
+                    HotkeyAction::MruApp => focused_rec.is_some_and(|f| r.app == f.app),
+                    _ => unreachable!(),
+                }
+            })?;
+            Some(Command::Focus { target })
+        }
+
+        HotkeyAction::MruDemote => {
+            let workspace = s.current_workspace()?;
+            let from = s.declared_focus()?;
+            // Demoting is only meaningful if focus can actually go somewhere
+            // else; with nowhere to go, do nothing.
+            let to = s.focus_history.most_recent(Some(from), |w| {
+                s.windows.get(&w).is_some_and(|r| r.workspace == workspace)
+            })?;
+            Some(Command::Demote {
+                workspace,
+                from,
+                to,
+            })
+        }
+
+        HotkeyAction::MoveFocusedToOtherMonitor => {
+            let window = s.declared_focus()?;
+            let rec = s.windows.get(&window)?;
+            let order = s.monitors_by_position();
+            if order.len() < 2 {
+                return None;
+            }
+            let i = order.iter().position(|m| *m == rec.monitor)?;
+            let to_id = order[(i + 1) % order.len()];
+            let (from_mon, to_mon) = (s.monitors.get(&rec.monitor)?, s.monitors.get(&to_id)?);
+            let frame = rec.frame.translate_between(&from_mon.frame, &to_mon.frame);
+            Some(Command::MoveToMonitor { window, frame })
+        }
+    }
+}
+
+/// Carry out a resolved command and return the focus declaration it leaves
+/// behind. Total over `Command` by construction — see the type's doc.
+fn execute(s: &mut State, cmd: Command, fx: &mut Vec<Effect>) -> FocusIntent {
+    match cmd {
+        Command::Switch { target } => {
             // Hand focus to the destination's MRU window BEFORE switching —
             // otherwise the keyboard keeps typing into a window that just got
             // parked off-screen, and the backend's app dimming (which spares
@@ -169,7 +341,8 @@ fn handle_hotkey(s: &mut State, action: HotkeyAction, now_ns: u64, fx: &mut Vec<
             // the first, which made the ordering unsatisfiable and flipped
             // the top window every round trip.
             let stack = mru_stack(s, target);
-            if let Some(&fw) = stack.first() {
+            let head = stack.first().copied();
+            if let Some(fw) = head {
                 let op = s.mint_op();
                 fx.push(Effect::FocusWindow { op, window: fw });
                 // Re-asserting focus the belief already holds produces no
@@ -184,7 +357,6 @@ fn handle_hotkey(s: &mut State, action: HotkeyAction, now_ns: u64, fx: &mut Vec<
             }
             let op = s.mint_op();
             fx.push(Effect::SwitchWorkspace { op, target });
-            s.last_switch_mono_ns = Some(now_ns);
             s.pending.push(PendingOp {
                 op,
                 expect: Expectation::AllMonitorsOn(target),
@@ -196,33 +368,12 @@ fn handle_hotkey(s: &mut State, action: HotkeyAction, now_ns: u64, fx: &mut Vec<
             fx.push(Effect::RequestRescan {
                 reason: RescanTrigger::PostEffect { op },
             });
+            // An empty destination has nothing that could hold focus; whatever
+            // the OS keeps key is its business until something is born here.
+            head.map_or(FocusIntent::Deferred, FocusIntent::Window)
         }
 
-        HotkeyAction::CarryFocusedToWorkspacePrev | HotkeyAction::CarryFocusedToWorkspaceNext => {
-            // Declared focus, not observed: mid-handoff the observation is
-            // stale and a carry grabbed the PREVIOUS window (run 38).
-            let Some(focused) = s.declared_focus() else {
-                return;
-            };
-            if !s.windows.contains_key(&focused) {
-                return;
-            }
-            let Some(cur) = s.current_workspace() else {
-                return;
-            };
-            // You carry what's with you: focus can legitimately sit on a
-            // hidden window (landing on an empty workspace leaves it behind),
-            // and dragging that one over would materialize it from nowhere.
-            if s.windows[&focused].workspace != cur {
-                return;
-            }
-            let target = match action {
-                HotkeyAction::CarryFocusedToWorkspacePrev if cur.0 > 1 => WorkspaceId(cur.0 - 1),
-                HotkeyAction::CarryFocusedToWorkspaceNext if cur.0 < s.workspace_count => {
-                    WorkspaceId(cur.0 + 1)
-                }
-                _ => return, // clamped at the edge: nothing to do
-            };
+        Command::Carry { window, target } => {
             // Reassign first, then switch: when the switch lands, the carried
             // window is already a resident of the destination and comes along.
             // Assignment only — the window's frame and focus don't change, so
@@ -231,13 +382,13 @@ fn handle_hotkey(s: &mut State, action: HotkeyAction, now_ns: u64, fx: &mut Vec<
             let move_op = s.mint_op();
             fx.push(Effect::AssignWindowToWorkspace {
                 op: move_op,
-                window: focused,
+                window,
                 target,
             });
             s.pending.push(PendingOp {
                 op: move_op,
                 expect: Expectation::WindowOn {
-                    window: focused,
+                    window,
                     workspace: target,
                 },
                 rescans_left: EXPECTATION_RESCANS,
@@ -247,59 +398,28 @@ fn handle_hotkey(s: &mut State, action: HotkeyAction, now_ns: u64, fx: &mut Vec<
                 op: switch_op,
                 target,
             });
-            s.last_switch_mono_ns = Some(now_ns);
             s.pending.push(PendingOp {
                 op: switch_op,
                 expect: Expectation::AllMonitorsOn(target),
                 rescans_left: EXPECTATION_RESCANS,
             });
-            push_restack(s, target, fx);
+            // The carried window rides on top. Its assignment is only pending,
+            // so the destination's MRU stack does not contain it yet — and a
+            // restack headed by a resident sibling makes AppKit key THAT
+            // window instead (run 51: every carry's restack omitted the
+            // carried window, and the next chord found focus on a sibling).
+            let mut order = vec![window];
+            order.extend(mru_stack(s, target).into_iter().filter(|w| *w != window));
+            if order.len() >= 2 {
+                fx.push(Effect::RestackWindows { order });
+            }
             fx.push(Effect::RequestRescan {
                 reason: RescanTrigger::PostEffect { op: switch_op },
             });
+            FocusIntent::Window(window)
         }
 
-        HotkeyAction::MruWorkspace
-        | HotkeyAction::MruMonitor
-        | HotkeyAction::MruApp
-        | HotkeyAction::MruOtherMonitor => {
-            let Some(cur_ws) = s.current_workspace() else {
-                return;
-            };
-            let focused = s.declared_focus();
-            let focused_rec = focused.and_then(|w| s.windows.get(&w)).cloned();
-            // The scoped variants are relative to the focused window; with
-            // nothing focused there is no "same monitor/app" to speak of.
-            if focused_rec.is_none() && action != HotkeyAction::MruWorkspace {
-                return;
-            }
-            let target = {
-                let windows = &s.windows;
-                s.focus_history.most_recent(focused, |w| {
-                    let Some(r) = windows.get(&w) else {
-                        return false;
-                    };
-                    if r.workspace != cur_ws {
-                        return false;
-                    }
-                    match action {
-                        HotkeyAction::MruWorkspace => true,
-                        HotkeyAction::MruMonitor => {
-                            focused_rec.as_ref().is_some_and(|f| r.monitor == f.monitor)
-                        }
-                        HotkeyAction::MruOtherMonitor => {
-                            focused_rec.as_ref().is_some_and(|f| r.monitor != f.monitor)
-                        }
-                        HotkeyAction::MruApp => {
-                            focused_rec.as_ref().is_some_and(|f| r.app == f.app)
-                        }
-                        _ => unreachable!(),
-                    }
-                })
-            };
-            let Some(target) = target else {
-                return;
-            };
+        Command::Focus { target } => {
             let center = s.windows[&target].frame.center();
             let op = s.mint_op();
             fx.push(Effect::FocusWindow { op, window: target });
@@ -317,86 +437,48 @@ fn handle_hotkey(s: &mut State, action: HotkeyAction, now_ns: u64, fx: &mut Vec<
             fx.push(Effect::RequestRescan {
                 reason: RescanTrigger::PostEffect { op },
             });
+            FocusIntent::Window(target)
         }
 
-        HotkeyAction::MruDemote => {
-            let Some(cur_ws) = s.current_workspace() else {
-                return;
-            };
-            let Some(focused) = s.declared_focus() else {
-                return;
-            };
-            // Demoting is only meaningful if focus can actually leave the
-            // window — otherwise the next observation touches it straight back
-            // to the front. With nowhere else to go, do nothing.
-            let target = {
-                let windows = &s.windows;
-                s.focus_history.most_recent(Some(focused), |w| {
-                    windows.get(&w).is_some_and(|r| r.workspace == cur_ws)
-                })
-            };
-            let Some(target) = target else {
-                return;
-            };
-            s.focus_history.demote(focused);
-            let center = s.windows[&target].frame.center();
+        Command::Demote {
+            workspace,
+            from,
+            to,
+        } => {
+            s.focus_history.demote(from);
+            let center = s.windows[&to].frame.center();
             let op = s.mint_op();
-            fx.push(Effect::FocusWindow { op, window: target });
+            fx.push(Effect::FocusWindow { op, window: to });
             fx.push(Effect::WarpMouse { to: center });
             // Bury it visually too, AFTER the focus: restacking raises
             // everything above the demoted window, and raises land below the
             // key window — so the new focus must already be key. The history
-            // was demoted above, so the MRU order now ends with `focused`.
-            push_restack(s, cur_ws, fx);
+            // was demoted above, so the MRU order now ends with `from`.
+            push_restack(s, workspace, fx);
             s.pending.push(PendingOp {
                 op,
-                expect: Expectation::Focused(target),
+                expect: Expectation::Focused(to),
                 rescans_left: EXPECTATION_RESCANS,
             });
             fx.push(Effect::RequestRescan {
                 reason: RescanTrigger::PostEffect { op },
             });
+            FocusIntent::Window(to)
         }
 
-        HotkeyAction::MoveFocusedToOtherMonitor => {
-            let Some(focused) = s.declared_focus() else {
-                return;
-            };
-            let Some(rec) = s.windows.get(&focused).cloned() else {
-                return;
-            };
-            let order = s.monitors_by_position();
-            if order.len() < 2 {
-                return;
-            }
-            let Some(i) = order.iter().position(|m| *m == rec.monitor) else {
-                return;
-            };
-            let to_id = order[(i + 1) % order.len()];
-            let (Some(from_mon), Some(to_mon)) =
-                (s.monitors.get(&rec.monitor), s.monitors.get(&to_id))
-            else {
-                return;
-            };
-            let frame = rec.frame.translate_between(&from_mon.frame, &to_mon.frame);
+        Command::MoveToMonitor { window, frame } => {
             let op = s.mint_op();
-            fx.push(Effect::SetWindowFrame {
-                op,
-                window: focused,
-                frame,
-            });
+            fx.push(Effect::SetWindowFrame { op, window, frame });
             fx.push(Effect::WarpMouse { to: frame.center() });
             s.pending.push(PendingOp {
                 op,
-                expect: Expectation::WindowFramed {
-                    window: focused,
-                    frame,
-                },
+                expect: Expectation::WindowFramed { window, frame },
                 rescans_left: EXPECTATION_RESCANS,
             });
             fx.push(Effect::RequestRescan {
                 reason: RescanTrigger::PostEffect { op },
             });
+            FocusIntent::Window(window)
         }
     }
 }
@@ -451,7 +533,6 @@ pub fn coalesce_hotkeys(s: &State, actions: &[HotkeyAction]) -> Vec<HotkeyAction
 fn handle_snapshot(
     pre: &State,
     s: &mut State,
-    now_ns: u64,
     trigger: &RescanTrigger,
     snap: &WorldSnapshot,
     fx: &mut Vec<Effect>,
@@ -463,32 +544,28 @@ fn handle_snapshot(
     let anchor_mon = pre.focused_monitor();
     let entry_expectations: Vec<Expectation> =
         pre.pending.iter().map(|p| p.expect.clone()).collect();
+    // A gesture explains only the observation that follows it.
+    let navigation_gesture = std::mem::take(&mut s.navigation_gesture);
 
     let deltas = reconcile::diff(pre, snap);
     reconcile::apply_snapshot(s, snap);
 
+    // While the OS owns the slot, its choice among the VISIBLE windows is the
+    // only record of where the user went. A hidden-workspace landing is never
+    // recorded from observation: it is either navigation, which the follow
+    // below declares, or a fling, which must not touch the history at all.
+    if s.focus_target().is_none() {
+        if let Some(f) = s.focused {
+            if s.windows.get(&f).map(|r| r.workspace) == s.current_workspace() {
+                s.focus_history.touch(f);
+            }
+        }
+    }
+
     // Resolve or age expectations against the fresh belief.
-    //
-    // Focus is one global slot, so a LANDED grant makes every older pending
-    // grant dead intent. Aging those out normally is harmless for delta
-    // attribution, but declared_focus() would keep reading the stale one —
-    // and a carry mid-burst would grab a window from a workspace behind us.
-    // Newer unlanded grants stay: they remain the freshest declaration.
-    let last_landed_focus = s
-        .pending
-        .iter()
-        .rposition(|p| matches!(p.expect, Expectation::Focused(w) if s.focused == Some(w)));
     let mut expired: Vec<PendingOp> = Vec::new();
     let mut still_pending: Vec<PendingOp> = Vec::new();
-    for (i, mut p) in std::mem::take(&mut s.pending).into_iter().enumerate() {
-        if matches!(p.expect, Expectation::Focused(_))
-            && !expectation_satisfied(&p.expect, s)
-            && last_landed_focus.is_some_and(|j| i < j)
-        {
-            notes.push(Note::OpLost { op: p.op });
-            expired.push(p);
-            continue;
-        }
+    for mut p in std::mem::take(&mut s.pending) {
         if expectation_satisfied(&p.expect, s) {
             notes.push(Note::SelfConfirmed { op: p.op });
             // The world accepted this placement: this axis's fight is over.
@@ -530,6 +607,23 @@ fn handle_snapshot(
         return;
     }
 
+    // Birth is a command: a brand-new window has no prior intent, and if it
+    // took focus it opened FOR the user, so it is what should be key. Not
+    // gated on the creation hint, unlike corralling: apps whose observer never
+    // attached (Slack, System Settings in run 51 — 8 focused births seen only
+    // by the periodic scan, against 2 announced) would otherwise have every
+    // new window's focus yanked back to the standing declaration. Startup is
+    // excluded because nothing was born then; the OS owns focus at start.
+    if !matches!(trigger, RescanTrigger::Startup) {
+        for d in &deltas {
+            if let Delta::WindowCreated(w) = d {
+                if s.focused == Some(*w) {
+                    s.declare_focus(FocusIntent::Window(*w));
+                }
+            }
+        }
+    }
+
     let mut last_op: Option<OpId> = None;
 
     // The user's hands outrank stale intent: an unexplained frame change on
@@ -549,7 +643,8 @@ fn handle_snapshot(
 
     // A placement op that expired while the window still sits in violation
     // gets retried — apps often re-apply their own autosaved frame after we
-    // move them — but only under the damping limit.
+    // move them — but only under the damping limit. (Focus needs no such
+    // pass: its declaration is a standing field, checked every snapshot.)
     for p in expired {
         match p.expect {
             Expectation::WindowOn { window, workspace }
@@ -675,95 +770,7 @@ fn handle_snapshot(
         }
     }
 
-    // Follow-the-focus: macOS handed focus to a window on a hidden workspace
-    // (Cmd+Tab, a Dock click, an app self-activating) — the one hole the
-    // emulated backend leaves open, since the app switcher is machine-global.
-    // Mirror what native Spaces would do and bring that workspace over. Only
-    // an EXTERNAL focus change qualifies: our own switches legitimately leave
-    // focus sitting on a freshly parked window (parking doesn't defocus), and
-    // `explains` attributes those focus deltas to the pending switch.
-    //
-    // A pending Focused expectation also holds this off: a switch's focus
-    // handoff is fire-and-forget and lands on the target app's schedule,
-    // while the switch itself (ledger-backed on the emulated backend)
-    // self-confirms on the very first snapshot — so AllMonitorsOn alone
-    // stopped guarding the handoff window once the restack moved off-thread
-    // and snapshots got fast. A transient re-key onto some hidden-workspace
-    // window mid-handoff (Dock dimming's app-hide can fling focus) must not
-    // read as the user navigating away; the expectation resolves or expires
-    // within EXPECTATION_RESCANS, so a genuine follow is deferred, not lost.
-    //
-    // Neither guard survives the full fallout tail (expectations are one-shot
-    // and rescan-counted; apps re-fling focus for seconds), so inside
-    // FOCUS_SETTLE_NS of our last switch a stray focus is treated like close
-    // fallout: hold the workspace, pull focus back. The pull-back's own echo
-    // can't recurse — its target is on the current workspace.
-    if !s.pending.iter().any(|p| {
-        matches!(
-            p.expect,
-            Expectation::AllMonitorsOn(_) | Expectation::Focused(_)
-        )
-    }) {
-        let external_focus = deltas.iter().any(|d| {
-            matches!(d, Delta::FocusChanged { .. })
-                && !entry_expectations.iter().any(|e| reconcile::explains(e, d))
-        });
-        if external_focus {
-            if let Some(rec) = s.focused.and_then(|w| s.windows.get(&w)).cloned() {
-                let target = rec.workspace;
-                let here = s.current_workspace();
-                if Some(target) != here && target.0 >= 1 && target.0 <= s.workspace_count {
-                    // Close fallout is not navigation: when a window dies,
-                    // macOS hands focus to the app's next window wherever it
-                    // lives — the user asked to close something, not to go
-                    // somewhere. Any destroy in this snapshot marks the focus
-                    // change as suspect; hold the workspace and pull focus
-                    // back to its MRU window (typing into a hidden window is
-                    // the alternative). A genuine Cmd+Tab landing in the same
-                    // snapshot as an unrelated close loses one follow — the
-                    // user re-presses; a wrong yank costs far more.
-                    let close_fallout = deltas
-                        .iter()
-                        .any(|d| matches!(d, Delta::WindowDestroyed(_)));
-                    let settling = s
-                        .last_switch_mono_ns
-                        .is_some_and(|t| now_ns.saturating_sub(t) < FOCUS_SETTLE_NS);
-                    if close_fallout || settling {
-                        if let Some(back) = here.and_then(|h| mru_stack(s, h).into_iter().next()) {
-                            let op = s.mint_op();
-                            fx.push(Effect::FocusWindow { op, window: back });
-                            s.pending.push(PendingOp {
-                                op,
-                                expect: Expectation::Focused(back),
-                                rescans_left: EXPECTATION_RESCANS,
-                            });
-                            notes.push(if close_fallout {
-                                Note::HeldFocusOnClose { window: back }
-                            } else {
-                                Note::HeldFocusSettling { window: back }
-                            });
-                            last_op = Some(op);
-                        }
-                    } else {
-                        let op = s.mint_op();
-                        fx.push(Effect::SwitchWorkspace { op, target });
-                        s.last_switch_mono_ns = Some(now_ns);
-                        s.pending.push(PendingOp {
-                            op,
-                            expect: Expectation::AllMonitorsOn(target),
-                            rescans_left: EXPECTATION_RESCANS,
-                        });
-                        push_restack(s, target, fx);
-                        notes.push(Note::FollowedFocus {
-                            window: rec.id,
-                            target,
-                        });
-                        last_op = Some(op);
-                    }
-                }
-            }
-        }
-    }
+    enforce_focus(s, navigation_gesture, notes, &mut last_op, fx);
 
     // Tear re-alignment: the product invariant is that a workspace spans all
     // monitors, so an externally-swiped display gets pulled back to the
@@ -787,7 +794,6 @@ fn handle_snapshot(
             if let Some(target) = reachable {
                 let op = s.mint_op();
                 fx.push(Effect::SwitchWorkspace { op, target });
-                s.last_switch_mono_ns = Some(now_ns);
                 s.pending.push(PendingOp {
                     op,
                     expect: Expectation::AllMonitorsOn(target),
@@ -809,6 +815,147 @@ fn handle_snapshot(
             reason: RescanTrigger::PostEffect { op },
         });
     }
+}
+
+/// Focus, after the snapshot has been absorbed. Two separate concerns:
+///
+/// The INVARIANT — the key window must be on the visible workspace — holds no
+/// matter who owns the slot. Observed focus on a hidden workspace's window is
+/// either the user going there (a witnessed gesture explains it: follow, as
+/// native Spaces would) or unusable state (nobody can type into an invisible
+/// window: declare the visible MRU window and pull focus back). This is the
+/// whole of what the old close-fallout and settle-window guards were groping
+/// toward, without inferring anything from timing.
+///
+/// The DECLARATION — `FocusIntent::Window(w)` — is enforced like a parked
+/// frame: a contradicting observation is re-asserted while a grant is not
+/// already in flight, under `DAMPING_LIMIT`, then stood down from loudly and
+/// once (retiring the declaration — see below). Under `Deferred` there is
+/// nothing to enforce. Because the default is "the declaration stands", a
+/// fling from a cause nobody has catalogued yet costs no new rule here.
+///
+/// The stand-down concedes the slot to the APP that kept it, and the
+/// invariant honours that concession for as long as that app holds focus —
+/// through whichever of its windows, since AppKit key-window ownership is
+/// per-application. Without this the two rules feed each other: retiring
+/// resets the budget, the invariant re-declares against the very same
+/// evidence, and the app that just won is fought (and its parked window
+/// raised) again every few seconds, indefinitely — the focus twin of the
+/// write loop `pending_repark` exists to prevent.
+fn enforce_focus(
+    s: &mut State,
+    navigation_gesture: bool,
+    notes: &mut Vec<Note>,
+    last_op: &mut Option<OpId>,
+    fx: &mut Vec<Effect>,
+) {
+    // Spent only by another app taking the slot. A vacuum says nothing about
+    // whether the conceding app relented, and the invariant cannot fire on
+    // one anyway; clearing there would only re-arm the loop for the app's
+    // next hidden hop.
+    if s.conceded
+        .is_some_and(|app| key_app(s).is_some_and(|holder| holder != app))
+    {
+        s.conceded = None;
+    }
+    let Some(here) = s.current_workspace() else {
+        return;
+    };
+
+    let landed_hidden = s
+        .focused
+        .and_then(|w| s.windows.get(&w))
+        .filter(|r| r.workspace != here && r.workspace.0 >= 1 && r.workspace.0 <= s.workspace_count)
+        .cloned();
+    if let (Some(rec), None) = (&landed_hidden, s.focus_target()) {
+        if navigation_gesture {
+            let target = rec.workspace;
+            let op = s.mint_op();
+            fx.push(Effect::SwitchWorkspace { op, target });
+            s.pending.push(PendingOp {
+                op,
+                expect: Expectation::AllMonitorsOn(target),
+                rescans_left: EXPECTATION_RESCANS,
+            });
+            // Declared first so the window the user chose heads the restack.
+            s.declare_focus(FocusIntent::Window(rec.id));
+            push_restack(s, target, fx);
+            notes.push(Note::FollowedFocus {
+                window: rec.id,
+                target,
+            });
+            *last_op = Some(op);
+            return;
+        }
+        // An empty visible workspace has nothing to hold focus: leave it, the
+        // next birth here declares itself.
+        if s.conceded != Some(rec.app) {
+            if let Some(head) = mru_stack(s, here).first().copied() {
+                s.declare_focus(FocusIntent::Window(head));
+                notes.push(Note::HeldFocus {
+                    window: head,
+                    from: rec.id,
+                    from_app: rec.app,
+                });
+            }
+        }
+    }
+
+    let Some(w) = s.focus_target() else {
+        return;
+    };
+    if s.focused == Some(w) {
+        s.focus_corrections = 0;
+        return;
+    }
+    // A declaration for a window that is not on the visible workspace is
+    // unenforceable (its switch has not landed, or never will); granting it
+    // would put the keyboard into an invisible window.
+    if s.windows[&w].workspace != here {
+        return;
+    }
+    // The grant is in flight; apps land it on their own schedule.
+    if s.pending
+        .iter()
+        .any(|p| p.expect == Expectation::Focused(w))
+    {
+        return;
+    }
+    if s.focus_corrections >= DAMPING_LIMIT {
+        // The app has won the slot. Unlike a parked frame — where the
+        // declaration is the user's filing and stays through a standoff —
+        // a focus declaration is a claim about NOW, and a lost one only
+        // misdirects the next carry or MRU chord toward a window the user is
+        // visibly not in (run 51: Chrome kept 44267 key against a grant to
+        // 41105 for 166 snapshots; every same-monitor Alt+Shift+Tab meanwhile
+        // resolved against 41105). Hand the slot to the OS; the invariant
+        // still holds, and the next command declares afresh.
+        notes.push(Note::FocusDiverged {
+            window: w,
+            winner: s.focused,
+            winner_app: key_app(s),
+        });
+        s.declare_focus(FocusIntent::Deferred);
+        // After the declaration, which clears it.
+        s.conceded = key_app(s);
+        return;
+    }
+    s.focus_corrections += 1;
+    let op = s.mint_op();
+    fx.push(Effect::FocusWindow { op, window: w });
+    s.pending.push(PendingOp {
+        op,
+        expect: Expectation::Focused(w),
+        rescans_left: EXPECTATION_RESCANS,
+    });
+    notes.push(Note::FocusReasserted { window: w });
+    *last_op = Some(op);
+}
+
+/// The app holding the key window. Reconcile filters `focused` to windows in
+/// the model, so `None` here is a focus vacuum, never an unknown holder.
+fn key_app(s: &State) -> Option<Pid> {
+    s.focused.and_then(|w| s.windows.get(&w)).map(|r| r.app)
 }
 
 /// Emit a placement corrective for `window` on `axis` unless that axis has hit

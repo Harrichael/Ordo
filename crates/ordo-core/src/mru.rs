@@ -8,6 +8,12 @@ const CAP: usize = 512;
 
 /// One global focus history, most-recent-first, each window at most once.
 ///
+/// What enters it is DECLARED use, not observed focus: a command that names a
+/// window records it (`State::declare_focus`), and an observed focus is
+/// recorded only while the OS owns the slot and the window is on the visible
+/// workspace. Driving this from raw observation let every app-initiated fling
+/// (a notification, a browser re-keying a sibling) silently reorder Alt+Tab.
+///
 /// The alternative — per-scope MRU stacks indexed by workspace x monitor x
 /// app — would need lockstep edits on every window move, destroy, and monitor
 /// hot-plug, exactly the class of bookkeeping bug this project exists to
@@ -42,8 +48,8 @@ impl FocusHistory {
     }
 
     /// Send `w` to the back: "I'm done with this one, stop offering it".
-    /// Callers must also move focus off `w` — a still-focused window gets
-    /// touched straight back to the front by the next observation.
+    /// Callers must also declare focus onto another window, or the demotion
+    /// is a lie about where the user is.
     pub fn demote(&mut self, w: WindowId) {
         if self.order.contains(&w) {
             self.remove(w);

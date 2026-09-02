@@ -1,4 +1,4 @@
-//! The global hotkey tap.
+//! The global hotkey tap — and the intent channel.
 //!
 //! A `CGEventTap` on its own thread watches key-downs, matches them against the
 //! (pure) [`crate::keys`] table, and for a hit posts a [`Msg`] to the engine and
@@ -6,6 +6,13 @@
 //!   - the callback must never block — it does no AX work, only a channel send;
 //!   - the tap gets disabled by the OS on timeout or heavy user input, and must
 //!     re-enable itself, or hotkeys silently die after a while.
+//!
+//! The same tap WITNESSES the user's focus gestures Ordo does not own — every
+//! mouse-down, and macOS's Cmd+Tab / Cmd+` — and reports them as
+//! [`Msg::Gesture`] while passing the event through untouched. Without that
+//! trace, a click and a notification stealing focus look identical to the
+//! core. Ordinary keystrokes are deliberately NOT reported: they say nothing
+//! about focus, and treating "recent typing" as intent blessed a fling once.
 //!
 //! The rescue chord is handled here, ahead of everything, so the kill switch
 //! works even if the engine thread is wedged: on the second press within the
@@ -26,8 +33,10 @@ use objc2_core_graphics::{
     CGEventTapPlacement, CGEventType,
 };
 
+use ordo_core::{Gesture, Point};
+
 use crate::engine::Msg;
-use crate::keys::{self, Chord, Mods};
+use crate::keys::{self, Chord, Mods, Witness};
 
 /// Two presses of the rescue chord within this window engage rescue.
 const RESCUE_WINDOW: Duration = Duration::from_secs(2);
@@ -38,6 +47,9 @@ struct TapContext {
     /// Set after the tap is created, so the callback can re-enable it.
     tap: RefCell<Option<CFRetained<CFMachPort>>>,
     last_rescue: Cell<Option<Instant>>,
+    /// Cmd+Tab was pressed and Cmd is still held: the app switcher acts on the
+    /// release, which is when the gesture is reported.
+    app_switcher_armed: Cell<bool>,
 }
 
 /// Spawn the tap on its own thread with its own run loop. The thread runs until
@@ -51,9 +63,17 @@ pub fn spawn(tx: Sender<Msg>, intercepting: Arc<AtomicBool>) {
             intercepting,
             tap: RefCell::new(None),
             last_rescue: Cell::new(None),
+            app_switcher_armed: Cell::new(false),
         }));
 
-        let mask: CGEventMask = 1 << CGEventType::KeyDown.0;
+        // Mouse-downs and modifier changes are listened to, never altered;
+        // one tap serves both because a second would double every event's
+        // trip through this process.
+        let mask: CGEventMask = (1 << CGEventType::KeyDown.0)
+            | (1 << CGEventType::FlagsChanged.0)
+            | (1 << CGEventType::LeftMouseDown.0)
+            | (1 << CGEventType::RightMouseDown.0)
+            | (1 << CGEventType::OtherMouseDown.0);
         let tap = unsafe {
             CGEvent::tap_create(
                 CGEventTapLocation::SessionEventTap,
@@ -102,12 +122,7 @@ unsafe extern "C-unwind" fn callback(
     }
 
     let pass = event.as_ptr();
-    if ty != CGEventType::KeyDown {
-        return pass;
-    }
-
     let ev = event.as_ref();
-    let keycode = CGEvent::integer_value_field(Some(ev), CGEventField::KeyboardEventKeycode) as u16;
     let flags = CGEvent::flags(Some(ev));
     let mods = Mods {
         cmd: flags.contains(CGEventFlags::MaskCommand),
@@ -115,6 +130,26 @@ unsafe extern "C-unwind" fn callback(
         shift: flags.contains(CGEventFlags::MaskShift),
         ctrl: flags.contains(CGEventFlags::MaskControl),
     };
+
+    match ty {
+        CGEventType::LeftMouseDown | CGEventType::RightMouseDown | CGEventType::OtherMouseDown => {
+            let p = CGEvent::location(Some(ev));
+            let _ = ctx.tx.send(Msg::Gesture(Gesture::MouseDown {
+                at: Point { x: p.x, y: p.y },
+            }));
+            return pass;
+        }
+        CGEventType::FlagsChanged => {
+            if !mods.cmd && ctx.app_switcher_armed.replace(false) {
+                let _ = ctx.tx.send(Msg::Gesture(Gesture::SystemSwitch));
+            }
+            return pass;
+        }
+        CGEventType::KeyDown => {}
+        _ => return pass,
+    }
+
+    let keycode = CGEvent::integer_value_field(Some(ev), CGEventField::KeyboardEventKeycode) as u16;
 
     // The engage chord is checked before the interception gate — its whole job
     // is to work while Ordo is disengaged (post-rescue, or a --paused start).
@@ -150,7 +185,16 @@ unsafe extern "C-unwind" fn callback(
             }
             Chord::Engage | Chord::EngageFresh => unreachable!(),
         },
-        _ => pass,
+        _ => {
+            match keys::witness(keycode, mods) {
+                Some(Witness::AppSwitcherArmed) => ctx.app_switcher_armed.set(true),
+                Some(Witness::WindowCycle) => {
+                    let _ = ctx.tx.send(Msg::Gesture(Gesture::SystemSwitch));
+                }
+                None => {}
+            }
+            pass
+        }
     }
 }
 

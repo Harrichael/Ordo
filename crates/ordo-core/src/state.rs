@@ -56,6 +56,26 @@ pub struct PendingOp {
     pub rescans_left: u8,
 }
 
+/// Who owns the key-window slot. A DECLARATION, written only by commands —
+/// never by an observation — and read by enforcement and by every command
+/// that needs "the focused window".
+///
+/// `Deferred` is a positive statement, not an unset `Option`: the OS owns the
+/// slot (the user clicked, Cmd+Tabbed, or nobody has commanded anything since
+/// start) and there is nothing to enforce. It is deliberately NOT "copy the
+/// next observed focus into the declaration": that would be a declaration
+/// travelling through the observation channel, and choosing WHICH of a
+/// batch of focus changes to copy reintroduces the race this type exists to
+/// remove. It stands until the next command overwrites it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FocusIntent {
+    /// Ordo asserts this window should be key; a contradicting observation is
+    /// a violation to re-assert (damped), never to absorb.
+    Window(WindowId),
+    #[default]
+    Deferred,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct State {
     pub mode: Mode,
@@ -69,17 +89,54 @@ pub struct State {
     pub monitor_ws: BTreeMap<MonitorId, WorkspaceId>,
     pub monitors: BTreeMap<MonitorId, MonitorRecord>,
     pub windows: BTreeMap<WindowId, WindowRecord>,
+    /// OBSERVED key window. Mirrors the world every snapshot, undamped and
+    /// uncorrected; its declared twin is `focus_intent`.
     pub focused: Option<WindowId>,
+    /// Private with one writer (`declare_focus`) so a declaration can never be
+    /// written without also resetting its damping episode and recording it in
+    /// the MRU history. `serde(default)` = `Deferred`: a checkpoint from before
+    /// this field, like a fresh start, has nothing to enforce.
+    #[serde(default)]
+    focus_intent: FocusIntent,
+    /// Grants issued by ENFORCEMENT for the current declaration (the command's
+    /// own grant is not counted). One slot, one counter — the focus twin of
+    /// `tear_corrections`. Reset by every new declaration and whenever the
+    /// world agrees.
+    #[serde(default)]
+    pub(crate) focus_corrections: u8,
+    /// A witnessed user gesture that could be navigation — Cmd+Tab, Cmd+`, a
+    /// mouse-down outside every visible window — arrived since the last
+    /// observation. The next observation consumes it: a focus landing on a
+    /// hidden workspace in that observation is the user going there, and is
+    /// followed; without it the same landing is a violation. "Since the last
+    /// observation" rather than a time window because the engine serializes
+    /// events, so this is exact and replayable.
+    #[serde(default)]
+    pub(crate) navigation_gesture: bool,
+    /// The app that kept the key window when enforcement last stood down,
+    /// while it still holds the slot. Retiring to `Deferred` alone does not
+    /// end a standoff against a window on a HIDDEN workspace: the
+    /// visible-key-window invariant re-declares the MRU head with a fresh
+    /// budget, and each grant raises the parked window again — a rate-limited
+    /// loop, forever. This is the evidence that stops it: the standoff already
+    /// established that this app will not yield, so the same observation is
+    /// not re-litigated.
+    ///
+    /// The unit is the APP, not the window that happened to be key: AppKit
+    /// key-window ownership is per-application, and which of its windows an
+    /// app keys is its own business (Chrome's key window wandered among its
+    /// windows through run 51's standoff; Cmd+H churn hops focus among an
+    /// app's hidden windows routinely). Conceding to a window makes each hop
+    /// look like the world moving on, and the loop returns at full rate. It is
+    /// spent when key belongs to a DIFFERENT app — a vacuum (`focused ==
+    /// None`) is not that: nobody else took the slot — or by any command
+    /// (`declare_focus`), never by a timer.
+    #[serde(default)]
+    pub(crate) conceded: Option<Pid>,
     pub focus_history: FocusHistory,
     pub pending: Vec<PendingOp>,
     /// Damping for tear re-alignment, mirroring `WindowRecord::corrections`.
     pub tear_corrections: u8,
-    /// When we last emitted a SwitchWorkspace (event clock — the core never
-    /// reads time). Follow-the-focus consults this: a switch's focus fallout
-    /// keeps arriving well after every landing signal fires, so "recently
-    /// switched" is the only tell that a stray focus is our own echo.
-    #[serde(default)]
-    pub last_switch_mono_ns: Option<u64>,
     /// OpId counter. Lives in State — not a global — so `update` stays pure
     /// and replay mints identical ids.
     pub next_op: u64,
@@ -94,10 +151,13 @@ impl State {
             monitors: BTreeMap::new(),
             windows: BTreeMap::new(),
             focused: None,
+            focus_intent: FocusIntent::Deferred,
+            focus_corrections: 0,
+            navigation_gesture: false,
+            conceded: None,
             focus_history: FocusHistory::new(),
             pending: Vec::new(),
             tear_corrections: 0,
-            last_switch_mono_ns: None,
             next_op: 0,
         }
     }
@@ -107,22 +167,49 @@ impl State {
         OpId(self.next_op)
     }
 
-    /// The user's focus as COMMANDS must read it: the most recent still-
-    /// pending focus grant we issued, falling back to observed focus. Between
-    /// issuing a FocusWindow and its echo arriving, the observation is stale
-    /// by exactly the amount that once made a carry grab the wrong window
-    /// (run 38 seq 20447: the previous window, not the visibly focused one).
-    /// The declared target self-expires with its expectation, so a failed
-    /// grant falls back to observation within a few rescans.
+    pub fn focus_intent(&self) -> FocusIntent {
+        self.focus_intent
+    }
+
+    /// The one write path for the focus declaration. Recording `Window(w)` in
+    /// the MRU history here is what makes MRU declaration-driven: the order
+    /// follows what Ordo decided, so an app flinging focus around cannot
+    /// reorder Alt+Tab. A new declaration is a new damping episode, and it
+    /// spends any gesture still waiting for its observation: a command that
+    /// lands between a Dock click and the next snapshot is the latest word,
+    /// and the old focus that snapshot shows parked is the command's doing,
+    /// not the click's. Likewise a standing concession: the command is fresh
+    /// evidence that the user wants the slot moved, so it is fought for anew.
+    pub(crate) fn declare_focus(&mut self, intent: FocusIntent) {
+        if let FocusIntent::Window(w) = intent {
+            self.focus_history.touch(w);
+        }
+        self.focus_intent = intent;
+        self.focus_corrections = 0;
+        self.navigation_gesture = false;
+        self.conceded = None;
+    }
+
+    /// The declared window while it is actually in the model. A declaration
+    /// about a window that is absent (closed, or dropped by one flaky scan)
+    /// is vacuous rather than wrong: nothing to enforce, nothing for commands
+    /// to act on, and it resumes untouched if the window reappears.
+    pub fn focus_target(&self) -> Option<WindowId> {
+        match self.focus_intent {
+            FocusIntent::Window(w) if self.windows.contains_key(&w) => Some(w),
+            _ => None,
+        }
+    }
+
+    /// The focused window as COMMANDS must read it: the declaration when Ordo
+    /// holds one, else the OS's choice. Between issuing a grant and its echo
+    /// arriving the observation is stale by exactly the amount that once made
+    /// a carry grab the previous window (run 38 seq 20447), and a fling that
+    /// contradicts a standing declaration must not redirect a command either
+    /// (run 51 seq 22484: a carry dropped because focus had been flung to a
+    /// parked sibling).
     pub fn declared_focus(&self) -> Option<WindowId> {
-        self.pending
-            .iter()
-            .rev()
-            .find_map(|p| match p.expect {
-                Expectation::Focused(w) => Some(w),
-                _ => None,
-            })
-            .or(self.focused)
+        self.focus_target().or(self.focused)
     }
 
     /// The monitor the user is "at": the focused window's monitor, falling

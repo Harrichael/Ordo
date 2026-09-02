@@ -13,11 +13,13 @@
 //! from the same starting state and you get the same effects, which is how
 //! "I think I had a bug at 3pm" becomes a reproducible test case.
 //!
-//! The other load-bearing rule: **belief follows observation, never intent.**
-//! Issuing an effect does not update state; state changes only when a
-//! [`WorldSnapshot`] confirms what actually happened. macOS co-owns much of
-//! this state (the user can switch spaces behind our back), so intent-ahead
-//! bookkeeping would inevitably diverge from reality.
+//! The other load-bearing rule: **belief follows observation, never intent —
+//! and intent never follows observation.** Issuing an effect does not update
+//! belief; belief changes only when a [`WorldSnapshot`] confirms what actually
+//! happened. Declarations (which workspace a window is on, which window
+//! should be key — [`FocusIntent`]) are written only by commands, and an
+//! observation that contradicts one is a violation to correct, never a fact
+//! to absorb. See docs/intent-vs-observation.md.
 //!
 //! ```
 //! use ordo_core::{update, Event, HotkeyAction, State, Ts};
@@ -41,11 +43,11 @@ mod update;
 
 pub use effect::{CorrectionAxis, Effect, Expectation};
 pub use event::{
-    AxHintKind, Event, HotkeyAction, MonitorSnap, MonitorWs, OpOutcome, RescanTrigger, Ts,
+    AxHintKind, Event, Gesture, HotkeyAction, MonitorSnap, MonitorWs, OpOutcome, RescanTrigger, Ts,
     WindowSnap, WorkspaceSnap, WorldSnapshot,
 };
 pub use ids::{MonitorId, OpId, Pid, Point, Rect, WindowId, WorkspaceId, FRAME_EPSILON};
 pub use mru::FocusHistory;
 pub use reconcile::Delta;
-pub use state::{Mode, MonitorRecord, PendingOp, State, WindowRecord};
+pub use state::{FocusIntent, Mode, MonitorRecord, PendingOp, State, WindowRecord};
 pub use update::{coalesce_hotkeys, update, Note, Step};

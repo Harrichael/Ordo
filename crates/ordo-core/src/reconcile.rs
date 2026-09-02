@@ -127,8 +127,10 @@ pub(crate) fn diff(state: &State, snap: &WorldSnapshot) -> Vec<Delta> {
 }
 
 /// Belief follows the snapshot wholesale — records are rebuilt, not patched.
-/// Only what the snapshot cannot know survives: focus history, damping
-/// counters, pendings (handled by the caller).
+/// Only what the snapshot cannot know survives: focus history, declarations,
+/// damping counters, pendings (handled by the caller). Observed focus is
+/// mirrored here but never recorded into the MRU history: which window counts
+/// as "used" is the caller's decision, made against the focus declaration.
 pub(crate) fn apply_snapshot(s: &mut State, snap: &WorldSnapshot) {
     let old_windows = std::mem::take(&mut s.windows);
 
@@ -212,9 +214,6 @@ pub(crate) fn apply_snapshot(s: &mut State, snap: &WorldSnapshot) {
     }
 
     s.focused = snap.focused.filter(|w| s.windows.contains_key(w));
-    if let Some(f) = s.focused {
-        s.focus_history.touch(f);
-    }
 }
 
 /// The monitor whose frame contains the window's center; a window straddling
@@ -241,13 +240,12 @@ fn dist2(r: Rect, x: f64, y: f64) -> f64 {
     (c.x - x).powi(2) + (c.y - y).powi(2)
 }
 
-/// Would this pending expectation account for this delta? Focus changes are
-/// also attributed to workspace switches because macOS refocuses whatever
-/// lives on the arriving space — a consequence of our op, not a user action.
+/// Would this pending expectation account for this delta? A focus change is
+/// explained only by a grant for exactly that window: a switch's fallout that
+/// re-keys something else is real, and the log should show it as such.
 pub(crate) fn explains(e: &Expectation, d: &Delta) -> bool {
     match (e, d) {
         (Expectation::AllMonitorsOn(t), Delta::MonitorWorkspaceChanged { to, .. }) => to == t,
-        (Expectation::AllMonitorsOn(_), Delta::FocusChanged { .. }) => true,
         (
             Expectation::WindowOn { window, workspace },
             Delta::WindowWorkspaceChanged { window: w, to, .. },

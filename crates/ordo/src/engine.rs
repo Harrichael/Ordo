@@ -18,7 +18,7 @@ use std::collections::VecDeque;
 
 use crossbeam_channel::Receiver;
 use ordo_core::{
-    coalesce_hotkeys, update, Effect, Event, HotkeyAction, OpId, RescanTrigger, State,
+    coalesce_hotkeys, update, Effect, Event, Gesture, HotkeyAction, OpId, RescanTrigger, State,
 };
 
 use crate::clock::Clock;
@@ -31,6 +31,11 @@ use crate::ports::{Effector, RestackStats, WorldSource};
 /// clock on this side is what lets producers stay clock-free.
 pub enum Msg {
     Hotkey(HotkeyAction),
+    /// A focus-moving user gesture the tap witnessed and passed through (a
+    /// click, Cmd+Tab). Not a hotkey: nothing is executed for it, but it is
+    /// intent, and its place in the order relative to hotkeys and snapshots
+    /// is exactly what the core reads it for.
+    Gesture(Gesture),
     Rescan(RescanTrigger),
     Rescue,
     /// The engage chord (or a --paused run coming alive): leave Rescued mode,
@@ -126,7 +131,8 @@ impl Engine {
     /// before processing — so that hotkeys which piled up while the engine was
     /// busy are seen TOGETHER and coalesced (`coalesce_hotkeys`) instead of
     /// replayed one by one: a queued backlog is one user gesture, not a
-    /// script. Non-hotkey messages fence the coalescing and keep their order.
+    /// script. Non-hotkey messages fence the coalescing and keep their order
+    /// — a gesture included, since "hotkey, click, hotkey" is not one burst.
     pub fn run(mut self, rx: Receiver<Msg>) {
         self.observe(RescanTrigger::Startup);
         'recv: while let Ok(msg) = rx.recv() {
@@ -153,6 +159,10 @@ impl Engine {
                         self.flush_hotkeys(&mut hotkeys);
                         match other {
                             Msg::Rescan(trigger) => self.observe(trigger),
+                            Msg::Gesture(gesture) => self.pump(Event::Gesture {
+                                at: self.clock.now(),
+                                gesture,
+                            }),
                             Msg::Rescue => self.pump(Event::RescueEngaged {
                                 at: self.clock.now(),
                             }),

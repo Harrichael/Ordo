@@ -298,7 +298,8 @@ fn event_time(e: &Event) -> (i64, i64) {
         | Event::WorldObserved { at, .. }
         | Event::EffectResult { at, .. }
         | Event::RescueEngaged { at }
-        | Event::Engaged { at } => at,
+        | Event::Engaged { at }
+        | Event::Gesture { at, .. } => at,
     };
     (ts.wall_ms, ts.mono_ns as i64)
 }
@@ -310,6 +311,7 @@ fn event_kind(e: &Event) -> &'static str {
         Event::EffectResult { .. } => "effect_result",
         Event::RescueEngaged { .. } => "rescue_engaged",
         Event::Engaged { .. } => "engaged",
+        Event::Gesture { .. } => "gesture",
     }
 }
 
@@ -347,9 +349,11 @@ fn note_kind(n: &Note) -> &'static str {
         Note::OpLost { .. } => "op_lost",
         Note::OpFailed { .. } => "op_failed",
         Note::External { .. } => "external",
+        Note::GestureClassified { .. } => "gesture_classified",
         Note::FollowedFocus { .. } => "followed_focus",
-        Note::HeldFocusOnClose { .. } => "held_focus_on_close",
-        Note::HeldFocusSettling { .. } => "held_focus_settling",
+        Note::HeldFocus { .. } => "held_focus",
+        Note::FocusReasserted { .. } => "focus_reasserted",
+        Note::FocusDiverged { .. } => "focus_diverged",
         Note::TearDetected { .. } => "tear_detected",
         Note::TearPersisting => "tear_persisting",
         Note::Diverged { .. } => "diverged",

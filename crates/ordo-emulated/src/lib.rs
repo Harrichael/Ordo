@@ -9,8 +9,8 @@
 //! Two kinds of data, and the split is the architecture: DECLARATIONS (a
 //! window's workspace, the visible workspace) are written only by Ordo's own
 //! commands — user switch/move, rescue, and a window's birth; OBSERVATIONS
-//! (frames, existence, focus) are authoritative about the world, never about
-//! intent. An observation contradicting a declaration is a violation to
+//! (frames, existence, observed focus) are authoritative about the world,
+//! never about intent. An observation contradicting a declaration is a violation to
 //! correct on screen or surface, never to absorb into the declaration.
 //!
 //! This crate is the whole emulated model — the pure [`ledger::Ledger`]

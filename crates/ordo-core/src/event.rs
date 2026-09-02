@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{MonitorId, OpId, Pid, Rect, WindowId, WorkspaceId};
+use crate::ids::{MonitorId, OpId, Pid, Point, Rect, WindowId, WorkspaceId};
 
 /// Both clocks, stamped by the shell at ingest. Wall time is what the user
 /// remembers ("around 3pm"); monotonic time is what ordering and latency
@@ -46,6 +46,32 @@ pub enum Event {
     Engaged {
         at: Ts,
     },
+    /// The user acted on focus through a channel Ordo does not command: a
+    /// click, or one of macOS's own switchers. Witnessed by the tap and passed
+    /// through untouched — this is intent Ordo cannot name a target for, so
+    /// it hands the key-window slot to the OS (`FocusIntent::Deferred`).
+    /// Without this channel such gestures left no trace but the focus change
+    /// they caused, which is what made focus look observational.
+    Gesture {
+        at: Ts,
+        gesture: Gesture,
+    },
+}
+
+/// Only gestures that MOVE focus are witnessed. Ordinary keystrokes are not:
+/// Cmd+N preceded a verified app-initiated fling by 500ms (run 51 seq 12769),
+/// so any "recent input" rule would have blessed it.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub enum Gesture {
+    /// Any mouse button went down here (global CG coordinates). The point is
+    /// what lets the core tell a click INTO a visible window (the OS keys the
+    /// right thing; a later hidden-workspace landing is a fling) from a click
+    /// elsewhere — Dock, menu bar, a notification — that can be navigation.
+    MouseDown { at: Point },
+    /// macOS's app switcher completed (Cmd released after Cmd+Tab) or its
+    /// in-app window cycle fired (Cmd+`). The target is the OS's to know; a
+    /// focus landing on a hidden workspace right after is the user going there.
+    SystemSwitch,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

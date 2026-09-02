@@ -64,8 +64,10 @@ Two workspace backends behind one trait:
 - **`emulated`** (default) — Ordo owns workspaces AeroSpace-style, parking
   hidden windows off-screen. Instant and animation-free, unlimited workspaces,
   no private Space APIs. Best with a single native Space per display.
-  Cmd+Tab and Dock clicks are followed: focusing a window on a hidden
-  workspace switches Ordo there, like native Spaces would. Apps with no
+  Cmd+Tab, Cmd+` and Dock clicks are followed: the tap witnesses them, and
+  a focus landing on a hidden workspace right after one switches Ordo there,
+  like native Spaces would. An app flinging focus there on its own is pulled
+  back instead. Apps with no
   window on the visible workspace are hidden (Cmd+H-style) so the Dock dims
   them — run `defaults write com.apple.dock showhidden -bool true; killall
   Dock` once to render hidden apps translucent.
