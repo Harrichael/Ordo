@@ -8,11 +8,32 @@ use ordo_core::*;
 // Two 1920x1080 monitors side by side, three workspaces, three windows:
 //   w1 (pid 100) and w3 (pid 100) on monitor A, w2 (pid 200) on monitor B.
 
+/// Time between one event and the next. Expectations expire by ELAPSED TIME,
+/// so a fixture that stamped every event with the same instant would never
+/// expire one and every expiry test below would pass vacuously. Per-thread, so
+/// each test gets its own timeline no matter how the harness schedules them.
+const TICK_MS: u64 = 200;
+
+thread_local! {
+    static CLOCK_MS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 fn ts() -> Ts {
+    stamp(CLOCK_MS.with(|c| {
+        c.set(c.get() + TICK_MS);
+        c.get()
+    }))
+}
+
+fn stamp(ms: u64) -> Ts {
     Ts {
-        wall_ms: 0,
-        mono_ns: 0,
+        wall_ms: ms as i64,
+        mono_ns: ms * 1_000_000,
     }
+}
+
+fn plus_ms(base: Ts, ms: u64) -> Ts {
+    stamp(base.wall_ms as u64 + ms)
 }
 
 fn mid(n: u8) -> MonitorId {
@@ -138,8 +159,20 @@ fn observed(
     focused: Option<u32>,
     trigger: RescanTrigger,
 ) -> Event {
+    observed_at(ts(), monitors, windows, focused, trigger)
+}
+
+/// `observed` with the timestamp pinned, for tests that care where an
+/// observation falls relative to an expectation's lifetime.
+fn observed_at(
+    at: Ts,
+    monitors: Vec<Mon>,
+    windows: Vec<Win>,
+    focused: Option<u32>,
+    trigger: RescanTrigger,
+) -> Event {
     Event::WorldObserved {
-        at: ts(),
+        at,
         trigger,
         snap: world(&monitors, &windows, focused),
     }
@@ -928,7 +961,7 @@ fn tear_realignment_gives_up_after_the_damping_limit() {
     let mut s = booted(&[1]);
     let mut switches = 0;
     let mut persisting = false;
-    for _ in 0..12 {
+    for _ in 0..24 {
         let step = update(
             &s,
             &observed(
@@ -1060,11 +1093,106 @@ fn placement_retries_are_damped_when_the_app_fights_back() {
 // --- ops, failure, rescue ----------------------------------------------------
 
 #[test]
+fn a_grant_the_app_answers_slowly_is_confirmed_not_re_issued() {
+    // The measured regression: apps accept a focus grant at a median of 398ms
+    // (p75 647ms), while a workspace switch's own post-effect rescan plus the
+    // burst of accessibility hints it provokes delivered three snapshots
+    // inside ~150ms. Counting snapshots, that spent the whole budget before
+    // the app could answer — the grant was declared lost and re-issued on
+    // roughly one switch in four, doubling how long a switch took to settle.
+    // Ordo must simply wait: the same grant, landing at +650ms, is ours.
+    let mut wins = std_windows();
+    wins[1].workspace = ws(2);
+    let s = update(
+        &booted(&[2, 1]),
+        &observed(
+            vec![mon_a(1), mon_b(1)],
+            wins.clone(),
+            Some(1),
+            RescanTrigger::Periodic,
+        ),
+    )
+    .state;
+
+    let issued = ts();
+    let mut step = update(
+        &s,
+        &Event::Hotkey {
+            at: issued,
+            action: HotkeyAction::WorkspaceNext,
+        },
+    );
+    assert_eq!(focus_targets(&step.effects), vec![wid(2)]);
+    let grant = OpId(1);
+
+    // The switch lands; the app has not answered the grant yet. The hint
+    // storm the switch itself provokes arrives while it is still thinking.
+    let hint = RescanTrigger::AxHint {
+        pid: Some(Pid(100)),
+        kind: AxHintKind::Other("AXFocusedWindowChanged".into()),
+    };
+    let mut notes = Vec::new();
+    let mut effects = Vec::new();
+    for (offset, trigger) in [
+        (20, RescanTrigger::PostEffect { op: OpId(2) }),
+        (50, hint.clone()),
+        (100, hint),
+    ] {
+        step = update(
+            &step.state,
+            &observed_at(
+                plus_ms(issued, offset),
+                vec![mon_a(2), mon_b(2)],
+                wins.clone(),
+                Some(1),
+                trigger,
+            ),
+        );
+        notes.extend(step.notes.clone());
+        effects.extend(step.effects.clone());
+    }
+
+    let landed = update(
+        &step.state,
+        &observed_at(
+            plus_ms(issued, 650),
+            vec![mon_a(2), mon_b(2)],
+            wins,
+            Some(2),
+            RescanTrigger::Periodic,
+        ),
+    );
+    notes.extend(landed.notes.clone());
+    effects.extend(landed.effects.clone());
+
+    assert!(
+        notes.contains(&Note::SelfConfirmed { op: grant }),
+        "the grant we issued is the one that landed: {notes:?}"
+    );
+    assert!(
+        !notes.contains(&Note::OpLost { op: grant }),
+        "an app answering at the measured p75 is not a lost op: {notes:?}"
+    );
+    assert!(
+        !notes
+            .iter()
+            .any(|n| matches!(n, Note::FocusReasserted { .. })),
+        "nothing to re-assert while the grant is still in flight: {notes:?}"
+    );
+    assert_eq!(
+        focus_targets(&effects),
+        Vec::new(),
+        "the grant was not re-issued"
+    );
+}
+
+#[test]
 fn unconfirmed_ops_expire_as_lost() {
     let s = booted(&[1]);
     let mut step = update(&s, &hotkey(HotkeyAction::WorkspaceNext)); // op 1
     let mut lost = false;
-    for _ in 0..3 {
+    // Long enough for the expectation's TTL to run out at TICK_MS per event.
+    for _ in 0..5 {
         step = update(
             &step.state,
             &observed(
@@ -1304,7 +1432,7 @@ fn expired_placement_yields_to_a_window_being_dragged() {
         "corral places the new window on the focused monitor"
     );
     // The corral never sticks (the snapshot keeps the old frame) …
-    for _ in 0..2 {
+    for _ in 0..4 {
         step = update(
             &step.state,
             &observed(
@@ -1735,7 +1863,7 @@ fn a_grant_landing_on_a_sibling_is_corrected_and_does_not_reorder_mru() {
 
     let mut s = step.state;
     let mut regrants = 0;
-    for _ in 0..3 {
+    for _ in 0..5 {
         let next = update(&s, &obs(2, 4)); // sibling holds key
         regrants += focus_targets(&next.effects).len();
         assert_eq!(count_switches(&next.effects), 0);

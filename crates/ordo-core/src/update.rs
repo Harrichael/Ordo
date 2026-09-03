@@ -8,10 +8,31 @@ use crate::ids::{OpId, Pid, Rect, WindowId, WorkspaceId, FRAME_EPSILON};
 use crate::reconcile::{self, Delta};
 use crate::state::{FocusIntent, Mode, PendingOp, State};
 
-/// Snapshots an expectation survives unmet before it's declared lost. Three
-/// covers the post-effect rescan plus slop for a slow executor without letting
-/// a dead op suppress external-change attribution for long.
-const EXPECTATION_RESCANS: u8 = 3;
+/// How long an expectation may go unmet before its op is declared lost.
+///
+/// Elapsed time, not a snapshot count. Snapshots are not a clock: they fire on
+/// the periodic timer, on post-effect requests, AND on every accessibility
+/// hint, and a workspace switch produces a burst of hints — three snapshots
+/// went by in ~150ms while an app takes a median of 398ms to accept a focus
+/// grant (415 measured grants: p50 398ms, p75 647ms, p90 975ms). So the grant
+/// was declared lost and re-issued before the app could answer, on roughly one
+/// switch in four, doubling the time a switch took to settle. One second is
+/// the p90 of grants that land at all.
+///
+/// Deliberately one constant for every expectation kind. `AllMonitorsOn`
+/// confirms on the post-effect snapshot under the emulated backend regardless;
+/// `WindowOn`/`WindowFramed` merely retry a second later instead of ~150ms
+/// later, which reduces write fights rather than regressing anything. The one
+/// exposure is the native backend, whose multi-step switches run ~350ms per
+/// step and could exceed this — native is not the daily driver, so that is
+/// noted rather than special-cased.
+///
+/// The cost accepted: while an op is pending, its expectation explains
+/// matching deltas as self-caused, so a dead op now suppresses external
+/// attribution for up to a second instead of ~150ms. That narrowness was the
+/// original reason the budget was small; a second of it is worth not fighting
+/// every app that answers slowly.
+const EXPECTATION_TTL_NS: u64 = 1_000_000_000;
 
 /// Correctives per window (and per tear episode, and per focus declaration)
 /// before we stop fighting and log instead. An app that re-places its own
@@ -94,13 +115,21 @@ pub fn update(state: &State, event: &Event) -> Step {
     let mut notes = Vec::new();
 
     match event {
-        Event::Hotkey { action, .. } => {
+        Event::Hotkey { at, action } => {
             if s.mode == Mode::Active {
-                handle_hotkey(&mut s, *action, &mut effects);
+                handle_hotkey(&mut s, *action, at.mono_ns, &mut effects);
             }
         }
-        Event::WorldObserved { trigger, snap, .. } => {
-            handle_snapshot(state, &mut s, trigger, snap, &mut effects, &mut notes);
+        Event::WorldObserved { at, trigger, snap } => {
+            handle_snapshot(
+                state,
+                &mut s,
+                at.mono_ns,
+                trigger,
+                snap,
+                &mut effects,
+                &mut notes,
+            );
         }
         Event::EffectResult { op, outcome, .. } => {
             handle_effect_result(&mut s, *op, outcome, &mut notes);
@@ -208,13 +237,13 @@ enum Command {
     },
 }
 
-fn handle_hotkey(s: &mut State, action: HotkeyAction, fx: &mut Vec<Effect>) {
+fn handle_hotkey(s: &mut State, action: HotkeyAction, now_ns: u64, fx: &mut Vec<Effect>) {
     // A hotkey that resolves to nothing (clamped at an edge, nothing focused)
     // touched neither the world nor the declaration.
     let Some(cmd) = resolve(s, action) else {
         return;
     };
-    let focus = execute(s, cmd, fx);
+    let focus = execute(s, cmd, now_ns, fx);
     s.declare_focus(focus);
 }
 
@@ -322,7 +351,7 @@ fn resolve(s: &State, action: HotkeyAction) -> Option<Command> {
 
 /// Carry out a resolved command and return the focus declaration it leaves
 /// behind. Total over `Command` by construction — see the type's doc.
-fn execute(s: &mut State, cmd: Command, fx: &mut Vec<Effect>) -> FocusIntent {
+fn execute(s: &mut State, cmd: Command, now_ns: u64, fx: &mut Vec<Effect>) -> FocusIntent {
     match cmd {
         Command::Switch { target } => {
             // Hand focus to the destination's MRU window BEFORE switching —
@@ -351,7 +380,7 @@ fn execute(s: &mut State, cmd: Command, fx: &mut Vec<Effect>) -> FocusIntent {
                     s.pending.push(PendingOp {
                         op,
                         expect: Expectation::Focused(fw),
-                        rescans_left: EXPECTATION_RESCANS,
+                        issued_ns: now_ns,
                     });
                 }
             }
@@ -360,7 +389,7 @@ fn execute(s: &mut State, cmd: Command, fx: &mut Vec<Effect>) -> FocusIntent {
             s.pending.push(PendingOp {
                 op,
                 expect: Expectation::AllMonitorsOn(target),
-                rescans_left: EXPECTATION_RESCANS,
+                issued_ns: now_ns,
             });
             if stack.len() >= 2 {
                 fx.push(Effect::RestackWindows { order: stack });
@@ -391,7 +420,7 @@ fn execute(s: &mut State, cmd: Command, fx: &mut Vec<Effect>) -> FocusIntent {
                     window,
                     workspace: target,
                 },
-                rescans_left: EXPECTATION_RESCANS,
+                issued_ns: now_ns,
             });
             let switch_op = s.mint_op();
             fx.push(Effect::SwitchWorkspace {
@@ -401,7 +430,7 @@ fn execute(s: &mut State, cmd: Command, fx: &mut Vec<Effect>) -> FocusIntent {
             s.pending.push(PendingOp {
                 op: switch_op,
                 expect: Expectation::AllMonitorsOn(target),
-                rescans_left: EXPECTATION_RESCANS,
+                issued_ns: now_ns,
             });
             // The carried window rides on top. Its assignment is only pending,
             // so the destination's MRU stack does not contain it yet — and a
@@ -432,7 +461,7 @@ fn execute(s: &mut State, cmd: Command, fx: &mut Vec<Effect>) -> FocusIntent {
             s.pending.push(PendingOp {
                 op,
                 expect: Expectation::Focused(target),
-                rescans_left: EXPECTATION_RESCANS,
+                issued_ns: now_ns,
             });
             fx.push(Effect::RequestRescan {
                 reason: RescanTrigger::PostEffect { op },
@@ -458,7 +487,7 @@ fn execute(s: &mut State, cmd: Command, fx: &mut Vec<Effect>) -> FocusIntent {
             s.pending.push(PendingOp {
                 op,
                 expect: Expectation::Focused(to),
-                rescans_left: EXPECTATION_RESCANS,
+                issued_ns: now_ns,
             });
             fx.push(Effect::RequestRescan {
                 reason: RescanTrigger::PostEffect { op },
@@ -473,7 +502,7 @@ fn execute(s: &mut State, cmd: Command, fx: &mut Vec<Effect>) -> FocusIntent {
             s.pending.push(PendingOp {
                 op,
                 expect: Expectation::WindowFramed { window, frame },
-                rescans_left: EXPECTATION_RESCANS,
+                issued_ns: now_ns,
             });
             fx.push(Effect::RequestRescan {
                 reason: RescanTrigger::PostEffect { op },
@@ -533,6 +562,7 @@ pub fn coalesce_hotkeys(s: &State, actions: &[HotkeyAction]) -> Vec<HotkeyAction
 fn handle_snapshot(
     pre: &State,
     s: &mut State,
+    now_ns: u64,
     trigger: &RescanTrigger,
     snap: &WorldSnapshot,
     fx: &mut Vec<Effect>,
@@ -565,7 +595,7 @@ fn handle_snapshot(
     // Resolve or age expectations against the fresh belief.
     let mut expired: Vec<PendingOp> = Vec::new();
     let mut still_pending: Vec<PendingOp> = Vec::new();
-    for mut p in std::mem::take(&mut s.pending) {
+    for p in std::mem::take(&mut s.pending) {
         if expectation_satisfied(&p.expect, s) {
             notes.push(Note::SelfConfirmed { op: p.op });
             // The world accepted this placement: this axis's fight is over.
@@ -579,14 +609,11 @@ fn handle_snapshot(
                     }
                 }
             }
+        } else if now_ns.saturating_sub(p.issued_ns) >= EXPECTATION_TTL_NS {
+            notes.push(Note::OpLost { op: p.op });
+            expired.push(p);
         } else {
-            p.rescans_left = p.rescans_left.saturating_sub(1);
-            if p.rescans_left == 0 {
-                notes.push(Note::OpLost { op: p.op });
-                expired.push(p);
-            } else {
-                still_pending.push(p);
-            }
+            still_pending.push(p);
         }
     }
     s.pending = still_pending;
@@ -656,6 +683,7 @@ fn handle_snapshot(
                     s,
                     window,
                     CorrectionAxis::Workspace,
+                    now_ns,
                     notes,
                     &mut last_op,
                     fx,
@@ -678,6 +706,7 @@ fn handle_snapshot(
                     s,
                     window,
                     CorrectionAxis::Frame,
+                    now_ns,
                     notes,
                     &mut last_op,
                     fx,
@@ -726,6 +755,7 @@ fn handle_snapshot(
                         s,
                         window,
                         CorrectionAxis::Workspace,
+                        now_ns,
                         notes,
                         &mut last_op,
                         fx,
@@ -754,6 +784,7 @@ fn handle_snapshot(
                             s,
                             window,
                             CorrectionAxis::Frame,
+                            now_ns,
                             notes,
                             &mut last_op,
                             fx,
@@ -770,7 +801,7 @@ fn handle_snapshot(
         }
     }
 
-    enforce_focus(s, navigation_gesture, notes, &mut last_op, fx);
+    enforce_focus(s, navigation_gesture, now_ns, notes, &mut last_op, fx);
 
     // Tear re-alignment: the product invariant is that a workspace spans all
     // monitors, so an externally-swiped display gets pulled back to the
@@ -797,7 +828,7 @@ fn handle_snapshot(
                 s.pending.push(PendingOp {
                     op,
                     expect: Expectation::AllMonitorsOn(target),
-                    rescans_left: EXPECTATION_RESCANS,
+                    issued_ns: now_ns,
                 });
                 notes.push(Note::TearDetected { target });
                 s.tear_corrections += 1;
@@ -845,6 +876,7 @@ fn handle_snapshot(
 fn enforce_focus(
     s: &mut State,
     navigation_gesture: bool,
+    now_ns: u64,
     notes: &mut Vec<Note>,
     last_op: &mut Option<OpId>,
     fx: &mut Vec<Effect>,
@@ -875,7 +907,7 @@ fn enforce_focus(
             s.pending.push(PendingOp {
                 op,
                 expect: Expectation::AllMonitorsOn(target),
-                rescans_left: EXPECTATION_RESCANS,
+                issued_ns: now_ns,
             });
             // Declared first so the window the user chose heads the restack.
             s.declare_focus(FocusIntent::Window(rec.id));
@@ -946,7 +978,7 @@ fn enforce_focus(
     s.pending.push(PendingOp {
         op,
         expect: Expectation::Focused(w),
-        rescans_left: EXPECTATION_RESCANS,
+        issued_ns: now_ns,
     });
     notes.push(Note::FocusReasserted { window: w });
     *last_op = Some(op);
@@ -962,10 +994,12 @@ fn key_app(s: &State) -> Option<Pid> {
 /// the damping limit, in which case note the divergence and stand down. Damping
 /// is per axis so a window wrong on both workspace and frame gets a full retry
 /// budget for each.
+#[allow(clippy::too_many_arguments)]
 fn correct_window(
     s: &mut State,
     window: WindowId,
     axis: CorrectionAxis,
+    now_ns: u64,
     notes: &mut Vec<Note>,
     last_op: &mut Option<OpId>,
     fx: &mut Vec<Effect>,
@@ -985,7 +1019,7 @@ fn correct_window(
     s.pending.push(PendingOp {
         op,
         expect,
-        rescans_left: EXPECTATION_RESCANS,
+        issued_ns: now_ns,
     });
     if let Some(r) = s.windows.get_mut(&window) {
         match axis {

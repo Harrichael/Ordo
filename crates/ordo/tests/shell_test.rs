@@ -193,18 +193,23 @@ fn at(n: i64) -> ordo_core::Ts {
     }
 }
 
-/// A monotonic fake clock: reproducible timestamps for reproducible logs.
+/// A monotonic fake clock: reproducible timestamps for reproducible logs. The
+/// step is a plausible inter-event gap rather than one tick, because the core
+/// ages expectations by elapsed `mono_ns` — a clock that barely moved would
+/// leave every op pending forever and quietly retire the expiry paths below.
 struct StepClock {
     n: Cell<u64>,
 }
+
+const STEP_MS: u64 = 100;
 
 impl Clock for StepClock {
     fn now(&self) -> ordo_core::Ts {
         let n = self.n.get();
         self.n.set(n + 1);
         ordo_core::Ts {
-            wall_ms: 1_000 + n as i64,
-            mono_ns: n,
+            wall_ms: 1_000 + (n * STEP_MS) as i64,
+            mono_ns: n * STEP_MS * 1_000_000,
         }
     }
 }
@@ -494,7 +499,9 @@ fn a_focus_grant_the_desktop_ignores_is_retried_then_stood_down() {
         while engine.state().focus_intent() != FocusIntent::Deferred {
             engine.observe(RescanTrigger::Periodic);
             observations += 1;
-            assert!(observations <= 12, "never stood down");
+            // Generous because expiry is elapsed time now: at STEP_MS per
+            // clock read, waiting out one grant's TTL costs several rescans.
+            assert!(observations <= 48, "never stood down");
         }
         // The stand-down is where the interesting behaviour starts, not
         // where it ends: focus is still on a hidden window, so keep watching
@@ -549,11 +556,13 @@ fn a_grant_that_lands_on_a_sibling_is_corrected_until_the_app_gives_in() {
         Some(WindowId(4)),
         "the sibling took it"
     );
-    for _ in 0..3 {
+    // Enough rescans either side of the relenting for the ignored grant's
+    // expectation to time out and the retry to be issued.
+    for _ in 0..8 {
         engine.observe(RescanTrigger::Periodic);
     }
     os.borrow_mut().policy = FocusPolicy::Lands;
-    for _ in 0..3 {
+    for _ in 0..8 {
         engine.observe(RescanTrigger::Periodic);
     }
     assert_eq!(os.borrow().focused, Some(WindowId(2)));

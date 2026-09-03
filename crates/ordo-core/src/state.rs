@@ -47,13 +47,19 @@ pub struct WindowRecord {
 }
 
 /// A self-initiated operation awaiting its echo in a snapshot. Deltas that
-/// match `expect` are ours; unmatched expectations expire after a few rescans
-/// so a lost op can't suppress genuinely external changes forever.
+/// match `expect` are ours; an expectation the world never meets expires after
+/// `EXPECTATION_TTL_NS` of elapsed time so a lost op can't suppress genuinely
+/// external changes forever.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PendingOp {
     pub op: OpId,
     pub expect: Expectation,
-    pub rescans_left: u8,
+    /// The `mono_ns` of the event that issued the effect. `serde(default)` so
+    /// checkpoints written before expiry became time-based still decode; those
+    /// ops read as issued at time zero and expire at the first snapshot, which
+    /// is what a resumed run should do with them anyway.
+    #[serde(default)]
+    pub issued_ns: u64,
 }
 
 /// Who owns the key-window slot. A DECLARATION, written only by commands —
