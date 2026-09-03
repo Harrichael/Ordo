@@ -40,6 +40,7 @@ pub type CgsSpaceId = u64;
 /// `CFNumberGetValue` type selectors (from CFNumber.h).
 pub const kCFNumberSInt64Type: c_int = 4;
 pub const kCFNumberIntType: c_int = 9;
+pub const kCFNumberDoubleType: c_int = 13;
 
 /// UTF-8 for `CFStringCreateWithCString` (from CFString.h).
 pub const kCFStringEncodingUTF8: u32 = 0x0800_0100;

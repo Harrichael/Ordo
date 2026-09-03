@@ -34,10 +34,22 @@ pub mod statefile;
 pub mod trace;
 pub mod workspaces;
 
-pub use trace::{ParkTrace, ParkTraceKind};
+pub use trace::{HoldStat, ParkTrace, ParkTraceKind};
 pub use workspaces::{EmulatedWorkspaces, WorkspaceOutOfRange};
 
 use ordo_core::{Pid, Point, Rect, WindowId};
+
+/// One app to un-hide, and the windows that must not come back with it.
+///
+/// An empty `hold` is a deliberate statement, not an omission: reveal
+/// everything, which is exactly what the rescue path wants.
+#[derive(Debug, Clone)]
+pub struct Unhide {
+    pub pid: Pid,
+    /// This app's windows declared on other workspaces, each with the park
+    /// origin it must still occupy when the reveal is over.
+    pub hold: Vec<(WindowId, Point)>,
+}
 
 /// The slice of the desktop the emulated model needs to touch: enumerate
 /// windows, move them, hide apps, and know where the main display is. Defined
@@ -62,7 +74,34 @@ pub trait Desktop {
     /// incoming one in a single breath, and an implementation that has to walk
     /// each app's window list should walk it once for both.
     fn move_windows(&self, moves: &[(Pid, WindowId, Point)]);
-    fn set_app_hidden(&self, pid: Pid, hidden: bool);
+
+    /// Hide an app, the Cmd+H way. Fire-and-forget on purpose: nothing
+    /// contests a hide — the windows are already where the model wants them
+    /// and vanishing gives the app no reason to move them.
+    fn hide_app(&self, pid: Pid);
+
+    /// Un-hide these apps, HOLDING each one's listed windows at the given
+    /// origin until the desktop agrees they are there.
+    ///
+    /// The asymmetry with [`Desktop::hide_app`] is the whole point. As an
+    /// un-hidden app's windows order back in, AppKit re-homes each one onto a
+    /// display (`constrainFrameRect:toScreen:`), dragging the ones parked for
+    /// other workspaces fully back on screen — measured on 93% of genuine
+    /// un-hides of an app with a parked window, and the flash the user sees on
+    /// every switch. Surviving that is a property of the un-hide itself, not a
+    /// second command issued after it: a write sent in the same breath is
+    /// processed BEFORE the order-in and then overwritten by it (measured: 1-4
+    /// of 12 ended parked). So the positions ride WITH the un-hide, and how
+    /// they are made to stick is the port's business — the model knows where a
+    /// window belongs, not how to win a race with an app's main thread.
+    ///
+    /// Batched for the same reason [`Desktop::move_windows`] is: a switch
+    /// un-hides several apps and must cost the slowest, not the sum.
+    ///
+    /// The returned stats are telemetry only — the model reads nothing back
+    /// into its beliefs from them.
+    fn show_apps(&self, apps: &[Unhide]) -> Vec<HoldStat>;
+
     fn focused_window(&self) -> Option<WindowId>;
     /// The main display's frame — where a re-homed window must land, because
     /// that is where the user is looking.

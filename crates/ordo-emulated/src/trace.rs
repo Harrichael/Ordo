@@ -58,6 +58,47 @@ pub enum ParkTraceKind {
     AppHidden,
 }
 
+/// What holding an app's parked windows through its un-hide cost.
+///
+/// The un-hide is the one moment the model does not control: the app orders
+/// its windows back in and AppKit re-homes each one onto a display, so the
+/// port has to keep re-writing the park origin until the window server agrees.
+/// That loop is invisible when it works — this is the only channel that can
+/// say it ran, how much it cost, and whether it still works. `converged` is
+/// the health signal; `escaped` names the windows a switch left on screen.
+#[derive(Debug, Clone, Serialize)]
+pub struct HoldStat {
+    pub pid: Pid,
+    /// Windows this un-hide had to hold — 0 for an app with nothing parked,
+    /// where the hold is a single window-server read and no writes at all.
+    pub windows: usize,
+    pub writes: u32,
+    pub elapsed_ms: u64,
+    pub escaped: Vec<WindowId>,
+    /// `escaped.is_empty()`, carried as its own field so the question this
+    /// telemetry exists to answer is one column and not an array to measure.
+    pub converged: bool,
+}
+
+impl HoldStat {
+    pub fn new(
+        pid: Pid,
+        windows: usize,
+        writes: u32,
+        elapsed_ms: u64,
+        escaped: Vec<WindowId>,
+    ) -> Self {
+        HoldStat {
+            pid,
+            windows,
+            writes,
+            elapsed_ms,
+            converged: escaped.is_empty(),
+            escaped,
+        }
+    }
+}
+
 /// One diagnostic fact about a window's frame mechanics.
 ///
 /// `observed` is always the raw frame as the OS reported it — never the
@@ -84,6 +125,9 @@ pub struct ParkTrace {
     pub at_park: Option<bool>,
     /// Enforcement attempts charged to this window so far.
     pub attempt: Option<u8>,
+    /// On an [`ParkTraceKind::AppShown`]: what it cost to keep that app's
+    /// parked windows at the corner while its windows ordered back in.
+    pub hold: Option<HoldStat>,
     pub detail: Option<String>,
 }
 
@@ -100,6 +144,7 @@ impl ParkTrace {
             requested: None,
             at_park: None,
             attempt: None,
+            hold: None,
             detail: None,
         }
     }
@@ -139,6 +184,11 @@ impl ParkTrace {
 
     pub fn attempt(mut self, n: u8) -> Self {
         self.attempt = Some(n);
+        self
+    }
+
+    pub fn hold(mut self, h: HoldStat) -> Self {
+        self.hold = Some(h);
         self
     }
 

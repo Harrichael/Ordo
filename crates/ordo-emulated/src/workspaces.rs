@@ -19,8 +19,8 @@ use ordo_core::{Pid, Point, Rect, WindowId, WorkspaceId};
 
 use crate::ledger::{Claim, Ledger, MoveAction};
 use crate::statefile::{self, PersistedState, PersistedWindow};
-use crate::trace::{ParkTrace, ParkTraceKind};
-use crate::Desktop;
+use crate::trace::{HoldStat, ParkTrace, ParkTraceKind};
+use crate::{Desktop, Unhide};
 
 /// How much of a parked window stays on-screen. macOS refuses to keep a fully
 /// off-screen window where you put it, so we leave a 1px handle — also the
@@ -325,7 +325,7 @@ impl EmulatedWorkspaces {
         // question: it cannot stop an app from restoring its own geometry in
         // response to being un-hidden, which is what the trace is here to show.
         self.move_windows(d, &writes);
-        self.apply_app_visibility(d, &frames);
+        self.apply_app_visibility(d, &frames, g);
     }
 
     pub fn move_window_to_workspace(
@@ -343,7 +343,7 @@ impl EmulatedWorkspaces {
         };
         self.persist();
         self.move_windows(d, write.as_slice());
-        self.apply_app_visibility(d, &frames);
+        self.apply_app_visibility(d, &frames, g);
         Ok(())
     }
 
@@ -649,10 +649,11 @@ impl EmulatedWorkspaces {
         // gather already unhides every app up front.
         let frames = current_frames(d);
         self.ledger.assign_window(window, self.ledger.current());
-        d.set_app_hidden(
-            frames.get(&window).map(|(p, _)| *p).unwrap_or(Pid(0)),
-            false,
-        );
+        // An empty hold: rescue reveals everything, deliberately.
+        d.show_apps(&[Unhide {
+            pid: frames.get(&window).map(|(p, _)| *p).unwrap_or(Pid(0)),
+            hold: Vec::new(),
+        }]);
         let write = self.restore(window, &frames, Geometry::read(d));
         self.persist();
         self.move_windows(d, write.as_slice());
@@ -855,7 +856,17 @@ impl EmulatedWorkspaces {
     /// app makes macOS fling focus somewhere arbitrary. Core-side, switches
     /// hand focus to the destination before this runs, so the exemption
     /// almost never bites; when it does, the app just stays undimmed.
-    fn apply_app_visibility(&mut self, d: &dyn Desktop, frames: &HashMap<WindowId, (Pid, Rect)>) {
+    ///
+    /// The un-hide carries the park origins of the app's windows declared
+    /// elsewhere: revealing an app drags exactly those back on screen unless
+    /// they are held (see [`Desktop::show_apps`]). Which windows and where is
+    /// the model's knowledge; making it stick is the port's.
+    fn apply_app_visibility(
+        &mut self,
+        d: &dyn Desktop,
+        frames: &HashMap<WindowId, (Pid, Rect)>,
+        g: Geometry,
+    ) {
         let current = self.ledger.current();
         let assignments = self.ledger.window_ws();
         let mut here_by_app: HashMap<Pid, bool> = HashMap::new();
@@ -867,35 +878,66 @@ impl EmulatedWorkspaces {
         let focused_app = d
             .focused_window()
             .and_then(|w| frames.get(&w).map(|(p, _)| *p));
-        // Count each app's windows that are NOT on the current workspace: those
-        // are the ones an unhide reveals along with the wanted one, and the
-        // number worth having when reading a flash back.
-        let mut elsewhere: HashMap<Pid, usize> = HashMap::new();
-        for (window, (pid, _)) in frames {
+        // Each app's windows that are NOT on the current workspace: the ones an
+        // unhide reveals along with the wanted one, so also the ones it has to
+        // be told to hold — and where. The park REQUEST is the anchor when
+        // there is one; without it (a promise loaded from disk, a window this
+        // process never parked) the corner is recomputed, which is the same
+        // answer because a park depends only on the window's width and keeps
+        // its y.
+        let mut elsewhere: HashMap<Pid, Vec<(WindowId, Point)>> = HashMap::new();
+        for (window, (pid, f)) in frames {
             if assignments.get(window).is_some_and(|ws| *ws != current) {
-                *elsewhere.entry(*pid).or_insert(0) += 1;
+                let want = self
+                    .park_request
+                    .get(window)
+                    .copied()
+                    .unwrap_or_else(|| park_frame(*f, g));
+                elsewhere.entry(*pid).or_default().push((
+                    *window,
+                    Point {
+                        x: want.x,
+                        y: want.y,
+                    },
+                ));
             }
         }
+        for hold in elsewhere.values_mut() {
+            hold.sort_by_key(|(w, _)| w.0);
+        }
+        let mut shows: Vec<Unhide> = Vec::new();
         let mut notes = Vec::new();
         for (pid, has_window_here) in here_by_app {
-            let parked_too = elsewhere.get(&pid).copied().unwrap_or(0);
+            let hold = elsewhere.get(&pid).cloned().unwrap_or_default();
             if has_window_here {
-                d.set_app_hidden(pid, false);
-                notes.push(
-                    ParkTrace::app(pid, ParkTraceKind::AppShown)
-                        .ws(current, current)
-                        .detail(format!(
-                            "unhidden; also reveals {parked_too} window(s) parked for other workspaces"
-                        )),
-                );
+                shows.push(Unhide { pid, hold });
             } else if Some(pid) != focused_app {
-                d.set_app_hidden(pid, true);
+                d.hide_app(pid);
                 notes.push(
                     ParkTrace::app(pid, ParkTraceKind::AppHidden)
                         .ws(current, current)
-                        .detail(format!("hidden; {parked_too} window(s) parked")),
+                        .detail(format!("hidden; {} window(s) parked", hold.len())),
                 );
             }
+        }
+        // One call for every un-hide of this pass: they overlap in time rather
+        // than queueing, so a switch costs the slowest app's reveal.
+        let held: HashMap<Pid, HoldStat> = d
+            .show_apps(&shows)
+            .into_iter()
+            .map(|s| (s.pid, s))
+            .collect();
+        for u in shows {
+            let mut t = ParkTrace::app(u.pid, ParkTraceKind::AppShown)
+                .ws(current, current)
+                .detail(format!(
+                    "unhidden; also reveals {} window(s) parked for other workspaces",
+                    u.hold.len()
+                ));
+            if let Some(s) = held.get(&u.pid) {
+                t = t.hold(s.clone());
+            }
+            notes.push(t);
         }
         for t in notes {
             self.note(t);
@@ -1118,6 +1160,27 @@ mod tests {
         }
     }
 
+    /// AppKit's `constrainFrameRect:toScreen:`, as an un-hidden app's windows
+    /// meet it on the way back in: the window is pushed until its body sits
+    /// inside the display owning its origin (an origin off to the left of
+    /// every display is main's, same rule as `write_whole_frame`). A parked
+    /// window's whole body is off that edge, so this is what hauls it back.
+    ///
+    /// Only the HORIZONTAL push is modelled, because only it was measured. The
+    /// vertical rule this fake already has — a landing may be pulled DOWN so a
+    /// title bar stays reachable, never hoisted to make a tall window fit —
+    /// comes from `land`, which every write goes through.
+    fn constrain_to_screen(f: Rect) -> Rect {
+        let owner = displays()
+            .into_iter()
+            .find(|d| f.x >= d.x && f.x < d.x + d.w && f.y >= d.y && f.y < d.y + d.h)
+            .unwrap_or(MAIN);
+        Rect {
+            x: f.x.clamp(owner.x, (owner.x + owner.w - f.w).max(owner.x)),
+            ..f
+        }
+    }
+
     /// The widest strip of `f` any display still shows. The park hides a
     /// window horizontally, so this is the axis the invariant lives on.
     fn visible_width(f: &Rect) -> f64 {
@@ -1139,6 +1202,12 @@ mod tests {
         /// measured in production (124pt), which no constant-box predicate
         /// survived.
         pull: std::cell::Cell<f64>,
+        /// Apps hidden the Cmd+H way. Their windows stay in `windows`, because
+        /// an AX scan really does still see a hidden app's windows — that is
+        /// what lets the model restore them later, and why the port's death
+        /// evidence has to come from the window server instead. What hiding
+        /// changes is what happens on the way BACK: see `show_apps`.
+        hidden: std::cell::RefCell<HashSet<Pid>>,
     }
 
     impl FakeDesktop {
@@ -1150,6 +1219,7 @@ mod tests {
                 frozen: std::cell::Cell::new(false),
                 cg_down: std::cell::Cell::new(false),
                 pull: std::cell::Cell::new(28.0),
+                hidden: std::cell::RefCell::new(HashSet::new()),
             }
         }
 
@@ -1190,6 +1260,10 @@ mod tests {
 
         fn frame(&self, w: WindowId) -> Rect {
             self.windows.borrow()[&w].1
+        }
+
+        fn is_hidden(&self, pid: Pid) -> bool {
+            self.hidden.borrow().contains(&pid)
         }
 
         fn freeze(&self) {
@@ -1259,7 +1333,81 @@ mod tests {
             }
         }
 
-        fn set_app_hidden(&self, _pid: Pid, _hidden: bool) {}
+        fn hide_app(&self, pid: Pid) {
+            self.hidden.borrow_mut().insert(pid);
+        }
+
+        /// The un-hide, modelled as the measurements found it — because the
+        /// defect lives entirely in what a no-op `set_app_hidden` did not say.
+        ///
+        /// A genuinely hidden app orders its windows back in, and AppKit runs
+        /// `constrainFrameRect:toScreen:` over each one on the way, dragging a
+        /// window parked off the left edge fully onto the display owning its
+        /// origin. Everything written BEFORE that moment — the switch's own
+        /// park writes, or a blind re-park issued in the same breath as the
+        /// un-hide — is what the constrain undoes; only the positions carried
+        /// through this call survive, which is why they are a parameter and
+        /// not a follow-up `move_windows`.
+        ///
+        /// Un-hiding an app that was never hidden orders nothing in and moves
+        /// nothing: no re-home here either.
+        fn show_apps(&self, apps: &[Unhide]) -> Vec<HoldStat> {
+            let mut out = Vec::new();
+            for a in apps {
+                // A frozen app applies nothing — neither our writes nor its
+                // own reveal — so it stays hidden and everything holds still.
+                if !self.frozen.get() {
+                    if self.hidden.borrow_mut().remove(&a.pid) {
+                        let ordering_in: Vec<(WindowId, Rect)> = self
+                            .windows
+                            .borrow()
+                            .iter()
+                            .filter(|(_, (p, _))| *p == a.pid)
+                            .map(|(w, (_, f))| (*w, *f))
+                            .collect();
+                        for (w, f) in ordering_in {
+                            self.land(a.pid, w, constrain_to_screen(f));
+                        }
+                    }
+                    for (w, at) in &a.hold {
+                        let size_is_the_windows_own = self.windows.borrow()[w].1;
+                        self.land(
+                            a.pid,
+                            *w,
+                            Rect {
+                                x: at.x,
+                                y: at.y,
+                                ..size_is_the_windows_own
+                            },
+                        );
+                    }
+                }
+                let escaped = a
+                    .hold
+                    .iter()
+                    .filter(|(w, at)| {
+                        let f = self.windows.borrow()[w].1;
+                        !same_position(
+                            &f,
+                            &Rect {
+                                x: at.x,
+                                y: at.y,
+                                ..f
+                            },
+                        )
+                    })
+                    .map(|(w, _)| *w)
+                    .collect();
+                out.push(HoldStat::new(
+                    a.pid,
+                    a.hold.len(),
+                    a.hold.len() as u32,
+                    0,
+                    escaped,
+                ));
+            }
+            out
+        }
 
         fn focused_window(&self) -> Option<WindowId> {
             None
@@ -1368,6 +1516,61 @@ mod tests {
             "counts the windows a flash would show: {:?}",
             shown.detail
         );
+    }
+
+    /// Un-hiding an app is not the mirror of hiding it. Dock dimming hides an
+    /// app whose windows all live elsewhere; arriving at a workspace un-hides
+    /// it, and the app orders EVERY window it owns back in — AppKit re-homing
+    /// each one onto a display on the way. The windows parked for other
+    /// workspaces come back with the wanted one unless the un-hide itself
+    /// holds them, which is the flash on every switch.
+    ///
+    /// Without the hold this test is red exactly where it should be: w2 is
+    /// found at x=0 (dragged onto main) instead of the corner.
+    #[test]
+    fn an_unhide_leaves_the_apps_other_workspaces_parked() {
+        // pid 10 straddles ws2 and ws3 and owns nothing on ws1, so it is
+        // genuinely hidden while we sit on ws1 — the only state an un-hide can
+        // re-home anything out of. pid 20 keeps ws1 populated.
+        let d = FakeDesktop::new(&[
+            (w(1), Pid(10), rect(100.0, 100.0)),
+            (w(2), Pid(10), rect(300.0, 200.0)),
+            (w(3), Pid(20), rect(500.0, 300.0)),
+        ]);
+        let mut b = EmulatedWorkspaces::new(3);
+        b.note_scan(&d, &d.scan());
+        b.move_window_to_workspace(&d, w(1), ws(2)).unwrap();
+        b.move_window_to_workspace(&d, w(2), ws(3)).unwrap();
+        assert!(
+            d.is_hidden(Pid(10)),
+            "dimming hid the app with nothing here"
+        );
+        b.take_trace();
+
+        b.switch_workspace(&d, ws(2));
+
+        assert_eq!(
+            d.frame(w(1)),
+            rect(100.0, 100.0),
+            "the wanted window is back"
+        );
+        assert!(
+            in_park_corner(&d.frame(w(2)), GEO),
+            "the un-hide dragged ws3's window back on screen: {:?}",
+            d.frame(w(2))
+        );
+        assert!(!d.is_hidden(Pid(10)));
+
+        // And the un-hide says what it cost, because a hold that quietly stops
+        // working looks exactly like one that works.
+        let trace = b.take_trace();
+        let shown = trace
+            .iter()
+            .find(|t| t.kind == ParkTraceKind::AppShown && t.pid == Some(Pid(10)))
+            .expect("the unhide is attributable");
+        let hold = shown.hold.as_ref().expect("with its hold on the record");
+        assert_eq!((hold.windows, hold.converged), (1, true));
+        assert!(hold.escaped.is_empty());
     }
 
     /// The trace exists because every other channel is laundered: the core is

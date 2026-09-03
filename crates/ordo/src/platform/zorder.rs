@@ -8,13 +8,18 @@
 //! moves a window in the global stack (examples/raise_probe.rs) — so an
 //! arbitrary order is spelled "raise each one, back-to-front".
 //!
+//! It is also where the cheap per-window window-server reads live — existence
+//! and bounds, neither of them z-order, but both the same list read and the
+//! same "no round trip to the app" property that makes the ordering gates
+//! affordable.
+//!
 //! One Tahoe quirk is a feature here: raises land BELOW the active app's key
 //! window, so callers should hand focus to the intended top window *before*
 //! restacking — the raises then slot in under it.
 
 use std::time::{Duration, Instant};
 
-use ordo_core::WindowId;
+use ordo_core::{Rect, WindowId};
 use ordo_skylight_sys as sys;
 
 use crate::ports::{RaiseKind, RaiseStat, RestackStats};
@@ -81,6 +86,40 @@ pub fn all_windows() -> Option<Vec<WindowId>> {
         None
     } else {
         Some(out)
+    }
+}
+
+/// Where the WINDOW SERVER says one window is — `None` while it doesn't know
+/// the window at all.
+///
+/// `kCGWindowListOptionIncludingWindow` alone, relative to the window itself:
+/// one descriptor, on screen or not, with no round trip to the owning app.
+/// That is what makes it safe to poll during an un-hide, when an AX read would
+/// queue behind the very order-in work being watched for — and it is the
+/// instrument the un-hide measurements were taken with. The `None` is
+/// meaningful there too: an un-hiding app's windows are missing from the list
+/// until they order back in.
+pub fn window_bounds(w: WindowId) -> Option<Rect> {
+    const INCLUDING_WINDOW: u32 = 1 << 3;
+    unsafe {
+        let arr = CGWindowListCopyWindowInfo(INCLUDING_WINDOW, w.0);
+        if arr.is_null() {
+            return None;
+        }
+        let out = (cf::array_len(arr) > 0)
+            .then(|| {
+                let d = cf::array_get(arr, 0) as sys::CFDictionaryRef;
+                let b = cf::dict_get(d, "kCGWindowBounds");
+                Some(Rect {
+                    x: cf::number_f64(cf::dict_get(b, "X"))?,
+                    y: cf::number_f64(cf::dict_get(b, "Y"))?,
+                    w: cf::number_f64(cf::dict_get(b, "Width"))?,
+                    h: cf::number_f64(cf::dict_get(b, "Height"))?,
+                })
+            })
+            .flatten();
+        sys::CFRelease(arr);
+        out
     }
 }
 

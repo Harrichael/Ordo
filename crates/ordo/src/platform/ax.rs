@@ -16,6 +16,7 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ptr::NonNull;
+use std::time::{Duration, Instant};
 
 use objc2_app_kit::{NSApplicationActivationPolicy, NSWorkspace};
 use objc2_application_services::{AXError, AXUIElement, AXValue, AXValueType};
@@ -308,6 +309,153 @@ pub fn set_app_hidden(pid: Pid, hidden: bool) {
     }
 }
 
+/// How long ONE un-hide may spend holding its parked windows at the corner
+/// before it gives up and lets the next enforcement pass clean up.
+///
+/// The measurements it has to cover: a window re-enters the window server's
+/// list at a median of 17-20ms after the un-hide (worst 63ms), and the hold
+/// converges within 19ms of that at worst — call it 82ms end to end. 250ms is
+/// three times that, and it is a per-app ceiling paid only by an app that
+/// never converges, since the loop exits the moment the window server agrees.
+/// The cost of exceeding it is bounded too: the un-hide simply reverts to
+/// today's behaviour (the window sits visible until enforcement re-parks it),
+/// which is why a generous bound is cheaper than a clever one.
+const HOLD_BUDGET: Duration = Duration::from_millis(250);
+
+/// What one un-hide's hold cost. `escaped` is the fact worth watching: a
+/// window listed there was left on screen for enforcement to find.
+pub struct HoldOutcome {
+    pub pid: Pid,
+    pub writes: u32,
+    pub elapsed_ms: u64,
+    pub escaped: Vec<WindowId>,
+}
+
+/// Un-hide these apps, holding each one's listed windows at the given origins
+/// through the reveal.
+///
+/// An un-hide is not the mirror of a hide. As the app's windows order back in,
+/// AppKit runs `constrainFrameRect:toScreen:` over each one and drags every
+/// window parked off the left edge fully back onto a display — measured
+/// deterministic (96/96), and the flash on every workspace switch.
+///
+/// Threaded per app for the same reason [`move_windows`] is: a switch un-hides
+/// several apps at once and must cost the slowest app's reveal, not the sum of
+/// them.
+pub fn show_apps(apps: &[(Pid, &[(WindowId, Point)])]) -> Vec<HoldOutcome> {
+    std::thread::scope(|scope| {
+        let running: Vec<_> = apps
+            .iter()
+            .map(|(pid, hold)| scope.spawn(move || show_app_holding(*pid, hold)))
+            .collect();
+        running.into_iter().filter_map(|h| h.join().ok()).collect()
+    })
+}
+
+/// Un-hide one app and keep writing `hold`'s origins until the window server
+/// reports the windows there.
+///
+/// The chase must VERIFY, never assume. Issuing the re-park once, immediately
+/// after the un-hide, was measured to end correctly parked in only 1-4 trials
+/// of 12: the app processes our position write BEFORE it orders the window in,
+/// and the order-in's constrain then overwrites it. Every one of those writes
+/// returned success, so nothing but the window server's own answer can settle
+/// whether the position stuck — which is exactly what a future "simplify this
+/// loop into one write" would throw away.
+fn show_app_holding(pid: Pid, hold: &[(WindowId, Point)]) -> HoldOutcome {
+    let started = Instant::now();
+    let el = unsafe { AXUIElement::new_application(pid.0) };
+    unsafe { el.set_messaging_timeout(MESSAGING_TIMEOUT_SECS) };
+    if hold.is_empty() {
+        // Nothing to lose to the reveal, and most un-hides are this: don't pay
+        // an AXWindows walk (a round trip to the app) to discover it.
+        unsafe { set_bool(&el, "AXHidden", false) };
+        return HoldOutcome {
+            pid,
+            writes: 0,
+            elapsed_ms: started.elapsed().as_millis() as u64,
+            escaped: Vec::new(),
+        };
+    }
+
+    // Resolve the window elements BEFORE the un-hide: an AXWindows walk is a
+    // round trip to the app, and once the reveal is under way that round trip
+    // queues behind the app's own order-in work — the very milliseconds the
+    // hold is racing for. The array is borrowed from, so it stays alive for
+    // the whole chase (same rule as `raise_sequenced`).
+    let raw = unsafe { copy_attr(&el, "AXWindows") };
+    let mut chase: Vec<(WindowId, Point, *const AXUIElement)> = Vec::new();
+    if let Some(raw) = raw {
+        unsafe {
+            for i in 0..super::cf::array_len(raw) {
+                let win = super::cf::array_get(raw, i) as *const AXUIElement;
+                let Some(id) = window_id(win) else { continue };
+                if let Some((_, at)) = hold.iter().find(|(w, _)| *w == id) {
+                    chase.push((id, *at, win));
+                }
+            }
+        }
+    }
+
+    let restore_eui = unsafe { disable_enhanced_ui(&el) };
+    unsafe { set_bool(&el, "AXHidden", false) };
+
+    let deadline = started + HOLD_BUDGET;
+    let mut writes = 0u32;
+    loop {
+        // A window absent from this read is mid-reveal and reads as "not
+        // there yet", which is the right answer: keep writing. Absence is what
+        // makes the loop safe to enter on a read — a hidden app's windows are
+        // genuinely missing from `kCGWindowListOptionIncludingWindow` (unlike
+        // the full list `existing_windows` uses, which keeps them), so the
+        // first read cannot report success before the order-in has happened.
+        chase.retain(|(w, at, _)| !holds_at(*w, *at));
+        if chase.is_empty() || Instant::now() >= deadline {
+            break;
+        }
+        // No sleep between rounds — each write is a synchronous round trip to
+        // the app, which is the only pacing this loop needs (~12 writes per
+        // window over a converging chase). A write the app REFUSES is a window
+        // that no longer exists; dropping it is what keeps a dead handle from
+        // spinning here until the budget runs out.
+        chase.retain(|(_, at, win)| {
+            writes += 1;
+            unsafe { set_point(&**win, "AXPosition", at.x, at.y) == AXError::Success }
+        });
+    }
+
+    unsafe {
+        if restore_eui {
+            set_bool(&el, "AXEnhancedUserInterface", true);
+        }
+        if let Some(raw) = raw {
+            sys::CFRelease(raw);
+        }
+    }
+
+    // Asked fresh rather than inferred from the loop, so a window that was
+    // never found in AXWindows or whose handle went stale is reported as
+    // escaped rather than silently counted as held.
+    HoldOutcome {
+        pid,
+        writes,
+        elapsed_ms: started.elapsed().as_millis() as u64,
+        escaped: hold
+            .iter()
+            .filter(|(w, at)| !holds_at(*w, *at))
+            .map(|(w, _)| *w)
+            .collect(),
+    }
+}
+
+/// Does the window server show this window at this origin? Position only, to
+/// the point: a park lands exactly (see `ordo_emulated`'s `park_frame`), and
+/// the window's size is its own business.
+fn holds_at(w: WindowId, at: Point) -> bool {
+    super::zorder::window_bounds(w)
+        .is_some_and(|b| (b.x - at.x).abs() <= 1.0 && (b.y - at.y).abs() <= 1.0)
+}
+
 /// Unhide every regular app — the rescue path's counterpart to dimming, so a
 /// kill switch never leaves apps invisible behind a dead daemon. Unconditional
 /// writes: reading hidden-ness first would just add a failure mode.
@@ -390,9 +538,9 @@ pub fn set_frame(target: WindowId, frame: Rect) -> bool {
         let win = unsafe { &*win };
         let restore_eui = unsafe { disable_enhanced_ui(app) };
         unsafe {
-            set_point(win, "AXPosition", frame.x, frame.y);
+            let _ = set_point(win, "AXPosition", frame.x, frame.y);
             set_size_attr(win, frame.w, frame.h);
-            set_point(win, "AXPosition", frame.x, frame.y);
+            let _ = set_point(win, "AXPosition", frame.x, frame.y);
             if restore_eui {
                 set_bool(app, "AXEnhancedUserInterface", true);
             }
@@ -441,7 +589,7 @@ fn move_app_windows(pid: i32, wins: &[(WindowId, Point)]) {
             let Some((_, at)) = wins.iter().find(|(w, _)| *w == id) else {
                 continue;
             };
-            set_point(&*win, "AXPosition", at.x, at.y);
+            let _ = set_point(&*win, "AXPosition", at.x, at.y);
         }
         if restore_eui {
             set_bool(&el, "AXEnhancedUserInterface", true);
@@ -506,16 +654,20 @@ unsafe fn set_bool(el: &AXUIElement, name: &str, value: bool) {
     let _ = el.set_attribute_value(&attr, cf);
 }
 
-unsafe fn set_point(el: &AXUIElement, name: &str, x: f64, y: f64) {
+/// The error is returned, not swallowed, for the one caller that can act on
+/// it: the un-hide hold, where a refused write means the window is gone and
+/// the chase should stop asking. Everywhere else a failed move is nothing a
+/// caller could do better than the next enforcement pass will.
+unsafe fn set_point(el: &AXUIElement, name: &str, x: f64, y: f64) -> AXError {
     let mut p = CGPoint { x, y };
     let Some(val) = AXValue::new(
         AXValueType::CGPoint,
         NonNull::new(&mut p as *mut _ as *mut c_void).unwrap(),
     ) else {
-        return;
+        return AXError::Failure;
     };
     let attr = CFString::from_str(name);
-    let _ = el.set_attribute_value(&attr, val.as_ref());
+    el.set_attribute_value(&attr, val.as_ref())
 }
 
 unsafe fn set_size_attr(el: &AXUIElement, w: f64, h: f64) {

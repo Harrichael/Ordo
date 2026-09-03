@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use ordo_core::{MonitorId, Pid, Point, Rect, WindowId, WorkspaceId};
-use ordo_emulated::{Desktop, EmulatedWorkspaces};
+use ordo_emulated::{Desktop, EmulatedWorkspaces, HoldStat, Unhide};
 
 use crate::backend::{
     BackendError, BackendTopology, Capabilities, MonitorWorkspace, Result, WorkspaceBackend,
@@ -31,8 +31,35 @@ impl Desktop for AxDesktop {
         ax::move_windows(moves);
     }
 
-    fn set_app_hidden(&self, pid: Pid, hidden: bool) {
-        ax::set_app_hidden(pid, hidden);
+    fn hide_app(&self, pid: Pid) {
+        ax::set_app_hidden(pid, true);
+    }
+
+    fn show_apps(&self, apps: &[Unhide]) -> Vec<HoldStat> {
+        let holds: Vec<(Pid, &[(WindowId, Point)])> =
+            apps.iter().map(|u| (u.pid, u.hold.as_slice())).collect();
+        ax::show_apps(&holds)
+            .into_iter()
+            .map(|o| {
+                if !o.escaped.is_empty() {
+                    eprintln!(
+                        "ordo: un-hiding pid {} left {} window(s) off the corner after {}ms",
+                        o.pid.0,
+                        o.escaped.len(),
+                        o.elapsed_ms
+                    );
+                }
+                HoldStat::new(
+                    o.pid,
+                    apps.iter()
+                        .find(|u| u.pid == o.pid)
+                        .map_or(0, |u| u.hold.len()),
+                    o.writes,
+                    o.elapsed_ms,
+                    o.escaped,
+                )
+            })
+            .collect()
     }
 
     fn focused_window(&self) -> Option<WindowId> {

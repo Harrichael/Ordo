@@ -66,6 +66,25 @@ pub unsafe fn number_i64(n: *const c_void) -> Option<i64> {
     }
 }
 
+/// Read a CFNumber as f64. Separate from [`number_i64`] because CoreGraphics
+/// window geometry is doubles, and asking for SInt64 back would truncate it.
+pub unsafe fn number_f64(n: *const c_void) -> Option<f64> {
+    if n.is_null() || sys::CFGetTypeID(n) != sys::CFNumberGetTypeID() {
+        return None;
+    }
+    let mut v: f64 = 0.0;
+    let ok = sys::CFNumberGetValue(
+        n,
+        sys::kCFNumberDoubleType,
+        &mut v as *mut f64 as *mut c_void,
+    );
+    if ok != 0 {
+        Some(v)
+    } else {
+        None
+    }
+}
+
 /// Read a CFString into a Rust String (best effort; None if it can't be
 /// materialized within a reasonable buffer).
 pub unsafe fn string_value(s: *const c_void) -> Option<String> {
