@@ -1,10 +1,10 @@
 //! The emulated workspace backend: Ordo owns workspaces outright.
 //!
 //! Everything lives in one native Space. A window on a hidden workspace is
-//! parked off-screen (flush to the bottom of the main display, right-aligned
-//! within it, a sliver left visible because macOS forcibly re-homes
-//! fully-off-screen windows). Switching parks the outgoing workspace's
-//! windows and restores the incoming one's to their saved frames.
+//! parked off-screen — slid left past the leftmost display at its own height,
+//! a 1pt sliver left visible because macOS forcibly re-homes fully-off-screen
+//! windows. Switching parks the outgoing workspace's windows and restores the
+//! incoming one's to their saved frames.
 //!
 //! Two kinds of data, and the split is the architecture: DECLARATIONS (a
 //! window's workspace, the visible workspace) are written only by Ordo's own
@@ -53,8 +53,8 @@ pub trait Desktop {
     /// Every display's frame. Needed because hiding a window is a question
     /// about the whole arrangement, not the main screen: macOS keeps a parked
     /// window's title bar on-screen, so only the HORIZONTAL escape hides it,
-    /// and escaping past the main display's right edge simply lands the window
-    /// on whatever display sits to the right.
+    /// and it has to clear the display at the end of the arrangement —
+    /// escaping past an interior edge just lands the window on the neighbour.
     fn displays(&self) -> Vec<Rect>;
     /// Which of `ids` still exist per the WINDOW SERVER's full window list —
     /// authoritative death evidence, unlike an AX scan (one slow app drops

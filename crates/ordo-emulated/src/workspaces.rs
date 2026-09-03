@@ -27,13 +27,19 @@ use crate::Desktop;
 /// manual escape hatch if Ordo dies mid-park.
 const SLIVER: f64 = 1.0;
 
-/// How far the WindowServer may move a frame from where a write asked, on the
-/// clamped (vertical) axis. Measured park landings: the bulk pulled back
-/// 27-65pt, with a 123-124pt tail from the era when the corner straddled a
-/// second display — and a 123pt strip is plainly readable, so this must never
-/// be an absolute "that's parked" box. It is only ever slack around a frame
-/// ORDO ITSELF REQUESTED (the x axis stays exact), where the worst
-/// misclassification is far cheaper than a missed one.
+/// How far the WindowServer may move one of Ordo's ON-SCREEN writes — a
+/// restore, a rehome, a rescue — from where it asked, on the clamped
+/// (vertical) axis: it pushes a frame down under the menu bar, and hoists the
+/// origin of a request too tall for its display up to that display's top
+/// inset. A park landing needs none of this any more: a park moves only x,
+/// which macOS never clamps, so it is compared to its request exactly.
+///
+/// What is left is slack around a frame ORDO ITSELF REQUESTED, serving the
+/// enforcement budget's own-write exemption and the retired park corners
+/// below. It stays generous on purpose: a false match leaves one violation
+/// uncounted (it is still corrected on the same pass), while a false mismatch
+/// charges Ordo's own write to the window — the leak that drained budgets
+/// until damping surrendered.
 const CLAMP_SLACK: f64 = 160.0;
 
 /// Foreign-attributed re-parks of an escaped window before enforcement stands
@@ -43,45 +49,58 @@ const CLAMP_SLACK: f64 = 160.0;
 /// the next switch or command.
 const ENFORCE_LIMIT: u8 = 3;
 
-/// The two rectangles park geometry depends on. They are NOT interchangeable,
-/// and conflating them is how a row of title bars ended up across the bottom
-/// of the main display (2026-09-01).
+/// The rectangles park geometry depends on. They are NOT interchangeable, and
+/// conflating them is how a row of title bars ended up across the bottom of
+/// the main display (2026-09-01).
 ///
 /// macOS refuses to push a window's title bar off the bottom of the screen it
-/// is on, so a parked window ALWAYS keeps roughly a title bar's height
-/// visible. Vertical hiding is therefore impossible; only the horizontal
-/// escape hides anything. Park past the main display's right edge and the
-/// window lands on whatever display sits to the right — Michael's second
-/// screen wore a 1470x66 band for weeks. Park inside the main display and that
-/// same unhideable strip becomes the window's full width, in plain view.
+/// is on, so vertical hiding is impossible; only the horizontal escape hides
+/// anything, and it has to clear a display with nothing beyond it to catch the
+/// window. Escaping RIGHT meant either dropping the window onto the next
+/// screen (Michael's second display wore a 1470x66 band for weeks) or aiming
+/// at the rightmost display's own bottom corner — where the write asked for a
+/// frame that display could not hold, and got a shorter one back.
 ///
-/// So the escape has to clear the RIGHTMOST display, and the y has to be that
-/// display's own bottom — not the arrangement's — or the request asks for a
-/// position further down than the host screen allows and the clamp grows by
-/// the difference.
+/// The escape goes LEFT instead: nothing sits left of the leftmost display,
+/// and x is the one axis macOS never clamps.
 #[derive(Clone, Copy, PartialEq, Debug)]
 struct Geometry {
     /// Where a window RETURNS to: a re-homed window must land where the user
     /// is looking.
     main: Rect,
-    /// The display windows hide PAST — the rightmost, so nothing lies beyond
+    /// The display windows hide PAST — the leftmost, so nothing lies beyond
     /// it to catch them.
     park_host: Rect,
+    /// The rightmost display: no longer a park target, only the corner
+    /// windows parked by builds up to 2026-09-02 still sit at. It is here so
+    /// [`in_park_corner`] can still recognize them; drop it once no live
+    /// window or state file can predate this change.
+    legacy_host: Rect,
 }
 
 impl Geometry {
     fn read(d: &dyn Desktop) -> Self {
         let main = d.main_display();
-        let park_host = d
-            .displays()
-            .into_iter()
+        let displays = d.displays();
+        let park_host = displays
+            .iter()
+            .copied()
+            .min_by(|a, b| a.x.total_cmp(&b.x).then(a.y.total_cmp(&b.y)))
+            .unwrap_or(main);
+        let legacy_host = displays
+            .iter()
+            .copied()
             .max_by(|a, b| {
                 (a.x + a.w)
                     .total_cmp(&(b.x + b.w))
                     .then((a.y + a.h).total_cmp(&(b.y + b.h)))
             })
             .unwrap_or(main);
-        Geometry { main, park_host }
+        Geometry {
+            main,
+            park_host,
+            legacy_host,
+        }
     }
 }
 
@@ -429,17 +448,16 @@ impl EmulatedWorkspaces {
             .collect()
     }
 
-    /// Is this window's observed frame at (a clamp of) the park corner Ordo
-    /// asked it to occupy? The request is the anchor: macOS pulls a parked
-    /// window back up from the corner by an amount that varies by app and
-    /// display, and guessing that pull-back with a constant misread 123pt
-    /// landings as escapes — spurious re-parks, a drained budget, and the raw
-    /// sliver frame fed to the core (which then mis-scoped MRU and monitor
-    /// attribution around a window "living" at the display corner).
+    /// Is this window's observed frame the park frame Ordo asked it to
+    /// occupy? Exactly it — the park write moves only x and macOS never
+    /// clamps x, so a compliant window is AT its request, not near it. The
+    /// request stays the anchor rather than a computed corner: a window's
+    /// park frame depends on its own width and y, and predicting where a
+    /// window "should" be parked once misread deep landings as escapes.
     fn at_park(&self, w: WindowId, f: &Rect) -> bool {
         self.park_request
             .get(&w)
-            .is_some_and(|req| clamp_of_request(f, req))
+            .is_some_and(|req| same_position(f, req))
     }
 
     /// `at_park`, plus the geometric fallback for frames with no request to
@@ -457,7 +475,8 @@ impl EmulatedWorkspaces {
     /// Enforcement asserts declarations by writing FRAMES; it never writes a
     /// declaration. Violations are classified by frame before they cost
     /// budget:
-    /// - at a clamp of the corner we last requested: compliant.
+    /// - at the park frame we last requested: compliant. An app that re-homes
+    ///   the window on un-hide is not at it, and is corrected, not tolerated.
     /// - at its own restore promise, or at any frame Ordo itself last wrote
     ///   (position match; size is the window's own): OUR write landed late
     ///   (or the app re-applied its autosaved frame — same response).
@@ -513,10 +532,7 @@ impl EmulatedWorkspaces {
                 self.pending_repark.remove(&w);
                 continue;
             }
-            let own_write = self
-                .saved
-                .get(&w)
-                .is_some_and(|s| (f.x - s.x).abs() <= 1.0 && (f.y - s.y).abs() <= 1.0)
+            let own_write = self.saved.get(&w).is_some_and(|s| same_position(f, s))
                 || self
                     .last_requested
                     .get(&w)
@@ -868,91 +884,88 @@ fn current_frames(d: &dyn Desktop) -> HashMap<WindowId, (Pid, Rect)> {
         .collect()
 }
 
-/// The park spot: flush to the bottom of the main display, right-aligned,
-/// keeping the window's size — so only `SLIVER` points remain visible.
+/// The park spot: the window slides LEFT until only `SLIVER` points of it
+/// remain on the leftmost display. Its y is left exactly as the window had it.
 ///
-/// The whole horizontal span stays on the main display. The old corner
-/// (x = right edge - SLIVER) hung the window's body across whatever sits to
-/// the right of main: the WindowServer then clamped one identical request
-/// against different displays — the same write landed anywhere from 27 to
-/// 124pt back up depending on which edge it consulted — and the overhang was
-/// a visible window-wide band on the second display even on a good landing.
-/// A window WIDER than main cannot fit; it is floored at main's left edge so
-/// its origin (and the left of its title bar) stays on main, accepting the
-/// unavoidable overhang on the right — the bottom-flush y still reduces it
-/// to a strip.
+/// Keeping the window's own y is what makes this write exact, and exactness is
+/// worth more than a smaller artifact. macOS never clamps x (measured: an
+/// origin 1453pt off the left edge was granted verbatim), and a y the window
+/// already occupies is a y it was already granted — so the frame that lands is
+/// the frame requested, to the point, and everything downstream can compare
+/// them exactly. Parking flush to a display's BOTTOM instead bought a shorter
+/// visible artifact (a 1pt x ~40pt dash rather than a 1pt column the height of
+/// the window) and paid in inexactness twice over: the WindowServer pulled the
+/// landing back up by an unpredictable, app-dependent amount, and the size
+/// riding along with the write was capped to the height of the display the
+/// origin landed on — which is how parking a tall window at a corner on the
+/// short second display filed 127pt off it, permanently, a park at a time.
 ///
-/// MIGRATION: windows persisted while parked at the old corner read as one
-/// violation on the first enforcement pass after this change and are
-/// re-parked once onto this corner (see `park_request` for why the same
-/// happens after any restart).
-fn park_frame(size: Rect, g: Geometry) -> Rect {
+/// The window's WIDTH is what the escape has to clear, so a window wider than
+/// the display simply starts further left; nothing lies out there to catch it.
+///
+/// MIGRATION: windows persisted while parked at a retired corner read as one
+/// violation on the first enforcement pass after this change and are re-parked
+/// once (see `park_request` for why the same happens after any restart).
+fn park_frame(f: Rect, g: Geometry) -> Rect {
     Rect {
-        x: g.park_host.x + g.park_host.w - SLIVER,
-        y: g.park_host.y + g.park_host.h - SLIVER,
-        w: size.w,
-        h: size.h,
+        x: g.park_host.x - f.w + SLIVER,
+        y: f.y,
+        w: f.w,
+        h: f.h,
     }
 }
 
-/// Did `observed` land where `requested` asked, modulo the WindowServer's
-/// clamp? Position is the parked invariant; size is the window's own.
-///
-/// GOTCHA: a parked window does NOT land where we asked. The WindowServer
-/// refuses to push a title bar off the bottom of the screen and pulls the
-/// window back UP by an amount that varies by app and display (measured:
-/// 27-65pt for most apps, 123-124pt in the straddling-corner era). x is the
-/// tight axis — nothing clamps horizontally once the span fits the display —
-/// so x must match the request; y may only sit at or above it, within
-/// CLAMP_SLACK. Anchoring on the REQUEST is what keeps this from guessing:
-/// an absolute corner-region constant either misses deep clamps (declaring
-/// compliant windows escaped — spurious re-parks, then a rewritten
-/// declaration) or grows wide enough to swallow readable windows.
-fn clamp_of_request(observed: &Rect, requested: &Rect) -> bool {
-    (observed.x - requested.x).abs() <= 1.0
-        && observed.y <= requested.y + 1.0
-        && observed.y >= requested.y - CLAMP_SLACK
+/// Are these two frames at the same position, modulo AX's rounding? Size is
+/// the window's own business on every path that asks.
+fn same_position(a: &Rect, b: &Rect) -> bool {
+    (a.x - b.x).abs() <= 1.0 && (a.y - b.y).abs() <= 1.0
 }
 
-/// Like [`clamp_of_request`], but direction-agnostic in y: the clamp pulls up
-/// at the bottom edge and pushes DOWN under the menu bar, and this comparator
-/// serves the enforcement budget's own-write exemption, where the writes in
-/// question (restores, rehomes) can land against either edge. A false match
-/// merely leaves one violation uncounted (it is still corrected); a false
-/// mismatch charges Ordo's own write to the window — the leak that drained
-/// budgets.
+/// Did one of Ordo's ON-SCREEN writes (a restore, a rehome, a rescue) land
+/// where it asked, modulo the WindowServer's vertical clamp? Those writes can
+/// be pushed down under the menu bar or hoisted up by a size cap, in either
+/// direction and by an app-dependent amount, so y is compared with
+/// [`CLAMP_SLACK`]; x still has to match, since nothing clamps horizontally.
+///
+/// Park writes deliberately do NOT come through here — they land exactly (see
+/// [`park_frame`]) and are compared with [`same_position`].
 fn near_own_request(observed: &Rect, requested: &Rect) -> bool {
     (observed.x - requested.x).abs() <= 1.0 && (observed.y - requested.y).abs() <= CLAMP_SLACK
 }
 
 /// Does this frame LOOK like a park artifact, with no request to anchor on?
-/// The fallback for frames whose park (if any) this process never issued:
-/// promises loaded from disk, windows already slivered when an R-mode blank
+/// The geometric fallback for frames whose park (if any) this process never
+/// issued: promises loaded from disk, windows parked by an older Ordo, the
+/// first pass after a restart, windows already slivered when an R-mode blank
 /// or a model gap meets them.
 ///
-/// x must right-align exactly to the window's own width (or sit at the
-/// pre-2026-09 1px corner) — an alignment no user placement hits by accident
-/// at this height, since y confines the window's TOP edge to the bottom
-/// CLAMP_SLACK points of the display: a window there shows less than a
-/// title bar's worth of itself. The consumers of this test share an
-/// asymmetry that tolerates its generosity: a false "parked" skips a promise
-/// capture or re-homes a window (recoverable, self-heals on the next park);
-/// a false "not parked" canonicalizes a park artifact as a window's real
-/// frame — a silent, durable lie persisted to disk.
-/// Geometric fallback for frames with no request to anchor on: promises loaded
-/// from disk, windows parked by an older Ordo, the first pass after a restart.
+/// The consumers of this test share an asymmetry that tolerates its
+/// generosity: a false "parked" skips a promise capture or re-homes a window
+/// (recoverable, self-heals on the next park); a false "not parked"
+/// canonicalizes a park artifact as a window's real frame — a silent, durable
+/// lie persisted to disk.
 ///
-/// Accepts the corner this Ordo parks at AND the two its predecessors used —
-/// the main display's right edge, and (briefly, on 2026-09-01) right-aligned
-/// inside the main display. A window still sitting at a retired corner must be
-/// recognized as parked, or park() captures that artifact as its real frame and
-/// persists the lie.
+/// It therefore accepts the corner this Ordo parks at AND all three its
+/// predecessors used, so an upgrade does not turn every already-parked window
+/// into a window whose "real frame" is a sliver. The retired ones can go once
+/// no live window or state file can predate this change.
 fn in_park_corner(f: &Rect, g: Geometry) -> bool {
     let near = |a: f64, b: f64| (a - b).abs() <= 1.0;
-    let corners = [
+    // The current corner: the window's whole body off the left of the leftmost
+    // display, at whatever y it already had — so y says nothing here, and only
+    // the width-derived x does. No user placement lands there by accident.
+    if near(f.x, g.park_host.x - f.w + SLIVER) {
+        return true;
+    }
+    // The retired corners, all bottom-flush: the rightmost display's bottom
+    // right (through 2026-09-02), the main display's right edge, and — briefly,
+    // on 2026-09-01 — right-aligned inside the main display. y confines the
+    // window's TOP edge to the bottom CLAMP_SLACK points of the display, where
+    // it shows less than a title bar's worth of itself.
+    let retired = [
         (
-            g.park_host.x + g.park_host.w - SLIVER,
-            g.park_host.y + g.park_host.h - SLIVER,
+            g.legacy_host.x + g.legacy_host.w - SLIVER,
+            g.legacy_host.y + g.legacy_host.h - SLIVER,
         ),
         (g.main.x + g.main.w - SLIVER, g.main.y + g.main.h - SLIVER),
         (
@@ -960,7 +973,7 @@ fn in_park_corner(f: &Rect, g: Geometry) -> bool {
             g.main.y + g.main.h - SLIVER,
         ),
     ];
-    corners
+    retired
         .iter()
         .any(|(cx, cy)| near(f.x, *cx) && f.y <= cy + 1.0 && f.y >= cy - CLAMP_SLACK)
 }
@@ -1059,27 +1072,32 @@ mod tests {
 
     const GEO: Geometry = Geometry {
         main: MAIN,
-        park_host: SECOND,
+        park_host: MAIN,
+        legacy_host: SECOND,
     };
 
     fn displays() -> [Rect; 2] {
         [MAIN, SECOND]
     }
 
-    /// How much of `f` is visible on any display — the only question that
-    /// actually matters about a parked window.
-    fn visible_area(f: &Rect) -> f64 {
+    /// What each display keeps for itself at the top, measured on Michael's
+    /// rig: main hands a window at most 1050 of its 1080, the second 923 of
+    /// its 956. This is the whole difference between a park that hides a
+    /// window and a park that files 127pt off it.
+    fn usable_inset(d: Rect) -> f64 {
+        if d == MAIN {
+            30.0
+        } else {
+            33.0
+        }
+    }
+
+    /// The widest strip of `f` any display still shows. The park hides a
+    /// window horizontally, so this is the axis the invariant lives on.
+    fn visible_width(f: &Rect) -> f64 {
         displays()
             .iter()
-            .map(|d| {
-                let w = (f.x + f.w).min(d.x + d.w) - f.x.max(d.x);
-                let h = (f.y + f.h).min(d.y + d.h) - f.y.max(d.y);
-                if w > 0.0 && h > 0.0 {
-                    w * h
-                } else {
-                    0.0
-                }
-            })
+            .map(|d| ((f.x + f.w).min(d.x + d.w) - f.x.max(d.x)).max(0.0))
             .fold(0.0, f64::max)
     }
 
@@ -1095,6 +1113,11 @@ mod tests {
         /// measured in production (124pt), which no constant-box predicate
         /// survived.
         pull: std::cell::Cell<f64>,
+        /// Write AXPosition alone, leaving AXSize untouched — measured never
+        /// to resize a window, at any origin. Ordo's writes still carry a
+        /// size, so this is off by default; it is here because the size clamp
+        /// below only has meaning against a write that does NOT carry one.
+        position_only: std::cell::Cell<bool>,
     }
 
     impl FakeDesktop {
@@ -1106,6 +1129,7 @@ mod tests {
                 frozen: std::cell::Cell::new(false),
                 cg_down: std::cell::Cell::new(false),
                 pull: std::cell::Cell::new(28.0),
+                position_only: std::cell::Cell::new(false),
             }
         }
 
@@ -1152,30 +1176,46 @@ mod tests {
                 .collect()
         }
 
-        /// Writes land CLAMPED, as the real WindowServer lands them: a window
-        /// may not be positioned with its title bar below the bottom of the
-        /// display. A fake that stores frames verbatim is a fake that cannot
-        /// reproduce parking, which is how an exact-point park predicate
-        /// passed every test here and fought every window in production.
+        /// Writes land CLAMPED, as the real WindowServer lands them, on BOTH
+        /// axes a write can carry. A fake that stores frames verbatim is a
+        /// fake that cannot reproduce parking, which is how an exact-point
+        /// park predicate passed every test here and fought every window in
+        /// production — and the missing SIZE clamp is how a park that shrank
+        /// the author's windows by 58pt shipped past twenty tests.
         fn set_frames(&self, writes: &[(Pid, WindowId, Rect)]) {
             if self.frozen.get() {
                 return;
             }
             let mut ws = self.windows.borrow_mut();
             for (pid, w, f) in writes {
+                let mut landed = *f;
+                if self.position_only.get() {
+                    landed.w = ws[w].1.w;
+                    landed.h = ws[w].1.h;
+                } else {
+                    // A write carrying a size is capped to the usable height of
+                    // the display owning the ORIGIN — an origin off to the left
+                    // of every display is main's — and a request that does not
+                    // fit also loses its y to that display's top inset.
+                    let owner = displays()
+                        .into_iter()
+                        .find(|d| f.x >= d.x && f.x < d.x + d.w && f.y >= d.y && f.y < d.y + d.h)
+                        .unwrap_or(MAIN);
+                    let inset = usable_inset(owner);
+                    if landed.h > owner.h - inset {
+                        landed.h = owner.h - inset;
+                        landed.y = owner.y + inset;
+                    }
+                }
                 // macOS keeps the title bar reachable on whichever display the
                 // window sits over, so the floor differs per display — the
                 // fact that made one park request land at three heights.
                 let host = displays()
                     .into_iter()
-                    .filter(|d| f.x < d.x + d.w && f.x + f.w > d.x)
-                    .min_by(|a, b| (f.x - a.x).abs().total_cmp(&(f.x - b.x).abs()))
+                    .filter(|d| landed.x < d.x + d.w && landed.x + landed.w > d.x)
+                    .min_by(|a, b| (landed.x - a.x).abs().total_cmp(&(landed.x - b.x).abs()))
                     .unwrap_or(MAIN);
-                let floor = host.y + host.h - self.pull.get();
-                let landed = Rect {
-                    y: f.y.min(floor),
-                    ..*f
-                };
+                landed.y = landed.y.min(host.y + host.h - self.pull.get());
                 ws.insert(*w, (*pid, landed));
             }
         }
@@ -1387,18 +1427,28 @@ mod tests {
             w: 1470.0,
             h: 900.0,
         };
+        // The corner the build shipping before this one used: the rightmost
+        // display's own bottom-right. Every window parked at the moment of the
+        // upgrade is sitting here.
+        let retired_right = Rect {
+            x: SECOND.x + SECOND.w - SLIVER,
+            y: SECOND.y + SECOND.h - 33.0,
+            w: 1528.0,
+            h: 923.0,
+        };
         let frames: HashMap<WindowId, (Pid, Rect)> = [
             (w(1), (Pid(42), sliver)),
             (w(2), (Pid(42), rect(50.0, 60.0))),
             (w(3), (Pid(42), deep)),
             (w(4), (Pid(42), legacy)),
+            (w(5), (Pid(42), retired_right)),
         ]
         .into();
 
-        // A window already at a park artifact — the ideal corner, a deep
-        // clamp, or the legacy corner: bookkept as parked, but its (unknown)
-        // real frame is never fabricated from the artifact.
-        for id in [w(1), w(3), w(4)] {
+        // A window already at a park artifact — the current corner, a deep
+        // clamp, or either retired corner: bookkept as parked, but its
+        // (unknown) real frame is never fabricated from the artifact.
+        for id in [w(1), w(3), w(4), w(5)] {
             assert_eq!(b.park(id, None, &frames, GEO), None, "{id:?}");
             assert!(b.parked.contains(&id));
             assert!(!b.saved.contains_key(&id), "{id:?} captured an artifact");
@@ -1410,38 +1460,101 @@ mod tests {
         assert_eq!(write.2, park_frame(rect(50.0, 60.0), GEO));
     }
 
-    /// The park request must not straddle a neighboring display: the old
-    /// corner (x = right edge - 1) hung the window's body across whatever sat
-    /// to the right of main, where the WindowServer clamped the identical
-    /// request against different displays (same write, landings 27-124pt
-    /// apart) and the overhang was a visible window-wide band.
+    /// The park request must clear every display: an earlier corner
+    /// (x = main's right edge - 1) hung the window's body across whatever sat
+    /// to the right of main, and its successor left the body on the rightmost
+    /// display's own screen. macOS will not hide a title bar vertically, so
+    /// the horizontal escape is the only thing doing any hiding, and how much
+    /// of it survives on ANY screen is the whole question.
     #[test]
     fn a_parked_window_is_invisible_on_every_display() {
-        // The invariant that matters, and the one both previous corners broke:
-        // not "where is the origin" but "how much of this window can the user
-        // still see". macOS will not hide the title bar vertically, so the
-        // only question is whether the horizontal escape cleared every screen.
         for size in [(1470.0, 900.0), (800.0, 600.0), (MAIN.w + 500.0, 900.0)] {
-            let f = Rect {
-                x: 100.0,
-                y: 100.0,
-                w: size.0,
-                h: size.1,
-            };
-            let want = park_frame(f, GEO);
-            // As the WindowServer would actually land it, title bar and all.
-            let landed = Rect {
-                y: (want.y).min(SECOND.y + SECOND.h - 28.0),
-                ..want
-            };
-            let seen = visible_area(&landed);
-            assert!(
-                seen <= 2.0 * 28.0,
-                "a parked {}x{} window still shows {seen}px2 at {landed:?}",
-                size.0,
-                size.1
-            );
+            for y in [0.0, 100.0, MAIN.h - 200.0] {
+                let f = Rect {
+                    x: 100.0,
+                    y,
+                    w: size.0,
+                    h: size.1,
+                };
+                let d = FakeDesktop::new(&[(w(1), Pid(10), f)]);
+                d.set_frames(&[(Pid(10), w(1), park_frame(f, GEO))]);
+                let landed = d.frame(w(1));
+                let seen = visible_width(&landed);
+                assert!(
+                    seen <= SLIVER,
+                    "a parked {}x{} window at y={y} still shows a {seen}pt strip at {landed:?}",
+                    size.0,
+                    size.1
+                );
+                assert_eq!(landed, park_frame(f, GEO), "and it landed exactly");
+            }
         }
+    }
+
+    /// The ratchet, pinned: hiding a window must never RESIZE it. The park
+    /// write carries the window's size, so aiming it at a corner on the short
+    /// second display asked for a frame that display could not hold; the
+    /// WindowServer granted a shorter one, and the next park recorded THAT as
+    /// the window's real frame. Michael's Chrome lost 58pt and his kitty 59pt
+    /// this way, permanently, a few points per switch.
+    #[test]
+    fn parking_a_tall_window_never_shrinks_it() {
+        // Taller than the second display can hold (923), comfortably within
+        // main's 1050 — the shape of every window the ratchet ate.
+        let tall = Rect {
+            x: 0.0,
+            y: 157.0,
+            w: 1528.0,
+            h: 1050.0,
+        };
+        let d = FakeDesktop::new(&[(w(1), Pid(10), tall), (w(2), Pid(20), rect(300.0, 200.0))]);
+        let mut b = EmulatedWorkspaces::new(3);
+        b.note_scan(&d, &d.scan());
+
+        b.move_window_to_workspace(&d, w(1), ws(2)).unwrap();
+        for round in 1..=2 {
+            assert_eq!(
+                d.frame(w(1)).h,
+                tall.h,
+                "the park shrank the window (round {round})"
+            );
+            assert_eq!(b.saved[&w(1)], tall, "the promise shrank (round {round})");
+            b.switch_workspace(&d, ws(2)); // restore
+            assert_eq!(d.frame(w(1)), tall, "came back short (round {round})");
+            b.switch_workspace(&d, ws(1)); // park again
+        }
+        assert_eq!(d.frame(w(1)).h, tall.h);
+    }
+
+    /// The one place the park is still not exact, pinned for the commit that
+    /// closes it: the write carries the window's SIZE, so a window taller than
+    /// the display owning the park origin (main, for an origin off to the
+    /// left) still comes back shorter. No window on Michael's rig can be —
+    /// main is the tallest screen there — but a rig whose external display is
+    /// taller than main has them. Writing AXPosition alone, which was measured
+    /// never to resize a window at any origin, is what removes the exposure.
+    #[test]
+    fn only_the_size_riding_along_with_a_park_can_still_shorten_a_window() {
+        let over_tall = Rect {
+            x: 0.0,
+            y: 200.0,
+            w: 900.0,
+            h: 1200.0,
+        };
+        let want = park_frame(over_tall, GEO);
+
+        let d = FakeDesktop::new(&[(w(1), Pid(10), over_tall)]);
+        d.set_frames(&[(Pid(10), w(1), want)]);
+        assert_eq!(
+            d.frame(w(1)).h,
+            MAIN.h - 30.0,
+            "capped to what main can hold"
+        );
+
+        let d = FakeDesktop::new(&[(w(1), Pid(10), over_tall)]);
+        d.position_only.set(true);
+        d.set_frames(&[(Pid(10), w(1), want)]);
+        assert_eq!(d.frame(w(1)), want, "position alone moves without resizing");
     }
 
     #[test]
@@ -1651,15 +1764,15 @@ mod tests {
         assert_eq!(d.frame(w(1)), rect(100.0, 100.0), "restored to its promise");
     }
 
-    /// The regression that made the emulated backend unusable: macOS lands a
-    /// parked window pulled back up from the corner we asked for — measured
-    /// anywhere from a title bar (27pt) to 124pt, varying by app and display —
-    /// so a compliant window read as an escapee on every pass: re-parked
-    /// forever, its budget drained, the raw sliver fed to the core. The
-    /// landing must read as compliance at ANY clamp depth, because the
-    /// landing is a clamp of what WE requested, not a spot to guess at.
+    /// The bottom clamp is what made the emulated backend unusable: macOS
+    /// landed a parked window pulled back up from the corner by an
+    /// app-dependent 27-124pt, so a compliant window read as an escapee on
+    /// every pass — re-parked forever, budget drained, the raw sliver fed to
+    /// the core. Parking sideways at the window's own y takes the clamp out
+    /// of the mechanism entirely: however deep this WindowServer's pull-back
+    /// is, the park never goes near the bottom edge and lands exactly.
     #[test]
-    fn a_park_that_lands_where_macos_puts_it_is_compliance_not_escape() {
+    fn a_park_lands_exactly_however_deep_the_bottom_clamp_is() {
         // 124pt is the deepest landing in the production logs — well past any
         // title-bar-sized allowance.
         for pull in [28.0, 65.0, 124.0] {
@@ -1672,10 +1785,12 @@ mod tests {
             b.note_scan(&d, &d.scan());
             b.move_window_to_workspace(&d, w(1), ws(2)).unwrap();
 
-            // The landed frame is NOT the requested corner — that is the
-            // whole point — but it is still parked.
             let landed = d.frame(w(1));
-            assert!(landed.y <= MAIN.h - pull, "macOS pulled it back up");
+            assert_eq!(
+                landed,
+                park_frame(rect(100.0, 100.0), GEO),
+                "the park landed where it asked, size and all, at pull {pull}"
+            );
 
             // Enforcement must leave it alone indefinitely: no budget spent,
             // no rewrite of anything, no write churn against a window that is
@@ -1759,16 +1874,17 @@ mod tests {
     /// The restart / corner-migration wrinkle, pinned: park requests are not
     /// persisted, so after a restart a parked window has no anchor and reads
     /// as ONE violation — it is re-parked once (which also migrates windows
-    /// parked at the legacy straddling corner onto the in-display corner) and
-    /// then reads compliant, with its declaration and promise untouched.
+    /// parked at a retired corner onto the current one) and then reads
+    /// compliant, with its declaration and promise untouched.
     #[test]
     fn a_restart_reasserts_each_parked_window_once() {
-        // As a restart finds things: bookkept parked with a good promise,
-        // physically at the LEGACY corner (x at the display edge), no
+        // As the upgrade finds things: bookkept parked with a good promise,
+        // physically at the corner the previous build used (the rightmost
+        // display's bottom right, pulled back up by its clamp), no
         // park_request memory.
         let legacy_landing = Rect {
-            x: MAIN.w - SLIVER,
-            y: MAIN.h - 65.0,
+            x: SECOND.x + SECOND.w - SLIVER,
+            y: SECOND.y + SECOND.h - 65.0,
             w: 800.0,
             h: 600.0,
         };
@@ -1786,9 +1902,10 @@ mod tests {
         assert_eq!(b.enforce_attempts.get(&w(1)), Some(&1), "one violation");
         let migrated = d.frame(w(1));
         assert!(
-            visible_area(&migrated) <= 2.0 * 28.0,
+            visible_width(&migrated) <= SLIVER,
             "re-parked out of sight: {migrated:?}"
         );
+        assert_eq!(migrated.h, legacy_landing.h, "and not resized on the way");
 
         // With the anchor re-established, the next passes are quiet.
         for _ in 0..3 {
