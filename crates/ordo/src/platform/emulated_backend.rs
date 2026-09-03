@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use ordo_core::{MonitorId, Pid, Rect, WindowId, WorkspaceId};
+use ordo_core::{MonitorId, Pid, Point, Rect, WindowId, WorkspaceId};
 use ordo_emulated::{Desktop, EmulatedWorkspaces};
 
 use crate::backend::{
@@ -27,8 +27,8 @@ impl Desktop for AxDesktop {
             .collect()
     }
 
-    fn set_frames(&self, writes: &[(Pid, WindowId, Rect)]) {
-        ax::set_frames(writes);
+    fn move_windows(&self, moves: &[(Pid, WindowId, Point)]) {
+        ax::move_windows(moves);
     }
 
     fn set_app_hidden(&self, pid: Pid, hidden: bool) {

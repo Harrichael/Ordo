@@ -74,7 +74,10 @@ pub struct ParkTrace {
     pub current: Option<WorkspaceId>,
     pub observed: Option<Rect>,
     pub believed: Option<Rect>,
-    /// The frame handed to the OS, when this record is a write.
+    /// The frame the model aimed at, when this record is a write. Only its
+    /// ORIGIN reaches the OS — this backend moves windows and never resizes
+    /// them — so a size here that differs from `observed` is the window's own,
+    /// not a resize anyone asked for.
     pub requested: Option<Rect>,
     /// Whether the observed frame read as sitting at the park corner. The
     /// predicate's own answer, so a wrong one is visible after the fact.

@@ -20,7 +20,7 @@ use std::ptr::NonNull;
 use objc2_app_kit::{NSApplicationActivationPolicy, NSWorkspace};
 use objc2_application_services::{AXError, AXUIElement, AXValue, AXValueType};
 use objc2_core_foundation::{CFBoolean, CFString, CFType, CGPoint, CGSize};
-use ordo_core::{Pid, Rect, WindowId};
+use ordo_core::{Pid, Point, Rect, WindowId};
 use ordo_skylight_sys as sys;
 
 /// A quarter second: long enough for a healthy app to answer, short enough that
@@ -401,28 +401,32 @@ pub fn set_frame(target: WindowId, frame: Rect) -> bool {
     .is_some()
 }
 
-/// Apply a batch of frame writes, grouped by owning app, one thread per app.
+/// Move a batch of windows to new origins, grouped by owning app, one thread
+/// per app. Sizes are never touched: unlike [`set_frame`]'s cross-display move,
+/// this is the emulated backend's park/restore path, where a window's size is
+/// the window's own business and a size write is only an opportunity for the
+/// WindowServer to cap it (see `ordo_emulated::Desktop::move_windows`).
 ///
-/// This exists because a switch is only as instant as its slowest serialization:
-/// one `set_frame` per window re-walks every app's window list per write, so a
-/// multi-window switch rippled visibly across the screen (and across monitors,
-/// one after the other). Grouping gives one walk per app; the per-app threads
-/// make the whole batch land in the time of the slowest *app*, not the sum of
-/// all writes. AX is just Mach IPC and safe off the main thread — each thread
-/// builds its own app element rather than sharing one.
-pub fn set_frames(writes: &[(Pid, WindowId, Rect)]) {
-    let mut by_app: HashMap<i32, Vec<(WindowId, Rect)>> = HashMap::new();
-    for (pid, w, f) in writes {
-        by_app.entry(pid.0).or_default().push((*w, *f));
+/// The batching exists because a switch is only as instant as its slowest
+/// serialization: one `set_frame` per window re-walks every app's window list
+/// per write, so a multi-window switch rippled visibly across the screen (and
+/// across monitors, one after the other). Grouping gives one walk per app; the
+/// per-app threads make the whole batch land in the time of the slowest *app*,
+/// not the sum of all writes. AX is just Mach IPC and safe off the main thread —
+/// each thread builds its own app element rather than sharing one.
+pub fn move_windows(moves: &[(Pid, WindowId, Point)]) {
+    let mut by_app: HashMap<i32, Vec<(WindowId, Point)>> = HashMap::new();
+    for (pid, w, p) in moves {
+        by_app.entry(pid.0).or_default().push((*w, *p));
     }
     std::thread::scope(|scope| {
         for (pid, wins) in by_app {
-            scope.spawn(move || apply_app_frames(pid, &wins));
+            scope.spawn(move || move_app_windows(pid, &wins));
         }
     });
 }
 
-fn apply_app_frames(pid: i32, wins: &[(WindowId, Rect)]) {
+fn move_app_windows(pid: i32, wins: &[(WindowId, Point)]) {
     let el = unsafe { AXUIElement::new_application(pid) };
     unsafe { el.set_messaging_timeout(MESSAGING_TIMEOUT_SECS) };
     let Some(raw) = (unsafe { copy_attr(&el, "AXWindows") }) else {
@@ -434,13 +438,10 @@ fn apply_app_frames(pid: i32, wins: &[(WindowId, Rect)]) {
         for i in 0..super::cf::array_len(raw) {
             let win = super::cf::array_get(raw, i) as *const AXUIElement;
             let Some(id) = window_id(win) else { continue };
-            let Some((_, frame)) = wins.iter().find(|(w, _)| *w == id) else {
+            let Some((_, at)) = wins.iter().find(|(w, _)| *w == id) else {
                 continue;
             };
-            let win = &*win;
-            set_point(win, "AXPosition", frame.x, frame.y);
-            set_size_attr(win, frame.w, frame.h);
-            set_point(win, "AXPosition", frame.x, frame.y);
+            set_point(&*win, "AXPosition", at.x, at.y);
         }
         if restore_eui {
             set_bool(&el, "AXEnhancedUserInterface", true);

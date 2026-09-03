@@ -15,7 +15,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 
-use ordo_core::{Pid, Rect, WindowId, WorkspaceId};
+use ordo_core::{Pid, Point, Rect, WindowId, WorkspaceId};
 
 use crate::ledger::{Claim, Ledger, MoveAction};
 use crate::statefile::{self, PersistedState, PersistedWindow};
@@ -110,7 +110,9 @@ pub struct WorkspaceOutOfRange(pub WorkspaceId);
 
 pub struct EmulatedWorkspaces {
     ledger: Ledger,
-    /// On-screen frame to restore each parked window to.
+    /// The real on-screen frame each parked window was taken from. Whole,
+    /// because it is what the core is told the window's frame IS while the
+    /// window is really a sliver; only its origin is written back on restore.
     saved: HashMap<WindowId, Rect>,
     /// Windows currently parked off-screen. Tracked so re-parking an
     /// already-parked window (a hidden->hidden move) doesn't overwrite its real
@@ -131,7 +133,9 @@ pub struct EmulatedWorkspaces {
     /// The last frame Ordo asked the OS to give each window, whatever the
     /// reason (park, restore, rehome, rescue). A window observed at (a clamp
     /// of) this frame is our own write landing late, never an app fighting
-    /// back — charging those drained the enforcement budget against us.
+    /// back — charging those drained the enforcement budget against us. Only
+    /// the origin was ever sent, and only the origin is ever compared; the
+    /// size rides along because callers hand whole rects.
     last_requested: HashMap<WindowId, Rect>,
     /// Windows with an uncounted re-park issued and not yet observed
     /// compliant. Gates the suppressed path's WRITES, not just its counting:
@@ -268,14 +272,22 @@ impl EmulatedWorkspaces {
         }
     }
 
-    /// Every frame write funnels through here so the model remembers what it
-    /// asked for — the only way to later tell "our write landing" apart from
-    /// "an app fighting back".
-    fn write_frames(&mut self, d: &dyn Desktop, writes: &[(Pid, WindowId, Rect)]) {
+    /// Every write funnels through here so the model remembers what it asked
+    /// for — the only way to later tell "our write landing" apart from "an app
+    /// fighting back".
+    ///
+    /// Callers compute a whole target `Rect` because that is what the promise
+    /// and the trace are about, but only its ORIGIN is sent: this model moves
+    /// windows, it never resizes them ([`Desktop::move_windows`]).
+    fn move_windows(&mut self, d: &dyn Desktop, writes: &[(Pid, WindowId, Rect)]) {
         for (_, w, f) in writes {
             self.last_requested.insert(*w, *f);
         }
-        d.set_frames(writes);
+        let moves: Vec<(Pid, WindowId, Point)> = writes
+            .iter()
+            .map(|(pid, w, f)| (*pid, *w, Point { x: f.x, y: f.y }))
+            .collect();
+        d.move_windows(&moves);
     }
 
     pub fn switch_workspace(&mut self, d: &dyn Desktop, target: WorkspaceId) {
@@ -312,7 +324,7 @@ impl EmulatedWorkspaces {
         // still stands. Whether that ordering is SUFFICIENT is the open
         // question: it cannot stop an app from restoring its own geometry in
         // response to being un-hidden, which is what the trace is here to show.
-        self.write_frames(d, &writes);
+        self.move_windows(d, &writes);
         self.apply_app_visibility(d, &frames);
     }
 
@@ -330,7 +342,7 @@ impl EmulatedWorkspaces {
             None => return Err(WorkspaceOutOfRange(target)),
         };
         self.persist();
-        self.write_frames(d, write.as_slice());
+        self.move_windows(d, write.as_slice());
         self.apply_app_visibility(d, &frames);
         Ok(())
     }
@@ -472,7 +484,7 @@ impl EmulatedWorkspaces {
     /// park time) is still declared hidden, and a parked-set walk was blind
     /// to it forever.
     ///
-    /// Enforcement asserts declarations by writing FRAMES; it never writes a
+    /// Enforcement asserts declarations by MOVING windows; it never writes a
     /// declaration. Violations are classified by frame before they cost
     /// budget:
     /// - at the park frame we last requested: compliant. An app that re-homes
@@ -628,7 +640,7 @@ impl EmulatedWorkspaces {
         if newly_parked {
             self.persist();
         }
-        self.write_frames(d, &writes);
+        self.move_windows(d, &writes);
     }
 
     pub fn rescue_window(&mut self, d: &dyn Desktop, window: WindowId) {
@@ -643,7 +655,7 @@ impl EmulatedWorkspaces {
         );
         let write = self.restore(window, &frames, Geometry::read(d));
         self.persist();
-        self.write_frames(d, write.as_slice());
+        self.move_windows(d, write.as_slice());
     }
 
     /// Replace the in-memory model with the state file's, when it validates.
@@ -772,6 +784,20 @@ impl EmulatedWorkspaces {
         Some((pid, window, want))
     }
 
+    /// Send a parked window back to its promise — its POSITION, and only that,
+    /// even when the promise's size and the window's differ.
+    ///
+    /// That gap is real: a window ratcheted short by an older build, or one an
+    /// app resized while it sat parked, comes back at the size it has now and
+    /// not the one the promise records. Re-imposing the promised size would put
+    /// the capped write back on the path where it is likeliest to be wrong — a
+    /// size that differs is, by construction, one the WindowServer or the app
+    /// has already refused once, and asking again risks the same cap plus the
+    /// y-hoist that comes with it. Worse, the model cannot tell a height Ordo
+    /// stole from a height the user or the app deliberately changed, so
+    /// re-asserting it would override a live intent with a stale observation.
+    /// The promise stays whole for the core's benefit; the window keeps its own
+    /// size, and the next park records what the window really is.
     fn restore(
         &mut self,
         window: WindowId,
@@ -890,15 +916,12 @@ fn current_frames(d: &dyn Desktop) -> HashMap<WindowId, (Pid, Rect)> {
 /// Keeping the window's own y is what makes this write exact, and exactness is
 /// worth more than a smaller artifact. macOS never clamps x (measured: an
 /// origin 1453pt off the left edge was granted verbatim), and a y the window
-/// already occupies is a y it was already granted — so the frame that lands is
-/// the frame requested, to the point, and everything downstream can compare
-/// them exactly. Parking flush to a display's BOTTOM instead bought a shorter
-/// visible artifact (a 1pt x ~40pt dash rather than a 1pt column the height of
-/// the window) and paid in inexactness twice over: the WindowServer pulled the
-/// landing back up by an unpredictable, app-dependent amount, and the size
-/// riding along with the write was capped to the height of the display the
-/// origin landed on — which is how parking a tall window at a corner on the
-/// short second display filed 127pt off it, permanently, a park at a time.
+/// already occupies is a y it was already granted — so the position that lands
+/// is the position requested, to the point, and everything downstream can
+/// compare them exactly. Parking flush to a display's BOTTOM instead bought a
+/// shorter visible artifact (a 1pt x ~40pt dash rather than a 1pt column the
+/// height of the window) and paid for it with the WindowServer pulling the
+/// landing back up by an unpredictable, app-dependent amount.
 ///
 /// The window's WIDTH is what the escape has to clear, so a window wider than
 /// the display simply starts further left; nothing lies out there to catch it.
@@ -978,15 +1001,18 @@ fn in_park_corner(f: &Rect, g: Geometry) -> bool {
         .any(|(cx, cy)| near(f.x, *cx) && f.y <= cy + 1.0 && f.y >= cy - CLAMP_SLACK)
 }
 
-/// Re-home a frame fully inside `area` (top-left, shrunk if oversized) — the
-/// no-cascade twin of the rescue gather's clamp, for the lone promise-less
-/// window a restore must not leave as a sliver.
+/// Re-home a frame to `area`'s top-left — the no-cascade twin of the rescue
+/// gather's clamp, for the lone promise-less window a restore must not leave as
+/// a sliver. Reaching the window is the whole job, and its title bar at the
+/// display's origin is reachable whatever its size, so an oversized window is
+/// left oversized: a shrink here would be a size this model asked for and never
+/// got (the write carries only the origin), i.e. a request contradicted the
+/// moment it lands.
 fn rehome_into(f: &Rect, area: Rect) -> Rect {
     Rect {
         x: area.x,
         y: area.y,
-        w: f.w.min(area.w),
-        h: f.h.min(area.h),
+        ..*f
     }
 }
 
@@ -1101,9 +1127,9 @@ mod tests {
             .fold(0.0, f64::max)
     }
 
-    /// A desktop where frame writes land instantly — enough to drive the whole
-    /// backend through the port without a real window. `freeze()` makes later
-    /// writes vanish, simulating an app that hasn't applied them yet.
+    /// A desktop where moves land instantly — enough to drive the whole backend
+    /// through the port without a real window. `freeze()` makes later writes
+    /// vanish, simulating an app that hasn't applied them yet.
     struct FakeDesktop {
         windows: std::cell::RefCell<BTreeMap<WindowId, (Pid, Rect)>>,
         frozen: std::cell::Cell<bool>,
@@ -1113,11 +1139,6 @@ mod tests {
         /// measured in production (124pt), which no constant-box predicate
         /// survived.
         pull: std::cell::Cell<f64>,
-        /// Write AXPosition alone, leaving AXSize untouched — measured never
-        /// to resize a window, at any origin. Ordo's writes still carry a
-        /// size, so this is off by default; it is here because the size clamp
-        /// below only has meaning against a write that does NOT carry one.
-        position_only: std::cell::Cell<bool>,
     }
 
     impl FakeDesktop {
@@ -1129,8 +1150,42 @@ mod tests {
                 frozen: std::cell::Cell::new(false),
                 cg_down: std::cell::Cell::new(false),
                 pull: std::cell::Cell::new(28.0),
-                position_only: std::cell::Cell::new(false),
             }
+        }
+
+        /// A write that DOES carry AXSize, as `ax::set_frame` still issues for
+        /// a cross-display move. Not reachable through the `Desktop` port any
+        /// more — it is modelled so the tests can still show what the port's
+        /// position-only write buys: the WindowServer caps the height to what
+        /// the display owning the ORIGIN can hold (an origin off to the left of
+        /// every display is main's), and a request that does not fit also loses
+        /// its y to that display's top inset.
+        fn write_whole_frame(&self, pid: Pid, w: WindowId, f: Rect) {
+            let owner = displays()
+                .into_iter()
+                .find(|d| f.x >= d.x && f.x < d.x + d.w && f.y >= d.y && f.y < d.y + d.h)
+                .unwrap_or(MAIN);
+            let inset = usable_inset(owner);
+            let mut landed = f;
+            if landed.h > owner.h - inset {
+                landed.h = owner.h - inset;
+                landed.y = owner.y + inset;
+            }
+            self.land(pid, w, landed);
+        }
+
+        /// The last thing every write goes through: macOS keeps the title bar
+        /// reachable on whichever display the window sits over, so the floor
+        /// differs per display — the fact that made one park request land at
+        /// three heights.
+        fn land(&self, pid: Pid, w: WindowId, mut landed: Rect) {
+            let host = displays()
+                .into_iter()
+                .filter(|d| landed.x < d.x + d.w && landed.x + landed.w > d.x)
+                .min_by(|a, b| (landed.x - a.x).abs().total_cmp(&(landed.x - b.x).abs()))
+                .unwrap_or(MAIN);
+            landed.y = landed.y.min(host.y + host.h - self.pull.get());
+            self.windows.borrow_mut().insert(w, (pid, landed));
         }
 
         fn frame(&self, w: WindowId) -> Rect {
@@ -1176,47 +1231,31 @@ mod tests {
                 .collect()
         }
 
-        /// Writes land CLAMPED, as the real WindowServer lands them, on BOTH
-        /// axes a write can carry. A fake that stores frames verbatim is a
-        /// fake that cannot reproduce parking, which is how an exact-point
-        /// park predicate passed every test here and fought every window in
-        /// production — and the missing SIZE clamp is how a park that shrank
-        /// the author's windows by 58pt shipped past twenty tests.
-        fn set_frames(&self, writes: &[(Pid, WindowId, Rect)]) {
+        /// Moves land CLAMPED, as the real WindowServer lands them: a fake that
+        /// stores positions verbatim is a fake that cannot reproduce parking,
+        /// which is how an exact-point park predicate passed every test here
+        /// and fought every window in production.
+        ///
+        /// The window's SIZE is untouched, measured to be true at every origin
+        /// tried — which is the whole reason the port carries no size. What a
+        /// size WOULD suffer is modelled in `write_whole_frame`; the ratchet
+        /// that shrank the author's windows by 58pt lived in the gap between
+        /// the two.
+        fn move_windows(&self, moves: &[(Pid, WindowId, Point)]) {
             if self.frozen.get() {
                 return;
             }
-            let mut ws = self.windows.borrow_mut();
-            for (pid, w, f) in writes {
-                let mut landed = *f;
-                if self.position_only.get() {
-                    landed.w = ws[w].1.w;
-                    landed.h = ws[w].1.h;
-                } else {
-                    // A write carrying a size is capped to the usable height of
-                    // the display owning the ORIGIN — an origin off to the left
-                    // of every display is main's — and a request that does not
-                    // fit also loses its y to that display's top inset.
-                    let owner = displays()
-                        .into_iter()
-                        .find(|d| f.x >= d.x && f.x < d.x + d.w && f.y >= d.y && f.y < d.y + d.h)
-                        .unwrap_or(MAIN);
-                    let inset = usable_inset(owner);
-                    if landed.h > owner.h - inset {
-                        landed.h = owner.h - inset;
-                        landed.y = owner.y + inset;
-                    }
-                }
-                // macOS keeps the title bar reachable on whichever display the
-                // window sits over, so the floor differs per display — the
-                // fact that made one park request land at three heights.
-                let host = displays()
-                    .into_iter()
-                    .filter(|d| landed.x < d.x + d.w && landed.x + landed.w > d.x)
-                    .min_by(|a, b| (landed.x - a.x).abs().total_cmp(&(landed.x - b.x).abs()))
-                    .unwrap_or(MAIN);
-                landed.y = landed.y.min(host.y + host.h - self.pull.get());
-                ws.insert(*w, (*pid, landed));
+            for (pid, w, at) in moves {
+                let size_is_the_windows_own = self.windows.borrow()[w].1;
+                self.land(
+                    *pid,
+                    *w,
+                    Rect {
+                        x: at.x,
+                        y: at.y,
+                        ..size_is_the_windows_own
+                    },
+                );
             }
         }
 
@@ -1477,7 +1516,15 @@ mod tests {
                     h: size.1,
                 };
                 let d = FakeDesktop::new(&[(w(1), Pid(10), f)]);
-                d.set_frames(&[(Pid(10), w(1), park_frame(f, GEO))]);
+                let want = park_frame(f, GEO);
+                d.move_windows(&[(
+                    Pid(10),
+                    w(1),
+                    Point {
+                        x: want.x,
+                        y: want.y,
+                    },
+                )]);
                 let landed = d.frame(w(1));
                 let seen = visible_width(&landed);
                 assert!(
@@ -1486,7 +1533,7 @@ mod tests {
                     size.0,
                     size.1
                 );
-                assert_eq!(landed, park_frame(f, GEO), "and it landed exactly");
+                assert_eq!(landed, want, "and it landed exactly");
             }
         }
     }
@@ -1526,15 +1573,18 @@ mod tests {
         assert_eq!(d.frame(w(1)).h, tall.h);
     }
 
-    /// The one place the park is still not exact, pinned for the commit that
-    /// closes it: the write carries the window's SIZE, so a window taller than
-    /// the display owning the park origin (main, for an origin off to the
-    /// left) still comes back shorter. No window on Michael's rig can be —
-    /// main is the tallest screen there — but a rig whose external display is
-    /// taller than main has them. Writing AXPosition alone, which was measured
-    /// never to resize a window at any origin, is what removes the exposure.
+    /// The last of the ratchet, closed: a park is a MOVE, so not even a window
+    /// taller than the display owning the park origin comes back shorter. No
+    /// window on Michael's rig can be that tall — main is the tallest screen
+    /// there — but a rig whose external display is taller than main has them,
+    /// and this used to file the difference off them a park at a time.
+    ///
+    /// The second half is the counterfactual, and it is the point: the same
+    /// request as a whole-frame write still loses 150pt to the cap and its y
+    /// to main's top inset. Nothing about the WindowServer got kinder; the
+    /// write stopped asking.
     #[test]
-    fn only_the_size_riding_along_with_a_park_can_still_shorten_a_window() {
+    fn a_park_moves_an_over_tall_window_without_shortening_it() {
         let over_tall = Rect {
             x: 0.0,
             y: 200.0,
@@ -1544,17 +1594,67 @@ mod tests {
         let want = park_frame(over_tall, GEO);
 
         let d = FakeDesktop::new(&[(w(1), Pid(10), over_tall)]);
-        d.set_frames(&[(Pid(10), w(1), want)]);
+        let mut b = EmulatedWorkspaces::new(3);
+        b.note_scan(&d, &d.scan());
+        b.move_window_to_workspace(&d, w(1), ws(2)).unwrap();
+        assert_eq!(d.frame(w(1)), want, "parked exactly, height and all");
         assert_eq!(
-            d.frame(w(1)).h,
-            MAIN.h - 30.0,
-            "capped to what main can hold"
+            b.saved[&w(1)],
+            over_tall,
+            "and the promise is the real frame"
         );
 
         let d = FakeDesktop::new(&[(w(1), Pid(10), over_tall)]);
-        d.position_only.set(true);
-        d.set_frames(&[(Pid(10), w(1), want)]);
-        assert_eq!(d.frame(w(1)), want, "position alone moves without resizing");
+        d.write_whole_frame(Pid(10), w(1), want);
+        assert_eq!(
+            (d.frame(w(1)).h, d.frame(w(1)).y),
+            (MAIN.h - 30.0, 30.0),
+            "a size-carrying write is still capped to what main can hold"
+        );
+    }
+
+    /// The promise records a whole frame but a restore writes only its origin,
+    /// so a window whose size changed while it was parked — an app resizing
+    /// itself, or a window an older build already ratcheted short — comes home
+    /// to the right place at the size it actually has.
+    ///
+    /// This is the deliberate cost of the move-only write, and the shape of the
+    /// recovery is what makes it acceptable: the model does not fabricate the
+    /// lost height, it just stops carrying a stale one, and the next park
+    /// records what the window really is.
+    #[test]
+    fn a_restore_puts_a_window_back_at_its_size_not_its_promises() {
+        let tall = Rect {
+            x: 200.0,
+            y: 157.0,
+            w: 1000.0,
+            h: 1050.0,
+        };
+        let d = FakeDesktop::new(&[(w(1), Pid(10), tall)]);
+        let mut b = EmulatedWorkspaces::new(3);
+        b.note_scan(&d, &d.scan());
+        b.move_window_to_workspace(&d, w(1), ws(2)).unwrap();
+        let parked_at = d.frame(w(1));
+
+        // While parked, the window becomes shorter by a hand that is not ours.
+        let shrunk = Rect {
+            h: 923.0,
+            ..parked_at
+        };
+        d.place(w(1), shrunk);
+
+        b.switch_workspace(&d, ws(2));
+        assert_eq!(
+            d.frame(w(1)),
+            Rect { h: 923.0, ..tall },
+            "home to the promised position, at the height it now has"
+        );
+        assert_eq!(b.saved[&w(1)], tall, "the promise itself is not rewritten");
+
+        // Parking again captures the window as it is — nothing keeps dragging
+        // the stale height along, so one user resize is all the repair takes.
+        b.switch_workspace(&d, ws(1));
+        assert_eq!(b.saved[&w(1)], Rect { h: 923.0, ..tall });
     }
 
     #[test]

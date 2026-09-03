@@ -4,7 +4,9 @@
 //! parked off-screen — slid left past the leftmost display at its own height,
 //! a 1pt sliver left visible because macOS forcibly re-homes fully-off-screen
 //! windows. Switching parks the outgoing workspace's windows and restores the
-//! incoming one's to their saved frames.
+//! incoming one's to their saved frames. Every one of those writes is a MOVE
+//! and nothing more: this model never asserts a window's size, only where it
+//! sits — see [`Desktop::move_windows`] for the ratchet that taught us why.
 //!
 //! Two kinds of data, and the split is the architecture: DECLARATIONS (a
 //! window's workspace, the visible workspace) are written only by Ordo's own
@@ -35,7 +37,7 @@ pub mod workspaces;
 pub use trace::{ParkTrace, ParkTraceKind};
 pub use workspaces::{EmulatedWorkspaces, WorkspaceOutOfRange};
 
-use ordo_core::{Pid, Rect, WindowId};
+use ordo_core::{Pid, Point, Rect, WindowId};
 
 /// The slice of the desktop the emulated model needs to touch: enumerate
 /// windows, move them, hide apps, and know where the main display is. Defined
@@ -43,7 +45,23 @@ use ordo_core::{Pid, Rect, WindowId};
 pub trait Desktop {
     /// Every on-screen window: id, owning app, current frame.
     fn windows(&self) -> Vec<(WindowId, Pid, Rect)>;
-    fn set_frames(&self, writes: &[(Pid, WindowId, Rect)]);
+
+    /// Send each window to a new origin, leaving its size alone.
+    ///
+    /// A [`Point`] rather than a [`Rect`] because the size is not merely
+    /// unneeded here, it is actively harmful: a write carrying AXSize is capped
+    /// to the usable height of the display owning the origin, and parking then
+    /// recorded the shortened frame as the window's real one — a ratchet that
+    /// shaved a few points off tall windows every switch, permanently. Writing
+    /// the position alone was measured never to resize a window, at any origin,
+    /// so a move that cannot express a size cannot ratchet. Nothing this model
+    /// does is a resize; the one caller that genuinely resizes (the core's
+    /// cross-display `SetWindowFrame`) does not come through this port.
+    ///
+    /// Batched because a switch parks the outgoing workspace and restores the
+    /// incoming one in a single breath, and an implementation that has to walk
+    /// each app's window list should walk it once for both.
+    fn move_windows(&self, moves: &[(Pid, WindowId, Point)]);
     fn set_app_hidden(&self, pid: Pid, hidden: bool);
     fn focused_window(&self) -> Option<WindowId>;
     /// The main display's frame — where a re-homed window must land, because
