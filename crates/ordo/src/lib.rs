@@ -8,6 +8,7 @@
 //! Module map:
 //! - [`engine`] — the single serial loop: event in, core, log, effects out.
 //! - [`logger`] / [`replay`] — the structured log and its replay checker.
+//! - [`schema`] — the log's schema and the migration chain that grows it.
 //! - [`ports`] — the two traits the engine talks to the world through.
 //! - [`backend`] — the workspace-backend boundary. The implementations live
 //!   in their own crates (`ordo-emulated`; SkyLight FFI in
@@ -24,6 +25,7 @@ pub mod logger;
 pub mod ports;
 pub mod replay;
 pub mod rescue;
+pub mod schema;
 
 #[cfg(target_os = "macos")]
 pub mod platform;

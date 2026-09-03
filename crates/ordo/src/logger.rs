@@ -25,6 +25,7 @@ use std::path::{Path, PathBuf};
 use ordo_emulated::ParkTrace;
 
 use crate::ports::RestackStats;
+use crate::schema;
 use ordo_core::{Effect, Event, Note, OpId, OpOutcome, State};
 use rusqlite::{params, Connection};
 
@@ -80,29 +81,16 @@ impl Logger {
     ) -> rusqlite::Result<Self> {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
-        conn.execute_batch(SCHEMA)?;
-        // Columns added after a table shipped: CREATE IF NOT EXISTS won't grow
-        // an existing table, and the telemetry history is worth keeping (the
-        // raise-overlap decision wants weeks of it), so alter in place.
-        for (table, column) in [
-            ("restacks", "aborted"),
-            ("restacks", "ghost_pass"),
-            ("raises", "via_event"),
-        ] {
-            let exists = conn
-                .prepare(&format!(
-                    "SELECT 1 FROM pragma_table_info('{table}') WHERE name = '{column}'"
-                ))?
-                .exists([])?;
-            if !exists {
-                conn.execute_batch(&format!(
-                    "ALTER TABLE {table} ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0;"
-                ))?;
-            }
-        }
 
-        let cutoff = now_wall_ms - RETENTION_DAYS * 24 * 60 * 60 * 1000;
-        conn.execute("DELETE FROM runs WHERE started_wall < ?1", params![cutoff])?;
+        let schema_version = schema::open_version(&conn)?;
+        // Retention first, on whatever schema the file already has: a migration
+        // that rewrites a table should never pay for rows that are about to be
+        // deleted anyway. Version 0 is an empty file with nothing to prune.
+        if schema_version >= 1 {
+            let cutoff = now_wall_ms - RETENTION_DAYS * 24 * 60 * 60 * 1000;
+            conn.execute("DELETE FROM runs WHERE started_wall < ?1", params![cutoff])?;
+        }
+        schema::migrate(&conn, schema_version)?;
 
         conn.execute(
             "INSERT INTO runs (started_wall, version, backend) VALUES (?1, ?2, ?3)",
@@ -359,92 +347,3 @@ fn note_kind(n: &Note) -> &'static str {
         Note::Diverged { .. } => "diverged",
     }
 }
-
-const SCHEMA: &str = r#"
-CREATE TABLE IF NOT EXISTS runs (
-    run_id       INTEGER PRIMARY KEY,
-    started_wall INTEGER NOT NULL,
-    ended_wall   INTEGER,
-    version      TEXT NOT NULL,
-    backend      TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS events (
-    run_id  INTEGER NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
-    seq     INTEGER NOT NULL,
-    wall_ms INTEGER NOT NULL,
-    mono_ns INTEGER NOT NULL,
-    kind    TEXT NOT NULL,
-    payload TEXT NOT NULL,
-    PRIMARY KEY (run_id, seq)
-);
-CREATE TABLE IF NOT EXISTS effects (
-    run_id  INTEGER NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
-    seq     INTEGER NOT NULL,
-    ord     INTEGER NOT NULL,
-    op_id   INTEGER,
-    kind    TEXT NOT NULL,
-    payload TEXT NOT NULL,
-    PRIMARY KEY (run_id, seq, ord)
-);
-CREATE TABLE IF NOT EXISTS notes (
-    run_id  INTEGER NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
-    seq     INTEGER NOT NULL,
-    ord     INTEGER NOT NULL,
-    kind    TEXT NOT NULL,
-    payload TEXT NOT NULL,
-    PRIMARY KEY (run_id, seq, ord)
-);
-CREATE TABLE IF NOT EXISTS op_results (
-    run_id  INTEGER NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
-    op_id   INTEGER NOT NULL,
-    wall_ms INTEGER NOT NULL,
-    outcome TEXT NOT NULL,
-    detail  TEXT,
-    PRIMARY KEY (run_id, op_id, wall_ms)
-);
-CREATE TABLE IF NOT EXISTS checkpoints (
-    run_id  INTEGER NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
-    seq     INTEGER NOT NULL,
-    payload TEXT NOT NULL,
-    PRIMARY KEY (run_id, seq)
-);
-CREATE TABLE IF NOT EXISTS park_trace (
-    run_id   INTEGER NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
-    wall_ms  INTEGER NOT NULL,
-    window   INTEGER NOT NULL,
-    kind     TEXT NOT NULL,
-    payload  TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS park_trace_window ON park_trace (run_id, window, wall_ms);
-CREATE TABLE IF NOT EXISTS restacks (
-    restack_id       INTEGER PRIMARY KEY,
-    run_id           INTEGER NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
-    wall_ms          INTEGER NOT NULL,
-    total_ms         INTEGER NOT NULL,
-    presence_wait_ms INTEGER NOT NULL,
-    handoff_wait_ms  INTEGER NOT NULL,
-    desired          INTEGER NOT NULL,
-    missing          INTEGER NOT NULL,
-    skipped_suffix   INTEGER NOT NULL,
-    second_pass      INTEGER NOT NULL,
-    converged        INTEGER NOT NULL,
-    aborted          INTEGER NOT NULL DEFAULT 0,
-    ghost_pass       INTEGER NOT NULL DEFAULT 0
-);
-CREATE TABLE IF NOT EXISTS raises (
-    restack_id  INTEGER NOT NULL REFERENCES restacks(restack_id) ON DELETE CASCADE,
-    ord         INTEGER NOT NULL,
-    window      INTEGER NOT NULL,
-    pid         INTEGER NOT NULL,
-    kind        TEXT NOT NULL,
-    pass        INTEGER NOT NULL,
-    above_scope INTEGER NOT NULL,
-    above_all   INTEGER NOT NULL,
-    wait_ms     INTEGER NOT NULL,
-    timed_out   INTEGER NOT NULL,
-    via_event   INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (restack_id, ord)
-);
-CREATE INDEX IF NOT EXISTS events_by_time ON events(wall_ms);
-CREATE INDEX IF NOT EXISTS events_by_kind ON events(run_id, kind);
-"#;
