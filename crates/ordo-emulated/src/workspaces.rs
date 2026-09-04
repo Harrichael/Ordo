@@ -185,6 +185,10 @@ pub struct EmulatedWorkspaces {
     /// True during a fresh session (the R chord): the state file is neither
     /// read nor written, so O can still bring the pre-R organization back.
     suspended: bool,
+    /// The loaded file carried no monitor declarations (see
+    /// `PersistedState::monitors_assigned`); the next sighted scan learns
+    /// them from where the windows stand, once.
+    learn_monitors: bool,
     /// Diagnostic record of what this model did to windows' frames, drained by
     /// the shell each snapshot. See [`crate::trace`] for why it must exist:
     /// every other channel sees the substituted belief, so without this the
@@ -208,6 +212,7 @@ impl EmulatedWorkspaces {
             state_path: None,
             boot_time: statefile::boot_time_sec(),
             suspended: false,
+            learn_monitors: false,
             trace: Vec::new(),
         }
     }
@@ -315,6 +320,11 @@ impl EmulatedWorkspaces {
         // window must not inherit a teleport to it.
         let recycled = self.ledger.note_seen(windows, adopt);
         self.drop_park_bookkeeping(&recycled);
+        if self.learn_monitors {
+            self.learn_monitors_from_placement(&frames, &g);
+            self.learn_monitors = false;
+            dirty = true;
+        }
         dirty |= self.ledger.window_claims() != before;
         dirty |= self.refresh_home(&frames, &g);
         if dirty {
@@ -357,6 +367,40 @@ impl EmulatedWorkspaces {
                 )),
         );
         true
+    }
+
+    /// One-time: the file this model came from had no monitor declarations,
+    /// so every window's monitor is a placeholder, and asserting a placeholder
+    /// moves windows (it pulled a second-display window onto the first). Each
+    /// window's monitor is read off the display it actually occupies — its
+    /// promise's display while parked, since the sliver says nothing — and
+    /// only then does it become a declaration. Windows with no frame to read
+    /// keep the placeholder; their first sighting is a birth to the ledger's
+    /// adoption anyway.
+    fn learn_monitors_from_placement(
+        &mut self,
+        frames: &HashMap<WindowId, (Pid, Rect)>,
+        g: &Geometry,
+    ) {
+        let proj = self.ledger.projection();
+        for (id, claim) in self.ledger.window_claims() {
+            let standing = match frames.get(&id) {
+                Some((_, f)) if self.parked.contains(&id) || self.reads_parked(id, f, g) => {
+                    self.saved.get(&id).copied()
+                }
+                Some((_, f)) => Some(*f),
+                None => self.saved.get(&id).copied(),
+            };
+            let Some(f) = standing else { continue };
+            let Some(i) = g.displays.iter().position(|d| d.contains(f.center())) else {
+                continue;
+            };
+            if let Some(vm) = proj.canonical_vm(i) {
+                if vm != claim.monitor {
+                    self.ledger.assign_monitor(id, vm);
+                }
+            }
+        }
     }
 
     /// Whether every virtual monitor has a display of its own right now.
@@ -932,6 +976,7 @@ impl EmulatedWorkspaces {
             enabled: ps.virtual_monitors_enabled,
         };
         self.ledger = Ledger::restore(count, ps.current, monitors, self.ledger.physical(), claims);
+        self.learn_monitors = !ps.monitors_assigned;
         self.saved.clear();
         self.home.clear();
         self.parked.clear();
@@ -982,6 +1027,8 @@ impl EmulatedWorkspaces {
                 viewed: m.viewed,
                 virtual_monitors_enabled: m.enabled,
                 virtual_monitor_count: m.count,
+                // Once learned (or never in doubt), they are declarations.
+                monitors_assigned: !self.learn_monitors,
                 windows,
             },
         );
@@ -2629,6 +2676,7 @@ mod tests {
             viewed: vm(1),
             virtual_monitors_enabled: true,
             virtual_monitor_count: 2,
+            monitors_assigned: true,
             windows: vec![
                 // Parked pre-R, never seen by the fresh session.
                 pw(10, 3, Some(rect(10.0, 20.0))),
@@ -2852,6 +2900,66 @@ mod tests {
         assert_eq!(again.window_monitors()[&w(2)], vm(2));
         assert_eq!(again.home[&w(2)], rect(2000.0, 100.0));
 
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The migration pinned. A state file from before windows carried a
+    /// monitor — or from the build that first wrote one as a default of 1 —
+    /// must not have those placeholders asserted: on a two-display rig that
+    /// hauled a second-display window onto the first. The first scan reads
+    /// each window's monitor off where it stands (its promise, while parked),
+    /// and only what it learned is written back as declarations.
+    #[test]
+    fn a_file_without_monitor_declarations_learns_them_from_where_windows_stand() {
+        let dir = std::env::temp_dir().join(format!("ordo-learn-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        let parked_promise = rect(2000.0, 100.0); // w3 lived on the second display
+        let pw = |id: u32, wsn: u8, saved: Option<Rect>| PersistedWindow {
+            id: w(id),
+            workspace: ws(wsn),
+            monitor: vm(1), // the placeholder every old window carries
+            owner: Pid(10),
+            saved,
+            home: None,
+        };
+        statefile::save(
+            &path,
+            &PersistedState {
+                version: statefile::VERSION,
+                boot_time_sec: statefile::boot_time_sec(),
+                current: ws(1),
+                viewed: vm(1),
+                virtual_monitors_enabled: true,
+                virtual_monitor_count: 2,
+                monitors_assigned: false,
+                windows: vec![
+                    pw(1, 1, None),
+                    pw(2, 1, None),
+                    pw(3, 2, Some(parked_promise)),
+                ],
+            },
+        );
+        let d = FakeDesktop::new(&[
+            (w(1), Pid(10), rect(100.0, 100.0)),
+            (w(2), Pid(10), rect(2100.0, 100.0)),
+            (w(3), Pid(10), park_frame(parked_promise, &geo())),
+        ]);
+        let mut b = EmulatedWorkspaces::with_persistence(3, path.clone());
+        rescan(&d, &mut b);
+
+        let monitors = b.window_monitors();
+        assert_eq!(monitors[&w(1)], vm(1));
+        assert_eq!(monitors[&w(2)], vm(2), "read off the display it stands on");
+        assert_eq!(monitors[&w(3)], vm(2), "read off its promise while parked");
+        assert_eq!(d.frame(w(2)), rect(2100.0, 100.0), "nothing was hauled anywhere");
+        assert!(in_park_corner(&d.frame(w(3)), &geo()));
+
+        // Written back as declarations: a restart does not learn again, even
+        // if the user has since moved w2 elsewhere.
+        let again = EmulatedWorkspaces::with_persistence(3, path);
+        assert!(!again.learn_monitors);
+        assert_eq!(again.window_monitors()[&w(2)], vm(2));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

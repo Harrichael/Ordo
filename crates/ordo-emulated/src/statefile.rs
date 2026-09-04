@@ -51,6 +51,15 @@ pub struct PersistedState {
     /// it from the displays present".
     #[serde(default)]
     pub virtual_monitor_count: u8,
+    /// Whether each window's `monitor` is a declaration. False for a file
+    /// written before windows carried one — the loader then reads each
+    /// window's monitor off the display it stands on, once. A default is not
+    /// a declaration: the first build to write monitors defaulted every
+    /// window to 1, and asserting that pulled a second-display window onto
+    /// the first (2026-09-04), so the marker is explicit rather than inferred
+    /// from the count.
+    #[serde(default)]
+    pub monitors_assigned: bool,
     pub windows: Vec<PersistedWindow>,
 }
 
@@ -155,6 +164,7 @@ mod tests {
             viewed: VirtualMonitorId(2),
             virtual_monitors_enabled: false,
             virtual_monitor_count: 2,
+            monitors_assigned: true,
             windows: vec![
                 PersistedWindow {
                     id: WindowId(7),
@@ -223,5 +233,6 @@ mod tests {
         assert_eq!(state.viewed, VirtualMonitorId(1));
         assert!(state.virtual_monitors_enabled, "virtualization defaults ON");
         assert_eq!(state.virtual_monitor_count, 0, "unknown until displays are seen");
+        assert!(!state.monitors_assigned, "monitors are placeholders to be learned");
     }
 }
