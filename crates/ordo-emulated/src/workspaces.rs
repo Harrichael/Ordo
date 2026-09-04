@@ -2724,7 +2724,7 @@ mod tests {
         assert_eq!(d.frame(w(1)), rect(100.0, 100.0));
         assert!(in_park_corner(&d.frame(w(2)), &geo()));
 
-        // Cmd+Alt+V: collapse shows both; enabling hides monitor 2 again.
+        // Ctrl+Alt+Cmd+V: collapse shows both; enabling hides monitor 2 again.
         b.set_virtual_monitors(&d, false);
         assert_eq!(d.frame(w(1)), rect(100.0, 100.0));
         assert_eq!(d.frame(w(2)), rehomed);

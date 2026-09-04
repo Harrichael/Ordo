@@ -11,8 +11,9 @@
 //!   - Cmd+Alt+J / Cmd+Alt+K     → view the previous / next virtual monitor
 //!     (focus jumps to its MRU window; where displays are short, its windows
 //!     are revealed and the current monitor's hidden)
-//!   - Cmd+Alt+V                 → virtualization on/off: off collapses every
-//!     virtual monitor onto the displays present
+//!   - Ctrl+Alt+Cmd+V            → virtualization on/off: off collapses every
+//!     virtual monitor onto the displays present. A mode switch, not a
+//!     navigation key, so it sits with the other full-triple chords
 //!   - Ctrl+Cmd+Left / Right     → carry the focused window to the adjacent
 //!     workspace and switch there with it
 //!   - Alt+Tab                   → MRU window in the workspace
@@ -138,6 +139,11 @@ pub fn match_chord(keycode: u16, m: Mods) -> Option<Chord> {
     if m.ctrl && m.alt && m.cmd && keycode == code::S {
         return Some(Chord::SaveState);
     }
+    // A mode switch rather than navigation, so it lives with the full-triple
+    // family — but unlike rescue/engage it is only ours while intercepting.
+    if m.ctrl && m.alt && m.cmd && keycode == code::V {
+        return Some(Chord::Hotkey(ToggleVirtualMonitors));
+    }
 
     // Cmd+Alt+1..9: jump straight to that workspace. Alt is what keeps the
     // apps' Cmd-digit shortcuts — browser and terminal tab switching — which
@@ -148,12 +154,10 @@ pub fn match_chord(keycode: u16, m: Mods) -> Option<Chord> {
             return Some(Chord::Hotkey(WorkspaceSwitchTo(WorkspaceId(i as u8 + 1))));
         }
         // Virtual monitors live under the same Cmd+Alt prefix as the direct
-        // workspace jumps: J/K step the view (vim's down/up, here left/right),
-        // V toggles virtualization.
+        // workspace jumps: J/K step the view (vim's down/up, here left/right).
         match keycode {
             code::J => return Some(Chord::Hotkey(ViewMonitorPrev)),
             code::K => return Some(Chord::Hotkey(ViewMonitorNext)),
-            code::V => return Some(Chord::Hotkey(ToggleVirtualMonitors)),
             _ => {}
         }
     }
@@ -276,7 +280,7 @@ mod tests {
     }
 
     #[test]
-    fn cmd_alt_j_k_v_drive_virtual_monitors_and_bare_keys_pass_through() {
+    fn cmd_alt_j_k_view_monitors_and_the_triple_v_toggles_virtualization() {
         let chord = mods(true, true, false, false);
         assert_eq!(
             match_chord(code::J, chord),
@@ -286,11 +290,18 @@ mod tests {
             match_chord(code::K, chord),
             Some(Chord::Hotkey(ViewMonitorNext))
         );
+        // The toggle is a full-triple chord, and survives an extra shift like
+        // its neighbours; Cmd+Alt+V is NOT it.
         assert_eq!(
-            match_chord(code::V, chord),
+            match_chord(code::V, mods(true, true, false, true)),
             Some(Chord::Hotkey(ToggleVirtualMonitors))
         );
-        // Cmd+V is Paste, Cmd+J/K are the apps' — only the exact prefix is ours.
+        assert_eq!(
+            match_chord(code::V, mods(true, true, true, true)),
+            Some(Chord::Hotkey(ToggleVirtualMonitors))
+        );
+        assert_eq!(match_chord(code::V, chord), None);
+        // Cmd+V is Paste, Cmd+J/K are the apps' — only the exact chords are ours.
         for key in [code::J, code::K, code::V] {
             assert_eq!(match_chord(key, mods(true, false, false, false)), None);
             assert_eq!(match_chord(key, mods(false, true, false, false)), None);

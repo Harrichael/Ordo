@@ -12,7 +12,7 @@
 | Ctrl + Alt + Tab | Focus MRU window on the other monitor |
 | Cmd + Shift + Left / Right | Move the focused window to the previous / next virtual monitor (focus and mouse go with it; a hidden monitor is viewed) |
 | Cmd + Alt + J / K | View the previous / next virtual monitor: focus its MRU window and, where displays are short, show its windows in place of the current monitor's (no wrap) |
-| Cmd + Alt + V | Virtualization on / off: off collapses every virtual monitor onto the displays present |
+| Ctrl + Alt + Cmd + V | Virtualization on / off: off collapses every virtual monitor onto the displays present |
 | Ctrl + Cmd + Left / Right | Carry the focused window to the previous / next workspace and switch there with it |
 | Alt + End | Demote the focused window: back of the MRU history, back of the visual stack, focus moves to the next one |
 | Ctrl + Alt + Cmd + Esc (twice within 2s) | Rescue / kill switch: disengage and gather windows back on-screen |

@@ -56,7 +56,7 @@ The two rules that make it work:
   display per monitor they map one to one. With fewer displays (the laptop
   unplugged), `Cmd+Alt+J/K` view the previous/next monitor (no wrap; global,
   not per workspace), showing its windows and hiding the current one's, and
-  `Cmd+Alt+V` toggles virtualization: off collapses every monitor onto the
+  `Ctrl+Alt+Cmd+V` toggles virtualization: off collapses every monitor onto the
   display(s) present. The view follows focus — Alt+Tab or Cmd+Tab onto a hidden
   monitor's window reveals it. Plug the display back in and its windows return
   to it, at the frames they had, within about a second. Mirrored displays

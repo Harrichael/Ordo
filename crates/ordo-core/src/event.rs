@@ -111,7 +111,7 @@ pub enum HotkeyAction {
     /// one display it also reveals the monitor's windows.
     ViewMonitorPrev,
     ViewMonitorNext,
-    /// Cmd+Alt+V: virtualization on/off. Off collapses every virtual monitor
+    /// Ctrl+Alt+Cmd+V: virtualization on/off. Off collapses every virtual monitor
     /// onto the displays present; on shows only the viewed one where displays
     /// are short. The declarations are untouched either way.
     ToggleVirtualMonitors,
