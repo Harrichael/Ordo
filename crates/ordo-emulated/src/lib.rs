@@ -35,7 +35,7 @@ pub mod trace;
 pub mod workspaces;
 
 pub use trace::{HoldStat, ParkTrace, ParkTraceKind};
-pub use workspaces::{EmulatedWorkspaces, WorkspaceOutOfRange};
+pub use workspaces::{EmulatedWorkspaces, MonitorOutOfRange, WorkspaceOutOfRange};
 
 use ordo_core::{Pid, Point, Rect, WindowId};
 

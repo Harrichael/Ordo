@@ -67,11 +67,34 @@ struct Mon {
     count: u8,
 }
 
-/// Same pairing for a window: the observation plus its assignment.
+/// Same pairing for a window: the observation plus its assignments. `monitor`
+/// None = declared on the virtual monitor of the display its frame sits on,
+/// which is what the emulated backend adopts for a window it first meets there.
 #[derive(Clone)]
 struct Win {
     snap: WindowSnap,
     workspace: WorkspaceId,
+    monitor: Option<VirtualMonitorId>,
+}
+
+fn vm(n: u8) -> VirtualMonitorId {
+    VirtualMonitorId(n)
+}
+
+/// Declare a window onto a virtual monitor other than the one its frame implies.
+fn on_monitor(mut w: Win, n: u8) -> Win {
+    w.monitor = Some(vm(n));
+    w
+}
+
+/// The layout the emulated backend reports for a rig with one virtual monitor
+/// per display: the degenerate, one-to-one projection.
+fn full_rig(monitors: &[Mon]) -> VirtualMonitors {
+    VirtualMonitors {
+        count: monitors.len() as u8,
+        viewed: vm(1),
+        enabled: true,
+    }
 }
 
 fn mon_a(active: u8) -> Mon {
@@ -119,6 +142,7 @@ fn win(id: u32, pid: i32, workspace: u8, frame: Rect) -> Win {
             subrole: None,
         },
         workspace: ws(workspace),
+        monitor: None,
     }
 }
 
@@ -131,6 +155,27 @@ fn std_windows() -> Vec<Win> {
 }
 
 fn world(monitors: &[Mon], windows: &[Win], focused: Option<u32>) -> WorldSnapshot {
+    world_view(full_rig(monitors), monitors, windows, focused)
+}
+
+/// The virtual monitor a frame's display stands at, left to right.
+fn position_of(frame: &Rect, monitors: &[Mon]) -> VirtualMonitorId {
+    let mut ms: Vec<&Mon> = monitors.iter().collect();
+    ms.sort_by(|a, b| a.snap.frame.x.total_cmp(&b.snap.frame.x));
+    let c = frame.center();
+    let i = ms
+        .iter()
+        .position(|m| m.snap.frame.contains(c))
+        .unwrap_or(0);
+    vm(i as u8 + 1)
+}
+
+fn world_view(
+    view: VirtualMonitors,
+    monitors: &[Mon],
+    windows: &[Win],
+    focused: Option<u32>,
+) -> WorldSnapshot {
     WorldSnapshot {
         monitors: monitors.iter().map(|m| m.snap.clone()).collect(),
         windows: windows.iter().map(|w| w.snap.clone()).collect(),
@@ -149,7 +194,35 @@ fn world(monitors: &[Mon], windows: &[Win], focused: Option<u32>) -> WorldSnapsh
                 })
                 .collect(),
             assignments: windows.iter().map(|w| (w.snap.id, w.workspace)).collect(),
+            virtual_monitors: Some(VirtualMonitorsWord {
+                view,
+                assignments: windows
+                    .iter()
+                    .map(|w| {
+                        (
+                            w.snap.id,
+                            w.monitor
+                                .unwrap_or_else(|| position_of(&w.snap.frame, monitors)),
+                        )
+                    })
+                    .collect(),
+            }),
         },
+    }
+}
+
+/// `observed` under a virtual-monitor layout other than the full rig.
+fn observed_view(
+    view: VirtualMonitors,
+    monitors: Vec<Mon>,
+    windows: Vec<Win>,
+    focused: Option<u32>,
+    trigger: RescanTrigger,
+) -> Event {
+    Event::WorldObserved {
+        at: ts(),
+        trigger,
+        snap: world_view(view, &monitors, &windows, focused),
     }
 }
 
@@ -690,7 +763,8 @@ fn a_witnessed_switch_to_a_hidden_window_is_followed_and_an_unwitnessed_one_is_h
     );
     assert!(followed.notes.contains(&Note::FollowedFocus {
         window: wid(2),
-        target: ws(2)
+        target: ws(2),
+        monitor: None,
     }));
     assert_eq!(followed.state.focus_intent(), FocusIntent::Window(wid(2)));
 }
@@ -1348,7 +1422,7 @@ fn demote_with_nowhere_to_go_does_nothing() {
 #[test]
 fn move_focused_window_to_other_monitor_brings_the_mouse() {
     let s = booted(&[1]); // focused w1 on monitor A
-    let step = update(&s, &hotkey(HotkeyAction::MoveFocusedToOtherMonitor));
+    let step = update(&s, &hotkey(HotkeyAction::MoveFocusedToMonitorNext));
     let frame = set_frame_for(&step.effects, 1).expect("frame effect");
     assert!(
         frame.x >= 1920.0 && frame.x + frame.w <= 3840.0,
@@ -1369,7 +1443,7 @@ fn clamped_landing_on_the_target_monitor_confirms_the_move() {
     // old exact-rect check could never be satisfied and re-asserted the
     // doomed frame until damping, fighting the user the whole way.
     let s = booted(&[1]);
-    let step = update(&s, &hotkey(HotkeyAction::MoveFocusedToOtherMonitor));
+    let step = update(&s, &hotkey(HotkeyAction::MoveFocusedToMonitorNext));
     let f = set_frame_for(&step.effects, 1).expect("frame effect");
 
     let mut wins = std_windows();
@@ -2008,7 +2082,7 @@ fn a_gesture_hands_focus_to_the_os_and_every_command_takes_it_back() {
         (HotkeyAction::MruWorkspace, FocusIntent::Window(wid(2))),
         (HotkeyAction::MruDemote, FocusIntent::Window(wid(2))),
         (
-            HotkeyAction::MoveFocusedToOtherMonitor,
+            HotkeyAction::MoveFocusedToMonitorNext,
             FocusIntent::Window(wid(3)),
         ),
         (
@@ -2387,4 +2461,610 @@ fn follow_the_focus_holds_while_a_focus_handoff_is_in_flight() {
         .notes
         .iter()
         .any(|n| matches!(n, Note::FollowedFocus { .. })));
+}
+
+// --- virtual monitors --------------------------------------------------------
+// The laptop rig: ONE display, two virtual monitors, virtualization on. w1 and
+// w3 (pid 100) are declared on monitor 1, w2 (pid 200) on monitor 2 — hidden
+// while the anchor is monitor 1. Every frame sits on the one display, since
+// that is where macOS put them when the external display went away.
+
+fn laptop(viewed: u8, enabled: bool) -> VirtualMonitors {
+    VirtualMonitors {
+        count: 2,
+        viewed: vm(viewed),
+        enabled,
+    }
+}
+
+fn undocked_windows() -> Vec<Win> {
+    vec![
+        win(1, 100, 1, rect(100.0, 100.0)),
+        on_monitor(win(2, 200, 1, rect(600.0, 100.0)), 2),
+        win(3, 100, 1, rect(600.0, 500.0)),
+    ]
+}
+
+/// Boot the laptop rig with the anchor on monitor 1, then focus each window
+/// in `focus_seq` — viewing its monitor for the observation, since a hidden
+/// window's focus is never recorded — and end back on monitor 1.
+fn undocked(focus_seq: &[u32]) -> State {
+    let mut s = update(
+        &State::new(),
+        &observed_view(
+            laptop(1, true),
+            vec![mon_a(1)],
+            undocked_windows(),
+            None,
+            RescanTrigger::Startup,
+        ),
+    )
+    .state;
+    for f in focus_seq {
+        let viewed = if *f == 2 { 2 } else { 1 };
+        s = update(
+            &s,
+            &observed_view(
+                laptop(viewed, true),
+                vec![mon_a(1)],
+                undocked_windows(),
+                Some(*f),
+                RescanTrigger::Periodic,
+            ),
+        )
+        .state;
+    }
+    let last = focus_seq.last().copied();
+    update(
+        &s,
+        &observed_view(
+            laptop(1, true),
+            vec![mon_a(1)],
+            undocked_windows(),
+            last,
+            RescanTrigger::Periodic,
+        ),
+    )
+    .state
+}
+
+fn view_targets(effects: &[Effect]) -> Vec<VirtualMonitorId> {
+    effects
+        .iter()
+        .filter_map(|e| match e {
+            Effect::ViewMonitor { target, .. } => Some(*target),
+            _ => None,
+        })
+        .collect()
+}
+
+fn monitor_assignments(effects: &[Effect]) -> Vec<(WindowId, VirtualMonitorId)> {
+    effects
+        .iter()
+        .filter_map(|e| match e {
+            Effect::AssignWindowToMonitor { window, target, .. } => Some((*window, *target)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn viewing_the_next_monitor_hands_focus_to_its_mru_window_and_clamps_at_the_ends() {
+    let s = undocked(&[2, 1]); // history [1, 2]; anchor on monitor 1
+    assert_eq!(s.virtual_monitors, Some(laptop(1, true)));
+    assert!(!s.is_visible(&s.windows[&wid(2)]), "w2 is hidden with its monitor");
+
+    let step = update(&s, &hotkey(HotkeyAction::ViewMonitorNext));
+    assert_eq!(focus_targets(&step.effects), vec![wid(2)]);
+    assert_eq!(view_targets(&step.effects), vec![vm(2)]);
+    assert_eq!(step.state.focus_intent(), FocusIntent::Window(wid(2)));
+    // The focus is issued BEFORE the view, as a switch hands focus before it
+    // parks the old workspace.
+    let focus_at = step
+        .effects
+        .iter()
+        .position(|e| matches!(e, Effect::FocusWindow { .. }))
+        .unwrap();
+    let view_at = step
+        .effects
+        .iter()
+        .position(|e| matches!(e, Effect::ViewMonitor { .. }))
+        .unwrap();
+    assert!(focus_at < view_at);
+
+    // The backend's word confirms the view: our own echo.
+    let confirmed = update(
+        &step.state,
+        &observed_view(
+            laptop(2, true),
+            vec![mon_a(1)],
+            undocked_windows(),
+            Some(2),
+            RescanTrigger::Periodic,
+        ),
+    );
+    assert!(confirmed
+        .notes
+        .iter()
+        .any(|n| matches!(n, Note::SelfConfirmed { .. })));
+    assert!(!confirmed
+        .notes
+        .iter()
+        .any(|n| matches!(n, Note::External { delta: Delta::ViewedMonitorChanged { .. } })));
+
+    // Clamped at both ends; no wrap.
+    assert!(update(&confirmed.state, &hotkey(HotkeyAction::ViewMonitorNext))
+        .effects
+        .is_empty());
+    assert!(update(&s, &hotkey(HotkeyAction::ViewMonitorPrev))
+        .effects
+        .is_empty());
+}
+
+#[test]
+fn mru_chords_reach_hidden_monitors_and_view_them_first() {
+    let s = undocked(&[3, 2, 1]); // history [1, 2, 3]; w2 hidden on monitor 2
+
+    // Alt+Tab: the whole workspace, hidden monitors included — and the view
+    // follows the focus there.
+    let step = update(&s, &hotkey(HotkeyAction::MruWorkspace));
+    assert_eq!(focus_targets(&step.effects), vec![wid(2)]);
+    assert_eq!(view_targets(&step.effects), vec![vm(2)]);
+    // Nothing hidden is ever restacked: on one display the revealed set is w2
+    // alone, so there is no order to impose.
+    assert!(!step
+        .effects
+        .iter()
+        .any(|e| matches!(e, Effect::RestackWindows { .. })));
+
+    // Ctrl+Alt+Tab: the OTHER monitor is the hidden one.
+    let other = update(&s, &hotkey(HotkeyAction::MruOtherMonitor));
+    assert_eq!(focus_targets(&other.effects), vec![wid(2)]);
+    assert_eq!(view_targets(&other.effects), vec![vm(2)]);
+
+    // Alt+Shift+Tab: same monitor, so w3 — and nothing to view.
+    let same = update(&s, &hotkey(HotkeyAction::MruMonitor));
+    assert_eq!(focus_targets(&same.effects), vec![wid(3)]);
+    assert!(view_targets(&same.effects).is_empty());
+}
+
+#[test]
+fn moving_a_window_to_a_hidden_monitor_views_it_and_never_touches_its_frame() {
+    let s = undocked(&[1]);
+    let step = update(&s, &hotkey(HotkeyAction::MoveFocusedToMonitorNext));
+    assert_eq!(monitor_assignments(&step.effects), vec![(wid(1), vm(2))]);
+    assert_eq!(view_targets(&step.effects), vec![vm(2)]);
+    // Both monitors project onto the one display: the window stays put.
+    assert_eq!(count_set_frames(&step.effects, 1), 0);
+    assert_eq!(step.state.focus_intent(), FocusIntent::Window(wid(1)));
+    // The assignment comes first so the view's plan finds the window already
+    // a resident of the monitor being revealed.
+    let assign_at = step
+        .effects
+        .iter()
+        .position(|e| matches!(e, Effect::AssignWindowToMonitor { .. }))
+        .unwrap();
+    let view_at = step
+        .effects
+        .iter()
+        .position(|e| matches!(e, Effect::ViewMonitor { .. }))
+        .unwrap();
+    assert!(assign_at < view_at);
+
+    // Clamped at the edge.
+    assert!(update(&s, &hotkey(HotkeyAction::MoveFocusedToMonitorPrev))
+        .effects
+        .is_empty());
+
+    // On the full rig the target IS hosted: assignment plus the frame move,
+    // and nothing to view.
+    let docked = update(&booted(&[1]), &hotkey(HotkeyAction::MoveFocusedToMonitorNext));
+    assert_eq!(monitor_assignments(&docked.effects), vec![(wid(1), vm(2))]);
+    assert!(view_targets(&docked.effects).is_empty());
+    let frame = set_frame_for(&docked.effects, 1).expect("frame effect");
+    assert!(frame.x >= 1920.0, "landed on the second display: {frame:?}");
+}
+
+#[test]
+fn toggling_virtualization_on_views_the_focused_windows_monitor() {
+    let s = undocked(&[1]);
+    // Off: everything collapses onto the display; no view change needed.
+    let off = update(&s, &hotkey(HotkeyAction::ToggleVirtualMonitors));
+    assert!(off
+        .effects
+        .iter()
+        .any(|e| matches!(e, Effect::SetVirtualMonitors { enabled: false, .. })));
+    assert!(view_targets(&off.effects).is_empty());
+    assert_eq!(off.state.focus_intent(), s.focus_intent(), "focus untouched");
+
+    // The user clicks into w2, now visible on the shared display.
+    let collapsed = update(
+        &off.state,
+        &observed_view(
+            laptop(1, false),
+            vec![mon_a(1)],
+            undocked_windows(),
+            Some(1),
+            RescanTrigger::Periodic,
+        ),
+    )
+    .state;
+    assert!(collapsed.is_visible(&collapsed.windows[&wid(2)]));
+    let clicked = update(&collapsed, &click(700.0, 200.0)).state;
+    let on_w2 = update(
+        &clicked,
+        &observed_view(
+            laptop(1, false),
+            vec![mon_a(1)],
+            undocked_windows(),
+            Some(2),
+            RescanTrigger::Periodic,
+        ),
+    )
+    .state;
+    assert_eq!(on_w2.declared_focus(), Some(wid(2)));
+
+    // Back on: w2's monitor must not vanish from under the user, so the
+    // anchor moves to it in the same breath.
+    let on = update(&on_w2, &hotkey(HotkeyAction::ToggleVirtualMonitors));
+    assert!(on
+        .effects
+        .iter()
+        .any(|e| matches!(e, Effect::SetVirtualMonitors { enabled: true, .. })));
+    assert_eq!(view_targets(&on.effects), vec![vm(2)]);
+}
+
+#[test]
+fn a_switch_onto_a_workspace_hidden_by_its_monitor_views_the_mru_heads_monitor() {
+    // w2 lives on workspace 2 AND monitor 2; the anchor is monitor 1.
+    let mut wins = undocked_windows();
+    wins[1].workspace = ws(2);
+    let s = update(
+        &State::new(),
+        &observed_view(
+            laptop(1, true),
+            vec![mon_a(1)],
+            wins.clone(),
+            Some(1),
+            RescanTrigger::Startup,
+        ),
+    )
+    .state;
+    let step = update(&s, &hotkey(HotkeyAction::WorkspaceNext));
+    assert_eq!(count_switches(&step.effects), 1);
+    assert_eq!(focus_targets(&step.effects), vec![wid(2)], "not a blank screen");
+    assert_eq!(view_targets(&step.effects), vec![vm(2)]);
+    assert_eq!(step.state.focus_intent(), FocusIntent::Window(wid(2)));
+
+    // With something visible on the destination the anchor stays global.
+    wins.push(win(9, 300, 2, rect(200.0, 200.0))); // workspace 2, monitor 1
+    let s = update(
+        &State::new(),
+        &observed_view(
+            laptop(1, true),
+            vec![mon_a(1)],
+            wins,
+            Some(1),
+            RescanTrigger::Startup,
+        ),
+    )
+    .state;
+    let step = update(&s, &hotkey(HotkeyAction::WorkspaceNext));
+    assert_eq!(focus_targets(&step.effects), vec![wid(9)]);
+    assert!(view_targets(&step.effects).is_empty());
+}
+
+#[test]
+fn a_new_window_is_corralled_onto_the_focused_monitor_by_declaration_and_frame() {
+    let s = booted(&[1]); // user on w1: monitor 1
+    let mut wins = std_windows();
+    // Born on the second display (its app remembers a position there), and it
+    // takes focus.
+    wins.push(win(9, 300, 1, rect(2100.0, 300.0)));
+    let obs = update(
+        &s,
+        &observed(
+            vec![mon_a(1), mon_b(1)],
+            wins,
+            Some(9),
+            RescanTrigger::AxHint {
+                pid: Some(Pid(300)),
+                kind: AxHintKind::WindowCreated,
+            },
+        ),
+    );
+    assert_eq!(monitor_assignments(&obs.effects), vec![(wid(9), vm(1))]);
+    let frame = set_frame_for(&obs.effects, 9).expect("frame corrective");
+    assert!(frame.x + frame.w <= 1920.0, "onto monitor 1's display: {frame:?}");
+    assert!(
+        !obs.notes.iter().any(|n| matches!(n, Note::MonitorAdopted { .. })),
+        "a birth is corralled, not adopted"
+    );
+}
+
+#[test]
+fn replugging_rehosts_a_windows_frame_without_adopting() {
+    // Undocked, w2 declared on monitor 2 but sitting on the laptop display.
+    let s = undocked(&[1]);
+    // The external display returns: monitor 2 is hosted again, but w2's frame
+    // is still where the laptop had it. It goes home; its declaration stands.
+    let replug = update(
+        &s,
+        &observed_view(
+            laptop(1, true),
+            vec![mon_a(1), mon_b(1)],
+            undocked_windows(),
+            Some(1),
+            RescanTrigger::BackendHint {
+                kind: "display_reconfigured".into(),
+            },
+        ),
+    );
+    assert!(replug
+        .notes
+        .iter()
+        .any(|n| matches!(n, Note::External { delta: Delta::MonitorAdded(_) })));
+    let frame = set_frame_for(&replug.effects, 2).expect("w2 re-hosted");
+    assert!(frame.x >= 1920.0, "onto the returned display: {frame:?}");
+    assert!(monitor_assignments(&replug.effects).is_empty());
+    assert!(!replug
+        .notes
+        .iter()
+        .any(|n| matches!(n, Note::MonitorAdopted { .. })));
+    assert_eq!(count_set_frames(&replug.effects, 1), 0, "w1 was already home");
+
+    // The write lands: our own echo, and nothing more to do.
+    let mut wins = undocked_windows();
+    wins[1].snap.frame = frame;
+    let landed = update(
+        &replug.state,
+        &observed_view(
+            laptop(1, true),
+            vec![mon_a(1), mon_b(1)],
+            wins.clone(),
+            Some(1),
+            RescanTrigger::Periodic,
+        ),
+    );
+    assert!(landed
+        .notes
+        .iter()
+        .any(|n| matches!(n, Note::SelfConfirmed { .. })));
+    let quiet = update(
+        &landed.state,
+        &observed_view(
+            laptop(1, true),
+            vec![mon_a(1), mon_b(1)],
+            wins,
+            Some(1),
+            RescanTrigger::Periodic,
+        ),
+    );
+    assert!(quiet.effects.is_empty(), "{:?}", quiet.effects);
+}
+
+#[test]
+fn unplugging_never_adopts_the_windows_macos_rehomed() {
+    // Full rig, w2 on the second display and declared on monitor 2.
+    let s = booted(&[1]);
+    // The display vanishes and macOS drops w2 onto the remaining one, in the
+    // same observation. That landing is nobody's intent.
+    let mut wins = std_windows();
+    wins[1].snap.frame = rect(80.0, 34.0);
+    wins[1] = on_monitor(wins[1].clone(), 2); // the backend's word: still monitor 2
+    let unplug = update(
+        &s,
+        &observed_view(
+            laptop(1, true),
+            vec![mon_a(1)],
+            wins.clone(),
+            Some(1),
+            RescanTrigger::BackendHint {
+                kind: "display_reconfigured".into(),
+            },
+        ),
+    );
+    assert!(monitor_assignments(&unplug.effects).is_empty());
+    assert!(!unplug
+        .notes
+        .iter()
+        .any(|n| matches!(n, Note::MonitorAdopted { .. })));
+    assert_eq!(count_set_frames(&unplug.effects, 2), 0, "hidden: the backend parks it");
+    assert_eq!(unplug.state.windows[&wid(2)].vmonitor, vm(2), "declaration kept");
+    assert!(!unplug.state.is_visible(&unplug.state.windows[&wid(2)]));
+
+    // And on a later, quiet scan the (parked, hidden) window is still no
+    // drag: its monitor is not hosted, so there is nothing to adopt onto.
+    let later = update(
+        &unplug.state,
+        &observed_view(
+            laptop(1, true),
+            vec![mon_a(1)],
+            wins,
+            Some(1),
+            RescanTrigger::Periodic,
+        ),
+    );
+    assert!(later.effects.is_empty(), "{:?}", later.effects);
+}
+
+#[test]
+fn a_drag_across_live_displays_adopts_the_new_monitor_once() {
+    let s = booted(&[1]);
+    // w2 is dragged from the second display onto the first — an unexplained
+    // move between two live displays, with no display change.
+    let mut wins = std_windows();
+    wins[1].snap.frame = rect(800.0, 100.0);
+    wins[1] = on_monitor(wins[1].clone(), 2); // the word has not moved yet
+    let drag = update(
+        &s,
+        &observed(
+            vec![mon_a(1), mon_b(1)],
+            wins.clone(),
+            Some(1),
+            RescanTrigger::Periodic,
+        ),
+    );
+    assert_eq!(monitor_assignments(&drag.effects), vec![(wid(2), vm(1))]);
+    assert!(drag.notes.contains(&Note::MonitorAdopted {
+        window: wid(2),
+        monitor: vm(1)
+    }));
+    assert_eq!(count_set_frames(&drag.effects, 2), 0, "the user's hands win, no fight");
+
+    // The word follows the adoption: confirmed, and the window is left alone.
+    wins[1] = on_monitor(wins[1].clone(), 1);
+    let settled = update(
+        &drag.state,
+        &observed(
+            vec![mon_a(1), mon_b(1)],
+            wins.clone(),
+            Some(1),
+            RescanTrigger::Periodic,
+        ),
+    );
+    assert!(settled
+        .notes
+        .iter()
+        .any(|n| matches!(n, Note::SelfConfirmed { .. })));
+    let quiet = update(
+        &settled.state,
+        &observed(
+            vec![mon_a(1), mon_b(1)],
+            wins,
+            Some(1),
+            RescanTrigger::Periodic,
+        ),
+    );
+    assert!(quiet.effects.is_empty(), "{:?}", quiet.effects);
+}
+
+#[test]
+fn a_drag_onto_a_shared_display_adopts_the_monitor_it_stands_for() {
+    // Three virtual monitors, two displays, collapsed: the second display
+    // hosts monitors 2 and 3. A window dragged onto it becomes a monitor-2
+    // window (the first the display absorbs) — never a fight.
+    let view = VirtualMonitors {
+        count: 3,
+        viewed: vm(1),
+        enabled: false,
+    };
+    let wins = vec![
+        win(1, 100, 1, rect(100.0, 100.0)),
+        on_monitor(win(2, 200, 1, rect(2000.0, 100.0)), 3),
+    ];
+    let s = update(
+        &State::new(),
+        &observed_view(
+            view,
+            vec![mon_a(1), mon_b(1)],
+            wins.clone(),
+            Some(1),
+            RescanTrigger::Startup,
+        ),
+    )
+    .state;
+    assert!(s.is_visible(&s.windows[&wid(2)]));
+    // w2, declared on monitor 3, sits on the display hosting 3: no violation.
+    let quiet = update(
+        &s,
+        &observed_view(
+            view,
+            vec![mon_a(1), mon_b(1)],
+            wins.clone(),
+            Some(1),
+            RescanTrigger::Periodic,
+        ),
+    );
+    assert!(quiet.effects.is_empty(), "{:?}", quiet.effects);
+
+    let mut dragged = wins;
+    dragged[0].snap.frame = rect(2200.0, 300.0);
+    dragged[0] = on_monitor(dragged[0].clone(), 1);
+    let drag = update(
+        &s,
+        &observed_view(
+            view,
+            vec![mon_a(1), mon_b(1)],
+            dragged,
+            Some(1),
+            RescanTrigger::Periodic,
+        ),
+    );
+    assert_eq!(monitor_assignments(&drag.effects), vec![(wid(1), vm(2))]);
+    assert_eq!(count_set_frames(&drag.effects, 1), 0);
+}
+
+#[test]
+fn a_gesture_landing_on_a_hidden_monitor_is_followed_and_an_unwitnessed_one_held() {
+    let s = undocked(&[1]); // w2 hidden on monitor 2
+
+    // Cmd+Tab to w2's app: the user went there; the view follows, on the
+    // monitor axis only — the workspace is already current.
+    let switched = update(&s, &gesture(Gesture::SystemSwitch)).state;
+    let followed = update(
+        &switched,
+        &observed_view(
+            laptop(1, true),
+            vec![mon_a(1)],
+            undocked_windows(),
+            Some(2),
+            RescanTrigger::Periodic,
+        ),
+    );
+    assert_eq!(view_targets(&followed.effects), vec![vm(2)]);
+    assert_eq!(count_switches(&followed.effects), 0);
+    assert!(followed.notes.contains(&Note::FollowedFocus {
+        window: wid(2),
+        target: ws(1),
+        monitor: Some(vm(2)),
+    }));
+    assert_eq!(followed.state.focus_intent(), FocusIntent::Window(wid(2)));
+
+    // The same landing with no gesture is a fling into an invisible window:
+    // focus is pulled back to the visible MRU window.
+    let held = update(
+        &s,
+        &observed_view(
+            laptop(1, true),
+            vec![mon_a(1)],
+            undocked_windows(),
+            Some(2),
+            RescanTrigger::Periodic,
+        ),
+    );
+    assert!(view_targets(&held.effects).is_empty());
+    assert!(held
+        .notes
+        .iter()
+        .any(|n| matches!(n, Note::HeldFocus { window, .. } if *window == wid(1))));
+    assert_eq!(focus_targets(&held.effects), vec![wid(1)]);
+}
+
+#[test]
+fn without_a_virtual_layer_a_monitor_is_its_display() {
+    // A native-backend world (or a pre-monitor log): no word at all.
+    let mut snap = world(&[mon_a(1), mon_b(1)], &std_windows(), Some(1));
+    snap.workspaces.virtual_monitors = None;
+    let s = update(
+        &State::new(),
+        &Event::WorldObserved {
+            at: ts(),
+            trigger: RescanTrigger::Startup,
+            snap,
+        },
+    )
+    .state;
+    assert_eq!(s.virtual_monitors, None);
+    assert_eq!(s.windows[&wid(2)].vmonitor, vm(2), "position of its display");
+    assert!(s.is_visible(&s.windows[&wid(2)]));
+
+    // Monitor chords still work physically; the virtual-only ones are inert.
+    let other = update(&s, &hotkey(HotkeyAction::MruOtherMonitor));
+    assert_eq!(focus_targets(&other.effects), vec![wid(2)]);
+    let moved = update(&s, &hotkey(HotkeyAction::MoveFocusedToMonitorNext));
+    assert!(monitor_assignments(&moved.effects).is_empty(), "nothing to declare to");
+    assert!(set_frame_for(&moved.effects, 1).is_some_and(|f| f.x >= 1920.0));
+    assert!(update(&s, &hotkey(HotkeyAction::ViewMonitorNext)).effects.is_empty());
+    assert!(update(&s, &hotkey(HotkeyAction::ToggleVirtualMonitors)).effects.is_empty());
 }

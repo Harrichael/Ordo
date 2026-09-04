@@ -70,6 +70,16 @@ impl<'de> Deserialize<'de> for MonitorId {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct WorkspaceId(pub u8);
 
+/// A virtual monitor: a 1-based ordinal, left to right. This is the monitor
+/// the CONTROL plane speaks of — a window is declared onto one, MRU chords are
+/// scoped by one, J/K step between them — and it names a position, never a
+/// piece of hardware: the display that stands at position 2 today may be a
+/// different panel tomorrow, and the same declarations must hold. How virtual
+/// monitors land on the displays actually present is the projection
+/// (`crate::project`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct VirtualMonitorId(pub u8);
+
 /// App identity at runtime. The bundle id is carried as log metadata only —
 /// pids are what AX and CG events actually speak.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

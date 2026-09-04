@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{MonitorId, OpId, Pid, Point, Rect, WindowId, WorkspaceId};
+use crate::ids::{MonitorId, OpId, Pid, Point, Rect, VirtualMonitorId, WindowId, WorkspaceId};
+use crate::state::VirtualMonitors;
 
 /// Both clocks, stamped by the shell at ingest. Wall time is what the user
 /// remembers ("around 3pm"); monotonic time is what ordering and latency
@@ -97,9 +98,23 @@ pub enum HotkeyAction {
     /// the back of the visual stack, and focus the next MRU window — "done
     /// with this one, stop offering it (or showing it)".
     MruDemote,
-    /// Cmd+Shift+Left/Right: the window moves and the "view" moves with it —
-    /// focus stays on it and the mouse follows to its new center.
-    MoveFocusedToOtherMonitor,
+    /// Cmd+Shift+Left/Right: the focused window moves to the adjacent VIRTUAL
+    /// monitor, clamped at the ends, and the "view" moves with it — focus
+    /// stays on it and the mouse follows to its new center. When the target
+    /// monitor is hidden (fewer displays than monitors) the view is switched
+    /// there too, so the window is never moved out of sight.
+    MoveFocusedToMonitorPrev,
+    MoveFocusedToMonitorNext,
+    /// Cmd+Alt+J / Cmd+Alt+K: view the adjacent virtual monitor, clamped at
+    /// the ends. Global — not per workspace. Focus goes to that monitor's MRU
+    /// window, so on a full rig this is a focus jump between displays and with
+    /// one display it also reveals the monitor's windows.
+    ViewMonitorPrev,
+    ViewMonitorNext,
+    /// Cmd+Alt+V: virtualization on/off. Off collapses every virtual monitor
+    /// onto the displays present; on shows only the viewed one where displays
+    /// are short. The declarations are untouched either way.
+    ToggleVirtualMonitors,
     /// Ctrl+Cmd+Left/Right: carry the focused window to the adjacent workspace
     /// and switch there with it. The window keeps its frame and its focus, so
     /// the mouse has nowhere to follow — nothing on screen moves except the
@@ -199,6 +214,21 @@ pub struct WorkspaceSnap {
     /// Workspace assignment for every window the backend resolved; an
     /// unresolved window is absent, and its belief stands.
     pub assignments: std::collections::BTreeMap<WindowId, WorkspaceId>,
+    /// The virtual-monitor layer, when the backend has one. `None` means
+    /// there is no such layer (native Spaces, logs from before it existed):
+    /// the core then takes each window's virtual monitor to be the position
+    /// of the display it sits on, which is what "no virtualization" means.
+    #[serde(default)]
+    pub virtual_monitors: Option<VirtualMonitorsWord>,
+}
+
+/// The backend's word on the virtual-monitor layer: the layout declarations
+/// (how many, which is the anchor, whether virtualization is on) and each
+/// resolved window's monitor. Same provenance rules as the workspace word.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct VirtualMonitorsWord {
+    pub view: VirtualMonitors,
+    pub assignments: std::collections::BTreeMap<WindowId, VirtualMonitorId>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]

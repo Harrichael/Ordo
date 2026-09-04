@@ -35,6 +35,10 @@ pub enum ParkTraceKind {
     Reassert,
     /// Restore write issued back to the remembered frame.
     Restore,
+    /// Restore write issued onto the window's monitor's display, carried over
+    /// from the display the promise was made on: the rig changed while the
+    /// window was hidden (monitor memory bringing a window home).
+    Rehost,
     /// Restored with no trustworthy promise — re-homed somewhere reachable.
     Rehome,
     /// A refused promise: the remembered frame was itself a park position.
@@ -49,6 +53,9 @@ pub enum ParkTraceKind {
     Standoff,
     /// A workspace switch began: the boundary that groups everything after it.
     Switch,
+    /// A view change began — a monitor viewed, virtualization toggled, or the
+    /// display set changed under the projection. Same grouping role.
+    View,
     /// Dock dimming un-hid an app (Cmd+H cleared), revealing EVERY window it
     /// owns — including the ones parked for other workspaces. The suspected
     /// source of the switch flash, and previously unrecorded, so a flash could

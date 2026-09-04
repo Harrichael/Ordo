@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::event::RescanTrigger;
-use crate::ids::{OpId, Point, Rect, WindowId, WorkspaceId};
+use crate::ids::{OpId, Point, Rect, VirtualMonitorId, WindowId, WorkspaceId};
 
 /// Instructions to the shell. Executors perform them and report back via
 /// `Event::EffectResult`; the world's actual reaction arrives via the next
@@ -32,6 +32,28 @@ pub enum Effect {
         op: OpId,
         window: WindowId,
         target: WorkspaceId,
+    },
+    /// Rewrite one window's virtual-monitor DECLARATION and nothing else — the
+    /// monitor twin of `AssignWindowToWorkspace`. Never a frame write: when the
+    /// window should also move displays the core issues the `SetWindowFrame`
+    /// itself, and when the target monitor is hidden the core views it in the
+    /// same breath, so the window never needs parking here. (A park here would
+    /// race the view's restore of the very same window.)
+    AssignWindowToMonitor {
+        op: OpId,
+        window: WindowId,
+        target: VirtualMonitorId,
+    },
+    /// Make `target` the viewed (anchor) virtual monitor. Where displays are
+    /// short this hides one monitor's windows and reveals another's; on a
+    /// full rig it changes nothing on screen.
+    ViewMonitor {
+        op: OpId,
+        target: VirtualMonitorId,
+    },
+    SetVirtualMonitors {
+        op: OpId,
+        enabled: bool,
     },
     /// The core computes target geometry itself (pure math over monitor
     /// frames); the shell only performs the AX write.
@@ -88,6 +110,12 @@ pub enum Expectation {
         frame: Rect,
     },
     Focused(WindowId),
+    WindowOnMonitor {
+        window: WindowId,
+        monitor: VirtualMonitorId,
+    },
+    Viewing(VirtualMonitorId),
+    VirtualMonitorsEnabled(bool),
 }
 
 /// Which independent placement fight a correction belongs to. Workspace
@@ -104,14 +132,16 @@ impl Expectation {
     /// reset that window's damping counter once the world accepts a correction.
     pub fn window(&self) -> Option<WindowId> {
         match self {
-            Expectation::WindowOn { window, .. } | Expectation::WindowFramed { window, .. } => {
-                Some(*window)
-            }
+            Expectation::WindowOn { window, .. }
+            | Expectation::WindowFramed { window, .. }
+            | Expectation::WindowOnMonitor { window, .. } => Some(*window),
             _ => None,
         }
     }
 
-    /// The damping axis this expectation's correction is damped on.
+    /// The damping axis this expectation's correction is damped on. A monitor
+    /// assignment has none: it is a declaration to Ordo's own backend, which
+    /// nothing contests, so there is no fight to damp.
     pub fn axis(&self) -> Option<CorrectionAxis> {
         match self {
             Expectation::WindowOn { .. } => Some(CorrectionAxis::Workspace),

@@ -70,6 +70,17 @@ impl Effector for MacEffector {
                     .borrow_mut()
                     .assign_window_to_workspace(*window, *target),
             )),
+            Effect::AssignWindowToMonitor { window, target, .. } => Some(result_outcome(
+                self.backend
+                    .borrow_mut()
+                    .assign_window_to_monitor(*window, *target),
+            )),
+            Effect::ViewMonitor { target, .. } => {
+                Some(result_outcome(self.backend.borrow_mut().view_monitor(*target)))
+            }
+            Effect::SetVirtualMonitors { enabled, .. } => Some(result_outcome(
+                self.backend.borrow_mut().set_virtual_monitors(*enabled),
+            )),
             Effect::WarpMouse { to } => {
                 mouse::warp_to(*to);
                 None

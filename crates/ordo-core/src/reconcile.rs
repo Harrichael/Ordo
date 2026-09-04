@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::effect::Expectation;
 use crate::event::{MonitorSnap, WorldSnapshot};
-use crate::ids::{MonitorId, Rect, WindowId, WorkspaceId, FRAME_EPSILON};
-use crate::state::{State, WindowRecord};
+use crate::ids::{MonitorId, Rect, VirtualMonitorId, WindowId, WorkspaceId, FRAME_EPSILON};
+use crate::state::{State, VirtualMonitors, WindowRecord};
 
 /// What changed between the previous belief and a fresh snapshot. Deltas are
 /// the unit of self-vs-external attribution: one that matches a pending
@@ -38,6 +38,19 @@ pub enum Delta {
     FocusChanged {
         from: Option<WindowId>,
         to: Option<WindowId>,
+    },
+    /// The backend's word moved a window's virtual-monitor declaration.
+    WindowMonitorAssigned {
+        window: WindowId,
+        from: VirtualMonitorId,
+        to: VirtualMonitorId,
+    },
+    ViewedMonitorChanged {
+        from: VirtualMonitorId,
+        to: VirtualMonitorId,
+    },
+    VirtualMonitorsToggled {
+        enabled: bool,
     },
 }
 
@@ -123,6 +136,31 @@ pub(crate) fn diff(state: &State, snap: &WorldSnapshot) -> Vec<Delta> {
         });
     }
 
+    if let (Some(old), Some(word)) = (state.virtual_monitors, &snap.workspaces.virtual_monitors) {
+        if old.viewed != word.view.viewed {
+            deltas.push(Delta::ViewedMonitorChanged {
+                from: old.viewed,
+                to: word.view.viewed,
+            });
+        }
+        if old.enabled != word.view.enabled {
+            deltas.push(Delta::VirtualMonitorsToggled {
+                enabled: word.view.enabled,
+            });
+        }
+        for (id, vm) in &word.assignments {
+            if let Some(old) = state.windows.get(id) {
+                if old.vmonitor != *vm {
+                    deltas.push(Delta::WindowMonitorAssigned {
+                        window: *id,
+                        from: old.vmonitor,
+                        to: *vm,
+                    });
+                }
+            }
+        }
+    }
+
     deltas
 }
 
@@ -159,6 +197,14 @@ pub(crate) fn apply_snapshot(s: &mut State, snap: &WorldSnapshot) {
     if let Some(min) = snap.workspaces.monitors.values().map(|m| m.count).min() {
         s.workspace_count = min.max(1);
     }
+    // The virtual layer is the backend's word entirely; its absence is the
+    // statement that there is none, not a blip to ride out.
+    s.virtual_monitors = snap
+        .workspaces
+        .virtual_monitors
+        .as_ref()
+        .map(|w| VirtualMonitors { ..w.view });
+    let positions = s.monitors_by_position();
 
     for w in &snap.windows {
         // A window whose monitor can't be derived means the snapshot has no
@@ -182,6 +228,20 @@ pub(crate) fn apply_snapshot(s: &mut State, snap: &WorldSnapshot) {
         else {
             continue;
         };
+        // The monitor declaration follows the same rule as the workspace's
+        // when there is a virtual layer. Without one, a window's virtual
+        // monitor IS the position of its display — the degenerate projection.
+        let vmonitor = match &snap.workspaces.virtual_monitors {
+            Some(word) => word
+                .assignments
+                .get(&w.id)
+                .copied()
+                .or(prior.map(|r| r.vmonitor))
+                .unwrap_or(VirtualMonitorId(1)),
+            None => VirtualMonitorId(
+                positions.iter().position(|m| *m == monitor).map_or(1, |i| i as u8 + 1),
+            ),
+        };
         let (ws_corrections, frame_corrections) =
             prior.map_or((0, 0), |r| (r.ws_corrections, r.frame_corrections));
         let is_new = prior.is_none();
@@ -193,6 +253,7 @@ pub(crate) fn apply_snapshot(s: &mut State, snap: &WorldSnapshot) {
                 bundle_id: w.bundle_id.clone(),
                 title: w.title.clone(),
                 workspace,
+                vmonitor,
                 monitor,
                 frame: w.frame,
                 ws_corrections,
@@ -259,6 +320,14 @@ pub(crate) fn explains(e: &Expectation, d: &Delta) -> bool {
             Delta::WindowMonitorChanged { window: w, .. },
         ) => w == window,
         (Expectation::Focused(t), Delta::FocusChanged { to, .. }) => *to == Some(*t),
+        (
+            Expectation::WindowOnMonitor { window, monitor },
+            Delta::WindowMonitorAssigned { window: w, to, .. },
+        ) => w == window && to == monitor,
+        (Expectation::Viewing(t), Delta::ViewedMonitorChanged { to, .. }) => to == t,
+        (Expectation::VirtualMonitorsEnabled(e), Delta::VirtualMonitorsToggled { enabled }) => {
+            enabled == e
+        }
         _ => false,
     }
 }

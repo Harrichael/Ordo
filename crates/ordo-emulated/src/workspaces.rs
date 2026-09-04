@@ -3,21 +3,31 @@
 //! policing that reality keeps matching them.
 //!
 //! The model's data splits in two, and the split is the architecture.
-//! DECLARATIONS — which workspace a window belongs to, which workspace is
-//! visible — are written only by Ordo's own commands: a user switch or move,
-//! rescue, and a window's birth (a brand-new window has no prior intent to
-//! preserve). OBSERVATIONS — frames, existence, focus — are authoritative
-//! about the world, never about intent. An observation that contradicts a
-//! declaration is a violation to correct on screen or to surface to the
-//! user, NEVER to absorb into the declaration: a declaration must not travel
-//! through the observation channel.
+//! DECLARATIONS — which workspace and virtual monitor a window belongs to,
+//! which workspace is visible, which monitor is the anchor, whether
+//! virtualization is on — are written only by Ordo's own commands: a user
+//! switch, view or move, rescue, and a window's birth (a brand-new window has
+//! no prior intent to preserve). OBSERVATIONS — frames, existence, focus — are
+//! authoritative about the world, never about intent. An observation that
+//! contradicts a declaration is a violation to correct on screen or to surface
+//! to the user, NEVER to absorb into the declaration: a declaration must not
+//! travel through the observation channel.
+//!
+//! This is also the projection plane: the virtual monitors of the control
+//! plane land on whatever displays are present (`ordo_core::project`), and a
+//! window whose monitor has no display is parked exactly like one on a hidden
+//! workspace. A display coming or going is a change to the projection and is
+//! planned like a switch — which is the whole of monitor memory.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 
-use ordo_core::{Pid, Point, Rect, WindowId, WorkspaceId};
+use ordo_core::{
+    project, Pid, Point, Rect, VirtualMonitorId, VirtualMonitors, WindowId,
+    WorkspaceId, FRAME_EPSILON,
+};
 
-use crate::ledger::{Claim, Ledger, MoveAction};
+use crate::ledger::{Claim, Ledger, SwitchPlan};
 use crate::statefile::{self, PersistedState, PersistedWindow};
 use crate::trace::{HoldStat, ParkTrace, ParkTraceKind};
 use crate::{Desktop, Unhide};
@@ -63,7 +73,7 @@ const ENFORCE_LIMIT: u8 = 3;
 ///
 /// The escape goes LEFT instead: nothing sits left of the leftmost display,
 /// and x is the one axis macOS never clamps.
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug)]
 struct Geometry {
     /// Where a window RETURNS to: a re-homed window must land where the user
     /// is looking.
@@ -76,17 +86,17 @@ struct Geometry {
     /// [`in_park_corner`] can still recognize them; drop it once no live
     /// window or state file can predate this change.
     legacy_host: Rect,
+    /// Every display, left to right — the order the projection indexes. Must
+    /// sort exactly as the core's `State::monitors_by_position`.
+    displays: Vec<Rect>,
 }
 
 impl Geometry {
     fn read(d: &dyn Desktop) -> Self {
         let main = d.main_display();
-        let displays = d.displays();
-        let park_host = displays
-            .iter()
-            .copied()
-            .min_by(|a, b| a.x.total_cmp(&b.x).then(a.y.total_cmp(&b.y)))
-            .unwrap_or(main);
+        let mut displays = d.displays();
+        displays.sort_by(|a, b| a.x.total_cmp(&b.x).then(a.y.total_cmp(&b.y)));
+        let park_host = displays.first().copied().unwrap_or(main);
         let legacy_host = displays
             .iter()
             .copied()
@@ -100,7 +110,17 @@ impl Geometry {
             main,
             park_host,
             legacy_host,
+            displays,
         }
+    }
+
+    fn physical(&self) -> usize {
+        self.displays.len()
+    }
+
+    /// The display holding a point, if any.
+    fn display_at(&self, p: Point) -> Option<Rect> {
+        self.displays.iter().copied().find(|d| d.contains(p))
     }
 }
 
@@ -108,12 +128,24 @@ impl Geometry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorkspaceOutOfRange(pub WorkspaceId);
 
+/// A requested virtual monitor outside the known range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MonitorOutOfRange(pub VirtualMonitorId);
+
 pub struct EmulatedWorkspaces {
     ledger: Ledger,
     /// The real on-screen frame each parked window was taken from. Whole,
     /// because it is what the core is told the window's frame IS while the
     /// window is really a sliver; only its origin is written back on restore.
     saved: HashMap<WindowId, Rect>,
+    /// The frame each window last held with the FULL rig present — every
+    /// virtual monitor on a display of its own. Refreshed from observation in
+    /// that state only, never while collapsed or viewed on a shared display,
+    /// so neither a toggle nor an undocked session can overwrite the docked
+    /// layout. This is what lets a replug put a window back exactly where it
+    /// was: macOS re-homes a vanished display's windows onto the laptop before
+    /// Ordo sees anything, so `saved` alone can only remember the laptop frame.
+    home: HashMap<WindowId, Rect>,
     /// Windows currently parked off-screen. Tracked so re-parking an
     /// already-parked window (a hidden->hidden move) doesn't overwrite its real
     /// saved frame with the sliver position.
@@ -166,6 +198,7 @@ impl EmulatedWorkspaces {
         EmulatedWorkspaces {
             ledger: Ledger::new(count),
             saved: HashMap::new(),
+            home: HashMap::new(),
             parked: HashSet::new(),
             enforce_attempts: HashMap::new(),
             park_request: HashMap::new(),
@@ -211,13 +244,21 @@ impl EmulatedWorkspaces {
         self.ledger.count()
     }
 
+    pub fn monitors(&self) -> VirtualMonitors {
+        self.ledger.monitors()
+    }
+
     pub fn window_ws(&self) -> BTreeMap<WindowId, WorkspaceId> {
         self.ledger.window_ws()
     }
 
+    pub fn window_monitors(&self) -> BTreeMap<WindowId, VirtualMonitorId> {
+        self.ledger.window_monitors()
+    }
+
     /// Fold a completed window scan into the model: adopt the genuinely new,
-    /// forget the provably dead, keep the park bookkeeping in lockstep with
-    /// the ledger.
+    /// forget the provably dead, learn the display set, keep the park
+    /// bookkeeping in lockstep with the ledger.
     ///
     /// Absence is not death. An empty scan looks exactly like "every window
     /// closed" when displays sleep (the weekend flatten), and a PARTIAL scan
@@ -229,7 +270,12 @@ impl EmulatedWorkspaces {
     /// it no longer exists; a failed CG read is not evidence either, and
     /// everything is kept.
     pub fn note_scan(&mut self, d: &dyn Desktop, windows: &[(WindowId, Pid)]) {
+        let g = Geometry::read(d);
+        let mut dirty = self.note_displays(d, &g);
         if windows.is_empty() {
+            if dirty {
+                self.persist();
+            }
             return;
         }
         let before = self.ledger.window_claims();
@@ -252,18 +298,103 @@ impl EmulatedWorkspaces {
                 self.drop_park_bookkeeping(&dead);
             }
         }
+        // A new window is adopted onto the monitor its display stands for —
+        // it is visibly there — and onto the anchor where the display stands
+        // for several (collapsed) or none.
+        let frames = current_frames(d);
+        let proj = self.ledger.projection();
+        let viewed = self.ledger.monitors().viewed;
+        let adopt = |id: WindowId| {
+            frames
+                .get(&id)
+                .and_then(|(_, f)| g.displays.iter().position(|d| d.contains(f.center())))
+                .and_then(|i| proj.canonical_vm(i))
+                .unwrap_or(viewed)
+        };
         // A recycled id's saved frame belongs to a dead stranger; the new
         // window must not inherit a teleport to it.
-        let recycled = self.ledger.note_seen(windows);
+        let recycled = self.ledger.note_seen(windows, adopt);
         self.drop_park_bookkeeping(&recycled);
-        if self.ledger.window_claims() != before {
+        dirty |= self.ledger.window_claims() != before;
+        dirty |= self.refresh_home(&frames, &g);
+        if dirty {
             self.persist();
         }
+    }
+
+    /// Learn the display set. A change is a change to the projection, so the
+    /// view is decided here — BEFORE enforcement projects anything — by one
+    /// named policy: the view follows the focused window. A topology change is
+    /// systemic; without this the anchor stays where it was, the window the
+    /// user is typing into is parked, and the core's focus invariant then
+    /// yanks focus to whatever is left. Deciding it here also spares the
+    /// screen a park of the wrong set followed by its unpark a snapshot later.
+    /// The park/restore writes themselves belong to `enforce_placement`, which
+    /// runs only while Ordo is driving.
+    fn note_displays(&mut self, d: &dyn Desktop, g: &Geometry) -> bool {
+        let physical = g.physical();
+        // Displays asleep are not a rig with no monitors; nothing is learned.
+        if physical == 0 || physical == self.ledger.physical() {
+            return false;
+        }
+        let m = self.ledger.monitors();
+        let after = project(m.count.max(physical as u8), m.viewed, m.enabled, physical);
+        if let Some(c) = d.focused_window().and_then(|w| self.ledger.claim(w)) {
+            if c.ws == self.ledger.current() && !after.is_hosted(c.monitor) {
+                self.ledger.set_viewed(c.monitor);
+            }
+        }
+        let plan = self.ledger.note_displays(physical);
+        let current = self.ledger.current();
+        self.note(
+            ParkTrace::new(WindowId(0), ParkTraceKind::View)
+                .ws(current, current)
+                .detail(format!(
+                    "{physical} display(s); anchor {}; hiding {}, revealing {}",
+                    self.ledger.monitors().viewed.0,
+                    plan.park.len(),
+                    plan.restore.len()
+                )),
+        );
+        true
+    }
+
+    /// Whether every virtual monitor has a display of its own right now.
+    fn full_rig(&self, g: &Geometry) -> bool {
+        g.physical() >= self.ledger.monitors().count as usize
+    }
+
+    /// Remember where each on-screen window sits while the full rig is
+    /// present. Returns whether anything durable changed.
+    fn refresh_home(&mut self, frames: &HashMap<WindowId, (Pid, Rect)>, g: &Geometry) -> bool {
+        if !self.full_rig(g) {
+            return false;
+        }
+        let proj = self.ledger.projection();
+        let mut changed = false;
+        for (w, (_, f)) in frames {
+            if !self.ledger.visible(*w, &proj)
+                || self.parked.contains(w)
+                || self.reads_parked(*w, f, g)
+            {
+                continue;
+            }
+            if self
+                .home
+                .get(w)
+                .is_none_or(|h| !h.approx_eq(f, FRAME_EPSILON))
+            {
+                self.home.insert(*w, *f);
+                changed = true;
+            }
+        }
+        changed
     }
 
     fn drop_park_bookkeeping(&mut self, ids: &[WindowId]) {
         for id in ids {
             self.saved.remove(id);
+            self.home.remove(id);
             self.parked.remove(id);
             self.enforce_attempts.remove(id);
             self.park_request.remove(id);
@@ -290,42 +421,76 @@ impl EmulatedWorkspaces {
         d.move_windows(&moves);
     }
 
-    pub fn switch_workspace(&mut self, d: &dyn Desktop, target: WorkspaceId) {
-        // Stacking is NOT this backend's problem: the core follows every
-        // switch with a RestackWindows effect derived from the MRU history,
-        // which the effector reasserts after this returns.
-        // Before the ledger moves: afterwards `current` IS the target.
-        let from = self.ledger.current();
-        let plan = self.ledger.switch(target);
-        if plan.park.is_empty() && plan.restore.is_empty() {
-            self.persist(); // `current` may still have changed
+    /// Carry out a plan: park what left the screen, restore what entered it.
+    /// Frames first, then visibility — a window must already be at the corner
+    /// before its app is un-hidden, or the unhide reveals it where it still
+    /// stands. Whether that ordering is SUFFICIENT is the open question: it
+    /// cannot stop an app from restoring its own geometry in response to
+    /// being un-hidden, which is what the trace is here to show.
+    ///
+    /// Stacking is NOT this backend's problem: the core follows every switch
+    /// or view with a RestackWindows effect derived from the MRU history,
+    /// which the effector reasserts after this returns.
+    fn apply_plan(&mut self, d: &dyn Desktop, plan: SwitchPlan, boundary: ParkTrace) {
+        if plan.is_empty() {
+            self.persist(); // the declaration may still have changed
             return;
         }
         let frames = current_frames(d);
         let g = Geometry::read(d);
-        let t = ParkTrace::new(WindowId(0), ParkTraceKind::Switch)
-            .ws(from, target)
-            .detail(format!(
-                "parking {}, restoring {}",
-                plan.park.len(),
-                plan.restore.len()
-            ));
-        self.note(t);
+        self.note(boundary.detail(format!(
+            "parking {}, restoring {}",
+            plan.park.len(),
+            plan.restore.len()
+        )));
         let mut writes = Vec::new();
         for w in plan.park {
-            writes.extend(self.park(w, None, &frames, g));
+            writes.extend(self.park(w, None, &frames, &g));
         }
         for w in plan.restore {
-            writes.extend(self.restore(w, &frames, g));
+            writes.extend(self.restore(w, &frames, &g));
         }
         self.persist();
-        // Frames first, then visibility — a window must already be at the
-        // corner before its app is un-hidden, or the unhide reveals it where it
-        // still stands. Whether that ordering is SUFFICIENT is the open
-        // question: it cannot stop an app from restoring its own geometry in
-        // response to being un-hidden, which is what the trace is here to show.
         self.move_windows(d, &writes);
-        self.apply_app_visibility(d, &frames, g);
+        self.apply_app_visibility(d, &frames, &g);
+    }
+
+    pub fn switch_workspace(&mut self, d: &dyn Desktop, target: WorkspaceId) {
+        // Before the ledger moves: afterwards `current` IS the target.
+        let from = self.ledger.current();
+        let plan = self.ledger.switch(target);
+        let boundary = ParkTrace::new(WindowId(0), ParkTraceKind::Switch).ws(from, target);
+        self.apply_plan(d, plan, boundary);
+    }
+
+    pub fn view_monitor(
+        &mut self,
+        d: &dyn Desktop,
+        target: VirtualMonitorId,
+    ) -> Result<(), MonitorOutOfRange> {
+        let plan = self
+            .ledger
+            .view_monitor(target)
+            .ok_or(MonitorOutOfRange(target))?;
+        let current = self.ledger.current();
+        let boundary = ParkTrace::new(WindowId(0), ParkTraceKind::View)
+            .ws(current, current)
+            .detail(format!("anchor {}", target.0));
+        self.apply_plan(d, plan, boundary);
+        Ok(())
+    }
+
+    pub fn set_virtual_monitors(&mut self, d: &dyn Desktop, enabled: bool) {
+        let plan = self.ledger.set_enabled(enabled);
+        let current = self.ledger.current();
+        let boundary = ParkTrace::new(WindowId(0), ParkTraceKind::View)
+            .ws(current, current)
+            .detail(if enabled {
+                "virtualization on"
+            } else {
+                "virtualization off"
+            });
+        self.apply_plan(d, plan, boundary);
     }
 
     pub fn move_window_to_workspace(
@@ -334,16 +499,25 @@ impl EmulatedWorkspaces {
         window: WindowId,
         target: WorkspaceId,
     ) -> Result<(), WorkspaceOutOfRange> {
-        let frames = current_frames(d);
-        let g = Geometry::read(d);
-        let write = match self.ledger.assign_window(window, target) {
-            Some(MoveAction::Park) => self.park(window, None, &frames, g),
-            Some(MoveAction::Restore) => self.restore(window, &frames, g),
-            None => return Err(WorkspaceOutOfRange(target)),
-        };
-        self.persist();
-        self.move_windows(d, write.as_slice());
-        self.apply_app_visibility(d, &frames, g);
+        let mut plan = self
+            .ledger
+            .assign_window(window, target)
+            .ok_or(WorkspaceOutOfRange(target))?;
+        // A move onto the visible workspace of a window already standing there
+        // still gets its restore attempt: the plan sees no change, but a
+        // window physically at the corner (a promise from disk, a model gap)
+        // needs bringing back, and `restore` is a no-op for anything else.
+        if plan.is_empty()
+            && self.ledger.visible(window, &self.ledger.projection())
+            && !plan.restore.contains(&window)
+        {
+            plan.restore.push(window);
+        }
+        let current = self.ledger.current();
+        let boundary = ParkTrace::new(window, ParkTraceKind::Switch)
+            .ws(target, current)
+            .detail("window moved to workspace");
+        self.apply_plan(d, plan, boundary);
         Ok(())
     }
 
@@ -370,6 +544,23 @@ impl EmulatedWorkspaces {
         Ok(())
     }
 
+    /// The monitor twin of `assign_window_to_workspace`: declaration only.
+    /// The core moves the frame itself when the target monitor's display
+    /// differs, and views the target first when it is hidden — so the window
+    /// is never parked by this call, and any parking a stray declaration does
+    /// imply is enforcement's to assert.
+    pub fn assign_window_to_monitor(
+        &mut self,
+        window: WindowId,
+        target: VirtualMonitorId,
+    ) -> Result<(), MonitorOutOfRange> {
+        if self.ledger.assign_monitor(window, target).is_none() {
+            return Err(MonitorOutOfRange(target));
+        }
+        self.persist();
+        Ok(())
+    }
+
     pub fn bring_up(&mut self, use_state: bool) {
         if use_state {
             // O: reload the file. With write-through active this is the model
@@ -377,12 +568,18 @@ impl EmulatedWorkspaces {
             self.load_state();
             self.suspended = false;
         } else {
-            // R: blank model on the same workspace ordinal, file untouched
-            // and unused. Parked slivers keep sitting where they are — O can
-            // always bring their meaning back from the file.
-            self.ledger =
-                Ledger::restore(self.ledger.count(), self.ledger.current(), BTreeMap::new());
+            // R: blank model on the same workspace ordinal and layout, file
+            // untouched and unused. Parked slivers keep sitting where they
+            // are — O can always bring their meaning back from the file.
+            self.ledger = Ledger::restore(
+                self.ledger.count(),
+                self.ledger.current(),
+                self.ledger.monitors(),
+                self.ledger.physical(),
+                BTreeMap::new(),
+            );
             self.saved.clear();
+            self.home.clear();
             self.parked.clear();
             self.enforce_attempts.clear();
             self.park_request.clear();
@@ -413,10 +610,15 @@ impl EmulatedWorkspaces {
                     merge_fresh_session(&self.ledger.window_claims(), &self.saved, &ps, |id| {
                         frames
                             .get(id)
-                            .is_some_and(|(_, f)| self.reads_parked(*id, f, g))
+                            .is_some_and(|(_, f)| self.reads_parked(*id, f, &g))
                     });
-                self.ledger =
-                    Ledger::restore(self.ledger.count(), self.ledger.current(), merged.assign);
+                self.ledger = Ledger::restore(
+                    self.ledger.count(),
+                    self.ledger.current(),
+                    self.ledger.monitors(),
+                    self.ledger.physical(),
+                    merged.assign,
+                );
                 // Cheap assertion of the parked ⊆ assigned invariant (restore
                 // clamps rather than drops, so this always holds today — a
                 // parked entry with no assignment would arm enforcement
@@ -426,6 +628,11 @@ impl EmulatedWorkspaces {
                     if assigned.contains_key(&id) {
                         self.saved.insert(id, f);
                         self.parked.insert(id);
+                    }
+                }
+                for (id, f) in merged.home {
+                    if assigned.contains_key(&id) {
+                        self.home.insert(id, f);
                     }
                 }
             }
@@ -455,7 +662,7 @@ impl EmulatedWorkspaces {
             .iter()
             .filter_map(|(w, (_, f))| {
                 let saved = self.saved.get(w)?;
-                self.reads_parked(*w, f, g).then_some((*w, *saved))
+                self.reads_parked(*w, f, &g).then_some((*w, *saved))
             })
             .collect()
     }
@@ -474,15 +681,26 @@ impl EmulatedWorkspaces {
 
     /// `at_park`, plus the geometric fallback for frames with no request to
     /// anchor on (a restarted daemon, an R-mode blank, promises from disk).
-    fn reads_parked(&self, w: WindowId, f: &Rect, g: Geometry) -> bool {
+    fn reads_parked(&self, w: WindowId, f: &Rect, g: &Geometry) -> bool {
         self.at_park(w, f) || in_park_corner(f, g)
     }
 
-    /// Assert the declarations: every window assigned to a hidden workspace
-    /// must sit at the park corner. Iterates the LEDGER, not the parked set —
-    /// a window whose park write never happened (its frame was unreadable at
-    /// park time) is still declared hidden, and a parked-set walk was blind
-    /// to it forever.
+    /// The display the window's monitor is projected onto right now.
+    fn host_rect(&self, window: WindowId, g: &Geometry) -> Option<Rect> {
+        let claim = self.ledger.claim(window)?;
+        let i = self.ledger.projection().host(claim.monitor)?;
+        g.displays.get(i).copied()
+    }
+
+    /// Assert the declarations: every window that is not on screen must sit
+    /// at the park corner, and every window that IS on screen must not be
+    /// bookkept parked. Iterates the LEDGER, not the parked set — a window
+    /// whose park write never happened (its frame was unreadable at park
+    /// time) is still declared hidden, and a parked-set walk was blind to it
+    /// forever. The second half is what a display change costs: the
+    /// projection moved under the ledger (learned in `note_scan`), and the
+    /// windows whose monitor just regained a display are restored onto it —
+    /// monitor memory, on the rescan that follows the plug event.
     ///
     /// Enforcement asserts declarations by MOVING windows; it never writes a
     /// declaration. Violations are classified by frame before they cost
@@ -505,31 +723,40 @@ impl EmulatedWorkspaces {
     ///   self-heals; a declaration rewritten from the screen is a silent,
     ///   permanent loss of where the user filed the window.
     ///
-    /// A main-display change is a systemic event: the park corner moves,
-    /// so every parked window reads as in violation at once for a reason
-    /// that has nothing to do with opposition. That pass re-asserts without
-    /// counting and clears every budget.
+    /// A display change is a systemic event: the park corner moves, so every
+    /// parked window reads as in violation at once for a reason that has
+    /// nothing to do with opposition. That pass re-asserts without counting
+    /// and clears every budget.
     ///
     /// `frames` arrives from the caller rather than `d.windows()` because the
     /// shell's enumerator has always just scanned when this runs — no backend
     /// re-enumerates on its own.
     pub fn enforce_placement(&mut self, d: &dyn Desktop, frames: &HashMap<WindowId, (Pid, Rect)>) {
-        let current = self.ledger.current();
-        let hidden: Vec<WindowId> = self
-            .ledger
-            .window_ws()
-            .into_iter()
-            .filter(|(_, ws)| *ws != current)
-            .map(|(w, _)| w)
-            .collect();
-        // This runs on every snapshot; don't pay the display query when
-        // there's nothing to enforce.
-        if hidden.is_empty() {
+        let g = Geometry::read(d);
+        // Displays asleep: the projection would host nothing and every window
+        // would read as hidden. Not a world to assert anything against.
+        if g.displays.is_empty() {
             return;
         }
-        let g = Geometry::read(d);
-        let systemic = self.last_geometry.is_some_and(|prev| prev != g);
-        self.last_geometry = Some(g);
+        let current = self.ledger.current();
+        let proj = self.ledger.projection();
+        let claims = self.ledger.window_claims();
+        let hidden: Vec<WindowId> = claims
+            .keys()
+            .filter(|w| !self.ledger.visible(**w, &proj))
+            .copied()
+            .collect();
+        let stranded: Vec<WindowId> = claims
+            .keys()
+            .filter(|w| self.ledger.visible(**w, &proj) && self.parked.contains(w))
+            .copied()
+            .collect();
+        // This runs on every snapshot; don't pay for a quiet desktop.
+        if hidden.is_empty() && stranded.is_empty() {
+            return;
+        }
+        let systemic = self.last_geometry.as_ref().is_some_and(|prev| *prev != g);
+        self.last_geometry = Some(g.clone());
         if systemic {
             self.enforce_attempts.clear();
         }
@@ -564,7 +791,7 @@ impl EmulatedWorkspaces {
                     .at_park(false)
                     .attempt(self.enforce_attempts.get(&w).copied().unwrap_or(0))
                     .detail(if systemic {
-                        "main display changed; whole pass uncounted"
+                        "display set changed; whole pass uncounted"
                     } else if withheld {
                         "our own write; re-park already in flight, none issued"
                     } else {
@@ -614,7 +841,7 @@ impl EmulatedWorkspaces {
             // gets the corner write again; one that was never parked (the
             // blind spot) parks properly, capturing its promise on the way.
             if self.parked.contains(&w) {
-                let want = park_frame(*f, g);
+                let want = park_frame(*f, &g);
                 let t = ParkTrace::new(w, ParkTraceKind::Reassert)
                     .observed(*f)
                     .requested(want)
@@ -631,30 +858,43 @@ impl EmulatedWorkspaces {
                 }
                 writes.push((*pid, w, want));
             } else {
-                let write = self.park(w, self.enforce_attempts.get(&w).copied(), frames, g);
+                let write = self.park(w, self.enforce_attempts.get(&w).copied(), frames, &g);
                 newly_parked |= write.is_some();
                 writes.extend(write);
             }
         }
-        // A blind-spot park changed durable promises.
-        if newly_parked {
+        let mut restored = false;
+        for w in stranded {
+            if let Some(write) = self.restore(w, frames, &g) {
+                writes.push(write);
+                restored = true;
+            }
+        }
+        // A blind-spot park or a restore changed durable promises — and what
+        // is on screen, so the Dock follows, as after a switch.
+        if newly_parked || restored {
             self.persist();
         }
         self.move_windows(d, &writes);
+        if newly_parked || restored {
+            self.apply_app_visibility(d, frames, &g);
+        }
     }
 
     pub fn rescue_window(&mut self, d: &dyn Desktop, window: WindowId) {
-        // Claim it for the visible workspace and bring it back on-screen.
-        // No visibility pass here: rescue must only ever reveal, and the
-        // gather already unhides every app up front.
+        // Claim it for the visible workspace and the anchor monitor, and bring
+        // it back on-screen. No visibility pass here: rescue must only ever
+        // reveal, and the gather already unhides every app up front.
         let frames = current_frames(d);
+        let viewed = self.ledger.monitors().viewed;
         self.ledger.assign_window(window, self.ledger.current());
+        self.ledger.assign_monitor(window, viewed);
         // An empty hold: rescue reveals everything, deliberately.
         d.show_apps(&[Unhide {
             pid: frames.get(&window).map(|(p, _)| *p).unwrap_or(Pid(0)),
             hold: Vec::new(),
         }]);
-        let write = self.restore(window, &frames, Geometry::read(d));
+        let write = self.restore(window, &frames, &Geometry::read(d));
         self.persist();
         self.move_windows(d, write.as_slice());
     }
@@ -674,13 +914,26 @@ impl EmulatedWorkspaces {
                     w.id,
                     Claim {
                         ws: w.workspace,
+                        monitor: w.monitor,
                         owner: w.owner,
                     },
                 )
             })
             .collect();
-        self.ledger = Ledger::restore(count, ps.current, claims);
+        // A pre-monitor file has no count; the displays seen so far stand in.
+        let known = self.ledger.monitors();
+        let monitors = VirtualMonitors {
+            count: if ps.virtual_monitor_count == 0 {
+                known.count
+            } else {
+                ps.virtual_monitor_count
+            },
+            viewed: ps.viewed,
+            enabled: ps.virtual_monitors_enabled,
+        };
+        self.ledger = Ledger::restore(count, ps.current, monitors, self.ledger.physical(), claims);
         self.saved.clear();
+        self.home.clear();
         self.parked.clear();
         self.enforce_attempts.clear();
         self.park_request.clear();
@@ -690,6 +943,9 @@ impl EmulatedWorkspaces {
             if let Some(f) = w.saved {
                 self.saved.insert(w.id, f);
                 self.parked.insert(w.id);
+            }
+            if let Some(f) = w.home {
+                self.home.insert(w.id, f);
             }
         }
     }
@@ -706,20 +962,26 @@ impl EmulatedWorkspaces {
             .map(|(id, claim)| PersistedWindow {
                 id,
                 workspace: claim.ws,
+                monitor: claim.monitor,
                 owner: claim.owner,
                 saved: self
                     .parked
                     .contains(&id)
                     .then(|| self.saved.get(&id).copied())
                     .flatten(),
+                home: self.home.get(&id).copied(),
             })
             .collect();
+        let m = self.ledger.monitors();
         statefile::save(
             path,
             &PersistedState {
                 version: statefile::VERSION,
                 boot_time_sec: self.boot_time,
                 current: self.ledger.current(),
+                viewed: m.viewed,
+                virtual_monitors_enabled: m.enabled,
+                virtual_monitor_count: m.count,
                 windows,
             },
         );
@@ -736,7 +998,7 @@ impl EmulatedWorkspaces {
         window: WindowId,
         attempt: Option<u8>,
         frames: &HashMap<WindowId, (Pid, Rect)>,
-        g: Geometry,
+        g: &Geometry,
     ) -> Option<(Pid, WindowId, Rect)> {
         // Save the real frame only on the transition onto-screen -> parked; a
         // window already parked keeps its original saved frame rather than
@@ -769,6 +1031,9 @@ impl EmulatedWorkspaces {
         }
         let (pid, f) = (*pid, *f);
         self.saved.insert(window, f);
+        if self.full_rig(g) {
+            self.home.insert(window, f);
+        }
         self.parked.insert(window);
         self.enforce_attempts.remove(&window);
         self.pending_repark.remove(&window);
@@ -786,24 +1051,35 @@ impl EmulatedWorkspaces {
     }
 
     /// Send a parked window back to its promise — its POSITION, and only that,
-    /// even when the promise's size and the window's differ.
+    /// even when the promise's size and the window's differ — on the display
+    /// its monitor is projected onto NOW.
     ///
-    /// That gap is real: a window ratcheted short by an older build, or one an
-    /// app resized while it sat parked, comes back at the size it has now and
-    /// not the one the promise records. Re-imposing the promised size would put
-    /// the capped write back on the path where it is likeliest to be wrong — a
-    /// size that differs is, by construction, one the WindowServer or the app
-    /// has already refused once, and asking again risks the same cap plus the
-    /// y-hoist that comes with it. Worse, the model cannot tell a height Ordo
-    /// stole from a height the user or the app deliberately changed, so
-    /// re-asserting it would override a live intent with a stale observation.
-    /// The promise stays whole for the core's benefit; the window keeps its own
-    /// size, and the next park records what the window really is.
+    /// The size gap is real: a window ratcheted short by an older build, or
+    /// one an app resized while it sat parked, comes back at the size it has
+    /// now and not the one the promise records. Re-imposing the promised size
+    /// would put the capped write back on the path where it is likeliest to
+    /// be wrong — a size that differs is, by construction, one the
+    /// WindowServer or the app has already refused once, and asking again
+    /// risks the same cap plus the y-hoist that comes with it. Worse, the
+    /// model cannot tell a height Ordo stole from a height the user or the app
+    /// deliberately changed, so re-asserting it would override a live intent
+    /// with a stale observation. The promise stays whole for the core's
+    /// benefit; the window keeps its own size, and the next park records what
+    /// the window really is.
+    ///
+    /// The display gap is the rig changing while the window was hidden. In
+    /// order of preference: the promise itself, when it already lies on the
+    /// host; the window's `home` frame, when the host is the display it was
+    /// docked on (the rig came back — land exactly where it was); the promise
+    /// carried over proportionally from the display it was made on; and, when
+    /// that display is gone too, the promise clamped into the host. A carried
+    /// or clamped target replaces the promise, so what the core is told and
+    /// what the write asks for stay one frame.
     fn restore(
         &mut self,
         window: WindowId,
         frames: &HashMap<WindowId, (Pid, Rect)>,
-        g: Geometry,
+        g: &Geometry,
     ) -> Option<(Pid, WindowId, Rect)> {
         let was_parked = self.parked.remove(&window);
         self.enforce_attempts.remove(&window);
@@ -819,6 +1095,7 @@ impl EmulatedWorkspaces {
             return None;
         }
         let (pid, f) = (*pid, *f);
+        let host = self.host_rect(window, g);
         let (kind, want) = match self.saved.get(&window).copied() {
             // A promise that is itself a park artifact is not a promise. It is
             // residue from before the corner was recognizable, persisted to
@@ -826,17 +1103,38 @@ impl EmulatedWorkspaces {
             // the window the instant its workspace comes up — the window you
             // cannot switch to. A promise has no request to anchor on (it may
             // predate this process), so this is the geometric test.
-            Some(s) if in_park_corner(&s, g) => {
-                (ParkTraceKind::PoisonedPromise, rehome_into(&s, g.main))
-            }
-            Some(s) => (ParkTraceKind::Restore, s),
+            Some(s) if in_park_corner(&s, g) => (
+                ParkTraceKind::PoisonedPromise,
+                rehome_into(&s, host.unwrap_or(g.main)),
+            ),
+            Some(s) => match host {
+                Some(h) if h.contains(s.center()) => (ParkTraceKind::Restore, s),
+                Some(h) => {
+                    let home = self
+                        .home
+                        .get(&window)
+                        .filter(|hm| h.contains(hm.center()));
+                    let want = match (home, g.display_at(s.center())) {
+                        (Some(hm), _) => Rect { x: hm.x, y: hm.y, ..s },
+                        (None, Some(from)) => {
+                            let t = s.translate_between(&from, &h);
+                            Rect { x: t.x, y: t.y, ..s }
+                        }
+                        (None, None) => clamp_into(&s, &h),
+                    };
+                    self.saved.insert(window, want);
+                    (ParkTraceKind::Rehost, want)
+                }
+                None => (ParkTraceKind::Restore, s),
+            },
             // Parked with no promise (its real frame was never trustworthily
             // seen — see park()'s sliver guard): don't leave it a 1px sliver
             // on the now-visible workspace. Re-home it somewhere reachable;
             // the next park captures its real frame and it self-heals.
-            None if self.reads_parked(window, &f, g) => {
-                (ParkTraceKind::Rehome, rehome_into(&f, g.main))
-            }
+            None if self.reads_parked(window, &f, g) => (
+                ParkTraceKind::Rehome,
+                rehome_into(&f, host.unwrap_or(g.main)),
+            ),
             None => return None,
         };
         let t = ParkTrace::new(window, kind)
@@ -848,9 +1146,9 @@ impl EmulatedWorkspaces {
     }
 
     /// Dock dimming: hide (Cmd+H-style) every app whose known windows are all
-    /// parked on hidden workspaces, unhide every app with a window here. With
-    /// the Dock's `showhidden` pref, "hidden" renders as a translucent icon —
-    /// the closest macOS gets to a per-workspace Dock.
+    /// off screen, unhide every app with a window here. With the Dock's
+    /// `showhidden` pref, "hidden" renders as a translucent icon — the
+    /// closest macOS gets to a per-workspace Dock.
     ///
     /// The app owning the focused window is never hidden: hiding the active
     /// app makes macOS fling focus somewhere arbitrary. Core-side, switches
@@ -865,29 +1163,29 @@ impl EmulatedWorkspaces {
         &mut self,
         d: &dyn Desktop,
         frames: &HashMap<WindowId, (Pid, Rect)>,
-        g: Geometry,
+        g: &Geometry,
     ) {
         let current = self.ledger.current();
-        let assignments = self.ledger.window_ws();
+        let proj = self.ledger.projection();
         let mut here_by_app: HashMap<Pid, bool> = HashMap::new();
         for (window, (pid, _)) in frames {
-            if let Some(ws) = assignments.get(window) {
-                *here_by_app.entry(*pid).or_insert(false) |= *ws == current;
+            if self.ledger.claim(*window).is_some() {
+                *here_by_app.entry(*pid).or_insert(false) |= self.ledger.visible(*window, &proj);
             }
         }
         let focused_app = d
             .focused_window()
             .and_then(|w| frames.get(&w).map(|(p, _)| *p));
-        // Each app's windows that are NOT on the current workspace: the ones an
-        // unhide reveals along with the wanted one, so also the ones it has to
-        // be told to hold — and where. The park REQUEST is the anchor when
-        // there is one; without it (a promise loaded from disk, a window this
+        // Each app's windows that are NOT on screen: the ones an unhide
+        // reveals along with the wanted one, so also the ones it has to be
+        // told to hold — and where. The park REQUEST is the anchor when there
+        // is one; without it (a promise loaded from disk, a window this
         // process never parked) the corner is recomputed, which is the same
         // answer because a park depends only on the window's width and keeps
         // its y.
         let mut elsewhere: HashMap<Pid, Vec<(WindowId, Point)>> = HashMap::new();
         for (window, (pid, f)) in frames {
-            if assignments.get(window).is_some_and(|ws| *ws != current) {
+            if self.ledger.claim(*window).is_some() && !self.ledger.visible(*window, &proj) {
                 let want = self
                     .park_request
                     .get(window)
@@ -971,7 +1269,7 @@ fn current_frames(d: &dyn Desktop) -> HashMap<WindowId, (Pid, Rect)> {
 /// MIGRATION: windows persisted while parked at a retired corner read as one
 /// violation on the first enforcement pass after this change and are re-parked
 /// once (see `park_request` for why the same happens after any restart).
-fn park_frame(f: Rect, g: Geometry) -> Rect {
+fn park_frame(f: Rect, g: &Geometry) -> Rect {
     Rect {
         x: g.park_host.x - f.w + SLIVER,
         y: f.y,
@@ -1014,7 +1312,7 @@ fn near_own_request(observed: &Rect, requested: &Rect) -> bool {
 /// predecessors used, so an upgrade does not turn every already-parked window
 /// into a window whose "real frame" is a sliver. The retired ones can go once
 /// no live window or state file can predate this change.
-fn in_park_corner(f: &Rect, g: Geometry) -> bool {
+fn in_park_corner(f: &Rect, g: &Geometry) -> bool {
     let near = |a: f64, b: f64| (a - b).abs() <= 1.0;
     // The current corner: the window's whole body off the left of the leftmost
     // display, at whatever y it already had — so y says nothing here, and only
@@ -1058,11 +1356,24 @@ fn rehome_into(f: &Rect, area: Rect) -> Rect {
     }
 }
 
+/// Slide a frame the least distance that puts its origin inside `area`, size
+/// untouched — for a promise made on a display that no longer exists, where
+/// there is nothing to carry it over from.
+fn clamp_into(f: &Rect, area: &Rect) -> Rect {
+    Rect {
+        x: f.x.clamp(area.x, (area.x + area.w - f.w).max(area.x)),
+        y: f.y.clamp(area.y, (area.y + area.h - f.h).max(area.y)),
+        ..*f
+    }
+}
+
 /// The merged model an S-after-R resume adopts.
 struct FreshMerge {
     assign: BTreeMap<WindowId, Claim>,
     /// Restore promises revived from the file (window is parked again).
     saved: Vec<(WindowId, Rect)>,
+    /// Docked frames revived from the file.
+    home: Vec<(WindowId, Rect)>,
 }
 
 /// Merge a fresh (R-mode) session's model with the pre-R state file. The file
@@ -1082,6 +1393,7 @@ fn merge_fresh_session(
 ) -> FreshMerge {
     let mut assign = model.clone();
     let mut saved = Vec::new();
+    let mut home = Vec::new();
     for w in &file.windows {
         let model_knows = model.contains_key(&w.id);
         let noise_sliver =
@@ -1091,15 +1403,23 @@ fn merge_fresh_session(
                 w.id,
                 Claim {
                     ws: w.workspace,
+                    monitor: w.monitor,
                     owner: w.owner,
                 },
             );
             if let Some(f) = w.saved {
                 saved.push((w.id, f));
             }
+            if let Some(f) = w.home {
+                home.push((w.id, f));
+            }
         }
     }
-    FreshMerge { assign, saved }
+    FreshMerge {
+        assign,
+        saved,
+        home,
+    }
 }
 
 #[cfg(test)]
@@ -1138,14 +1458,17 @@ mod tests {
         h: 956.0,
     };
 
-    const GEO: Geometry = Geometry {
-        main: MAIN,
-        park_host: MAIN,
-        legacy_host: SECOND,
-    };
+    fn geo() -> Geometry {
+        Geometry {
+            main: MAIN,
+            park_host: MAIN,
+            legacy_host: SECOND,
+            displays: vec![MAIN, SECOND],
+        }
+    }
 
-    fn displays() -> [Rect; 2] {
-        [MAIN, SECOND]
+    fn vm(n: u8) -> VirtualMonitorId {
+        VirtualMonitorId(n)
     }
 
     /// What each display keeps for itself at the top, measured on Michael's
@@ -1170,9 +1493,10 @@ mod tests {
     /// vertical rule this fake already has — a landing may be pulled DOWN so a
     /// title bar stays reachable, never hoisted to make a tall window fit —
     /// comes from `land`, which every write goes through.
-    fn constrain_to_screen(f: Rect) -> Rect {
-        let owner = displays()
-            .into_iter()
+    fn constrain_to_screen(displays: &[Rect], f: Rect) -> Rect {
+        let owner = displays
+            .iter()
+            .copied()
             .find(|d| f.x >= d.x && f.x < d.x + d.w && f.y >= d.y && f.y < d.y + d.h)
             .unwrap_or(MAIN);
         Rect {
@@ -1184,7 +1508,7 @@ mod tests {
     /// The widest strip of `f` any display still shows. The park hides a
     /// window horizontally, so this is the axis the invariant lives on.
     fn visible_width(f: &Rect) -> f64 {
-        displays()
+        [MAIN, SECOND]
             .iter()
             .map(|d| ((f.x + f.w).min(d.x + d.w) - f.x.max(d.x)).max(0.0))
             .fold(0.0, f64::max)
@@ -1208,6 +1532,10 @@ mod tests {
         /// evidence has to come from the window server instead. What hiding
         /// changes is what happens on the way BACK: see `show_apps`.
         hidden: std::cell::RefCell<HashSet<Pid>>,
+        /// The rig. Starts as Michael's two displays; `set_displays` unplugs
+        /// or replugs, re-homing as macOS does.
+        displays: std::cell::RefCell<Vec<Rect>>,
+        focused: std::cell::Cell<Option<WindowId>>,
     }
 
     impl FakeDesktop {
@@ -1220,6 +1548,31 @@ mod tests {
                 cg_down: std::cell::Cell::new(false),
                 pull: std::cell::Cell::new(28.0),
                 hidden: std::cell::RefCell::new(HashSet::new()),
+                displays: std::cell::RefCell::new(vec![MAIN, SECOND]),
+                focused: std::cell::Cell::new(None),
+            }
+        }
+
+        /// The display set changes. macOS moves every window whose display
+        /// vanished onto the remaining one before anybody is told, keeping its
+        /// offset from the display's origin — the fact that makes `saved`
+        /// useless for coming home, and `home` necessary.
+        fn set_displays(&self, ds: &[Rect]) {
+            let old = self.displays.replace(ds.to_vec());
+            let main = ds.first().copied().unwrap_or(MAIN);
+            let mut ws = self.windows.borrow_mut();
+            for (_, f) in ws.values_mut() {
+                let c = f.center();
+                if ds.iter().any(|d| d.contains(c)) {
+                    continue;
+                }
+                let from = old.iter().copied().find(|d| d.contains(c)).unwrap_or(MAIN);
+                let moved = Rect {
+                    x: main.x + (f.x - from.x),
+                    y: main.y + (f.y - from.y),
+                    ..*f
+                };
+                *f = constrain_to_screen(ds, moved);
             }
         }
 
@@ -1231,8 +1584,11 @@ mod tests {
         /// every display is main's), and a request that does not fit also loses
         /// its y to that display's top inset.
         fn write_whole_frame(&self, pid: Pid, w: WindowId, f: Rect) {
-            let owner = displays()
-                .into_iter()
+            let owner = self
+                .displays
+                .borrow()
+                .iter()
+                .copied()
                 .find(|d| f.x >= d.x && f.x < d.x + d.w && f.y >= d.y && f.y < d.y + d.h)
                 .unwrap_or(MAIN);
             let inset = usable_inset(owner);
@@ -1249,8 +1605,11 @@ mod tests {
         /// differs per display — the fact that made one park request land at
         /// three heights.
         fn land(&self, pid: Pid, w: WindowId, mut landed: Rect) {
-            let host = displays()
-                .into_iter()
+            let host = self
+                .displays
+                .borrow()
+                .iter()
+                .copied()
                 .filter(|d| landed.x < d.x + d.w && landed.x + landed.w > d.x)
                 .min_by(|a, b| (landed.x - a.x).abs().total_cmp(&(landed.x - b.x).abs()))
                 .unwrap_or(MAIN);
@@ -1365,8 +1724,9 @@ mod tests {
                             .filter(|(_, (p, _))| *p == a.pid)
                             .map(|(w, (_, f))| (*w, *f))
                             .collect();
+                        let ds = self.displays.borrow().clone();
                         for (w, f) in ordering_in {
-                            self.land(a.pid, w, constrain_to_screen(f));
+                            self.land(a.pid, w, constrain_to_screen(&ds, f));
                         }
                     }
                     for (w, at) in &a.hold {
@@ -1410,15 +1770,15 @@ mod tests {
         }
 
         fn focused_window(&self) -> Option<WindowId> {
-            None
+            self.focused.get()
         }
 
         fn main_display(&self) -> Rect {
-            MAIN
+            self.displays.borrow().first().copied().unwrap_or(MAIN)
         }
 
         fn displays(&self) -> Vec<Rect> {
-            displays().to_vec()
+            self.displays.borrow().clone()
         }
 
         fn existing_windows(&self, ids: &[WindowId]) -> Option<HashSet<WindowId>> {
@@ -1447,18 +1807,18 @@ mod tests {
         // Moving w2 to a hidden workspace parks it at the corner…
         b.move_window_to_workspace(&d, w(2), ws(2)).unwrap();
         assert_eq!(b.window_ws()[&w(2)], ws(2));
-        assert!(in_park_corner(&d.frame(w(2)), GEO));
+        assert!(in_park_corner(&d.frame(w(2)), &geo()));
 
         // …and switching there parks w1 and puts w2 back where it was.
         b.switch_workspace(&d, ws(2));
         assert_eq!(b.current(), ws(2));
-        assert!(in_park_corner(&d.frame(w(1)), GEO));
+        assert!(in_park_corner(&d.frame(w(1)), &geo()));
         assert_eq!(d.frame(w(2)), rect(300.0, 200.0));
 
         // Round home: both windows end at their original frames.
         b.switch_workspace(&d, ws(1));
         assert_eq!(d.frame(w(1)), rect(100.0, 100.0));
-        assert!(in_park_corner(&d.frame(w(2)), GEO));
+        assert!(in_park_corner(&d.frame(w(2)), &geo()));
     }
 
     /// A switch must be readable end to end from the trace alone: which
@@ -1498,7 +1858,7 @@ mod tests {
             .expect("w1's park is on the record");
         assert!(in_park_corner(
             &parked.requested.expect("with the frame asked for"),
-            GEO
+            &geo()
         ));
 
         // The app stays visible (it owns a window here), and the record says
@@ -1555,7 +1915,7 @@ mod tests {
             "the wanted window is back"
         );
         assert!(
-            in_park_corner(&d.frame(w(2)), GEO),
+            in_park_corner(&d.frame(w(2)), &geo()),
             "the un-hide dragged ws3's window back on screen: {:?}",
             d.frame(w(2))
         );
@@ -1606,7 +1966,7 @@ mod tests {
         );
         let want = park.requested.expect("the frame we asked the OS for");
         assert!(
-            in_park_corner(&want, GEO),
+            in_park_corner(&want, &geo()),
             "and it names the corner the snapshot never shows: {want:?}"
         );
         // Draining is a move, not a copy: a second read must not double-count.
@@ -1652,7 +2012,7 @@ mod tests {
     #[test]
     fn park_never_captures_a_sliver_as_the_saved_frame() {
         let mut b = EmulatedWorkspaces::new(3);
-        let sliver = park_frame(rect(100.0, 100.0), GEO);
+        let sliver = park_frame(rect(100.0, 100.0), &geo());
         // The deepest clamp measured in production (124pt): still an artifact,
         // and beyond any title-bar-sized guess.
         let deep = Rect {
@@ -1691,15 +2051,15 @@ mod tests {
         // clamp, or either retired corner: bookkept as parked, but its
         // (unknown) real frame is never fabricated from the artifact.
         for id in [w(1), w(3), w(4), w(5)] {
-            assert_eq!(b.park(id, None, &frames, GEO), None, "{id:?}");
+            assert_eq!(b.park(id, None, &frames, &geo()), None, "{id:?}");
             assert!(b.parked.contains(&id));
             assert!(!b.saved.contains_key(&id), "{id:?} captured an artifact");
         }
 
         // A window at a real position parks normally.
-        let write = b.park(w(2), None, &frames, GEO).unwrap();
+        let write = b.park(w(2), None, &frames, &geo()).unwrap();
         assert_eq!(b.saved[&w(2)], rect(50.0, 60.0));
-        assert_eq!(write.2, park_frame(rect(50.0, 60.0), GEO));
+        assert_eq!(write.2, park_frame(rect(50.0, 60.0), &geo()));
     }
 
     /// The park request must clear every display: an earlier corner
@@ -1719,7 +2079,7 @@ mod tests {
                     h: size.1,
                 };
                 let d = FakeDesktop::new(&[(w(1), Pid(10), f)]);
-                let want = park_frame(f, GEO);
+                let want = park_frame(f, &geo());
                 d.move_windows(&[(
                     Pid(10),
                     w(1),
@@ -1794,7 +2154,7 @@ mod tests {
             w: 900.0,
             h: 1200.0,
         };
-        let want = park_frame(over_tall, GEO);
+        let want = park_frame(over_tall, &geo());
 
         let d = FakeDesktop::new(&[(w(1), Pid(10), over_tall)]);
         let mut b = EmulatedWorkspaces::new(3);
@@ -1951,7 +2311,7 @@ mod tests {
 
         // And leaving again parks it with a FRESH promise.
         b.switch_workspace(&d, ws(1));
-        assert!(in_park_corner(&d.frame(w(1)), GEO));
+        assert!(in_park_corner(&d.frame(w(1)), &geo()));
         assert_eq!(b.saved[&w(1)], placed);
     }
 
@@ -1970,7 +2330,7 @@ mod tests {
             .borrow_mut()
             .insert(w(1), (Pid(10), rect(100.0, 100.0)));
         b.enforce_placement(&d, &frames_of(&d));
-        assert!(in_park_corner(&d.frame(w(1)), GEO), "parked at last");
+        assert!(in_park_corner(&d.frame(w(1)), &geo()), "parked at last");
         assert_eq!(b.saved[&w(1)], rect(100.0, 100.0), "promise captured");
     }
 
@@ -2091,7 +2451,7 @@ mod tests {
             let landed = d.frame(w(1));
             assert_eq!(
                 landed,
-                park_frame(rect(100.0, 100.0), GEO),
+                park_frame(rect(100.0, 100.0), &geo()),
                 "the park landed where it asked, size and all, at pull {pull}"
             );
 
@@ -2130,7 +2490,7 @@ mod tests {
     fn a_window_at_ordos_own_last_write_is_never_charged() {
         // w1 starts as a corner artifact with no history: parked by the
         // sliver guard with NO promise, so its restore re-homes it.
-        let artifact = park_frame(rect(0.0, 0.0), GEO);
+        let artifact = park_frame(rect(0.0, 0.0), &geo());
         let d = FakeDesktop::new(&[
             (w(1), Pid(10), artifact),
             (w(2), Pid(20), rect(300.0, 200.0)),
@@ -2142,7 +2502,7 @@ mod tests {
 
         b.switch_workspace(&d, ws(2)); // restore re-homes it to main's origin
         let rehomed = d.frame(w(1));
-        assert!(!in_park_corner(&rehomed, GEO));
+        assert!(!in_park_corner(&rehomed, &geo()));
 
         // The user carries it to a hidden workspace, and the OS nudges the
         // rehome landing (the menu-bar pushdown): the observed frame now
@@ -2170,7 +2530,7 @@ mod tests {
             .any(|t| t.window == w(1) && t.kind == ParkTraceKind::Suppressed));
         // …but exemption suppresses the COUNT, not the correction: it still
         // gets parked, and the frame it stood at becomes the promise.
-        assert!(in_park_corner(&d.frame(w(1)), GEO));
+        assert!(in_park_corner(&d.frame(w(1)), &geo()));
         assert_eq!(b.saved[&w(1)].x, rehomed.x);
     }
 
@@ -2243,7 +2603,7 @@ mod tests {
         b.switch_workspace(&d, ws(2));
         let restored = d.frame(w(1));
         assert!(
-            !in_park_corner(&restored, GEO),
+            !in_park_corner(&restored, &geo()),
             "must not restore into the corner it was parked in"
         );
         assert!(
@@ -2257,13 +2617,18 @@ mod tests {
         let pw = |id: u32, wsn: u8, saved: Option<Rect>| PersistedWindow {
             id: w(id),
             workspace: ws(wsn),
+            monitor: vm(1),
             owner: Pid(10),
             saved,
+            home: None,
         };
         let file = PersistedState {
             version: statefile::VERSION,
             boot_time_sec: 1,
             current: ws(1),
+            viewed: vm(1),
+            virtual_monitors_enabled: true,
+            virtual_monitor_count: 2,
             windows: vec![
                 // Parked pre-R, never seen by the fresh session.
                 pw(10, 3, Some(rect(10.0, 20.0))),
@@ -2278,6 +2643,7 @@ mod tests {
         };
         let claim = |wsn: u8| Claim {
             ws: ws(wsn),
+            monitor: vm(1),
             owner: Pid(10),
         };
         let model: BTreeMap<WindowId, Claim> = [
@@ -2308,5 +2674,184 @@ mod tests {
         assert_eq!(saved.get(&w(11)), Some(&rect(30.0, 40.0)));
         assert_eq!(saved.get(&w(12)), None);
         assert_eq!(saved.get(&w(14)), None);
+    }
+
+    // --- virtual monitors ----------------------------------------------------
+    // Michael's rig: w1 on the main display (monitor 1), w2 on the second
+    // (monitor 2). The external display goes away and comes back.
+
+    fn rig() -> (FakeDesktop, EmulatedWorkspaces) {
+        let d = FakeDesktop::new(&[
+            (w(1), Pid(10), rect(100.0, 100.0)),
+            (w(2), Pid(20), rect(2000.0, 100.0)),
+        ]);
+        let mut b = EmulatedWorkspaces::new(3);
+        b.note_scan(&d, &d.scan());
+        assert_eq!(b.monitors().count, 2, "two displays, two monitors");
+        assert_eq!(b.window_monitors()[&w(2)], vm(2), "adopted where it stands");
+        (d, b)
+    }
+
+    /// One rescan's worth of the shell: learn the displays, then assert the
+    /// projection — what a plug event turns into once the world settles.
+    fn rescan(d: &FakeDesktop, b: &mut EmulatedWorkspaces) {
+        b.note_scan(d, &d.scan());
+        b.enforce_placement(d, &frames_of(d));
+    }
+
+    #[test]
+    fn unplugging_parks_the_hidden_monitor_and_viewing_it_swaps_the_screen() {
+        let (d, mut b) = rig();
+        d.set_displays(&[MAIN]);
+        let rehomed = d.frame(w(2));
+        assert!(MAIN.contains(rehomed.center()), "macOS moved it onto the laptop");
+
+        rescan(&d, &mut b);
+        assert_eq!(b.monitors().count, 2, "the count never shrinks");
+        assert_eq!(b.monitors().viewed, vm(1));
+        assert!(in_park_corner(&d.frame(w(2)), &geo()), "monitor 2 is hidden");
+        assert_eq!(b.window_monitors()[&w(2)], vm(2), "declaration kept");
+        assert_eq!(d.frame(w(1)), rect(100.0, 100.0), "monitor 1 untouched");
+        assert!(d.is_hidden(Pid(20)), "an app with nothing on screen is dimmed");
+
+        // J/K: the other monitor's windows come up, this one's go down.
+        b.view_monitor(&d, vm(2)).unwrap();
+        assert_eq!(d.frame(w(2)), rehomed, "back where the laptop had it");
+        assert!(in_park_corner(&d.frame(w(1)), &geo()));
+        assert!(!d.is_hidden(Pid(20)));
+        assert_eq!(b.view_monitor(&d, vm(3)), Err(MonitorOutOfRange(vm(3))));
+        b.view_monitor(&d, vm(1)).unwrap();
+        assert_eq!(d.frame(w(1)), rect(100.0, 100.0));
+        assert!(in_park_corner(&d.frame(w(2)), &geo()));
+
+        // Cmd+Alt+V: collapse shows both; enabling hides monitor 2 again.
+        b.set_virtual_monitors(&d, false);
+        assert_eq!(d.frame(w(1)), rect(100.0, 100.0));
+        assert_eq!(d.frame(w(2)), rehomed);
+        b.set_virtual_monitors(&d, true);
+        assert!(in_park_corner(&d.frame(w(2)), &geo()));
+        assert_eq!(d.frame(w(1)), rect(100.0, 100.0));
+        // Enforcement has nothing to add to a settled screen.
+        for _ in 0..3 {
+            b.enforce_placement(&d, &frames_of(&d));
+        }
+        assert!(in_park_corner(&d.frame(w(2)), &geo()));
+        assert!(b.enforce_attempts.is_empty());
+    }
+
+    /// Monitor memory. The frame macOS re-homed the window to is what `saved`
+    /// can know; `home` is the docked frame, and it is what the window comes
+    /// back to when its display returns.
+    #[test]
+    fn replugging_brings_a_window_home_to_its_docked_frame() {
+        let (d, mut b) = rig();
+        assert_eq!(b.home[&w(2)], rect(2000.0, 100.0), "docked frame remembered");
+        d.set_displays(&[MAIN]);
+        rescan(&d, &mut b);
+        // Undocked, the user views monitor 2 and moves w2 around on the laptop:
+        // the docked frame must survive all of it.
+        b.view_monitor(&d, vm(2)).unwrap();
+        d.place(w(2), rect(300.0, 300.0));
+        rescan(&d, &mut b);
+        assert_eq!(b.home[&w(2)], rect(2000.0, 100.0), "not overwritten undocked");
+        b.view_monitor(&d, vm(1)).unwrap();
+        b.take_trace();
+
+        d.set_displays(&[MAIN, SECOND]);
+        rescan(&d, &mut b);
+        assert_eq!(d.frame(w(2)), rect(2000.0, 100.0), "exactly where it was");
+        assert_eq!(d.frame(w(1)), rect(100.0, 100.0));
+        assert!(!d.is_hidden(Pid(20)));
+        assert!(b
+            .take_trace()
+            .iter()
+            .any(|t| t.kind == ParkTraceKind::Rehost && t.window == w(2)));
+        // Belief and screen agree, so the core sees no promise to re-host.
+        assert!(b.believed_frames(&d, &frames_of(&d)).is_empty());
+    }
+
+    #[test]
+    fn a_replacement_display_of_another_size_gets_the_frame_carried_over() {
+        let (d, mut b) = rig();
+        d.set_displays(&[MAIN]);
+        rescan(&d, &mut b);
+        // A different panel stands in the second position: too small to hold
+        // the old docked frame, so the laptop frame is carried over instead.
+        let small = Rect {
+            x: 1920.0,
+            y: 0.0,
+            w: 1000.0,
+            h: 700.0,
+        };
+        d.set_displays(&[MAIN, small]);
+        rescan(&d, &mut b);
+        let f = d.frame(w(2));
+        assert!(
+            small.contains(f.center()),
+            "landed on the new display: {f:?}"
+        );
+        assert_eq!((f.w, f.h), (800.0, 600.0), "size is the window's own");
+    }
+
+    /// A display change is systemic: the view follows the window the user is
+    /// in, rather than that window being parked because the anchor pointed
+    /// elsewhere.
+    #[test]
+    fn the_view_follows_the_focused_window_through_an_unplug() {
+        let (d, mut b) = rig();
+        d.focused.set(Some(w(2)));
+        d.set_displays(&[MAIN]);
+        rescan(&d, &mut b);
+        assert_eq!(b.monitors().viewed, vm(2));
+        assert!(in_park_corner(&d.frame(w(1)), &geo()), "monitor 1 hidden instead");
+        assert!(MAIN.contains(d.frame(w(2)).center()));
+    }
+
+    #[test]
+    fn a_monitor_assignment_is_a_declaration_only_and_enforcement_asserts_it() {
+        let (d, mut b) = rig();
+        d.set_displays(&[MAIN]);
+        rescan(&d, &mut b);
+        // The core assigns w1 to the hidden monitor without viewing it (a
+        // corral, say): no write here…
+        b.assign_window_to_monitor(w(1), vm(2)).unwrap();
+        assert_eq!(d.frame(w(1)), rect(100.0, 100.0));
+        assert_eq!(b.window_monitors()[&w(1)], vm(2));
+        // …and the standing check parks it on the next pass.
+        b.enforce_placement(&d, &frames_of(&d));
+        assert!(in_park_corner(&d.frame(w(1)), &geo()));
+        assert_eq!(
+            b.assign_window_to_monitor(w(1), vm(9)),
+            Err(MonitorOutOfRange(vm(9)))
+        );
+    }
+
+    #[test]
+    fn the_state_file_carries_the_layout_and_the_docked_frames() {
+        let dir = std::env::temp_dir().join(format!("ordo-vm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+
+        let d = FakeDesktop::new(&[
+            (w(1), Pid(10), rect(100.0, 100.0)),
+            (w(2), Pid(20), rect(2000.0, 100.0)),
+        ]);
+        let mut b = EmulatedWorkspaces::with_persistence(3, path.clone());
+        b.note_scan(&d, &d.scan());
+        d.set_displays(&[MAIN]);
+        rescan(&d, &mut b);
+        b.view_monitor(&d, vm(2)).unwrap();
+        b.set_virtual_monitors(&d, false);
+
+        // A restart: the layout, the declarations and the docked frames are
+        // all back before the first scan.
+        let again = EmulatedWorkspaces::with_persistence(3, path);
+        assert_eq!(again.monitors().count, 2);
+        assert_eq!(again.monitors().viewed, vm(2));
+        assert!(!again.monitors().enabled);
+        assert_eq!(again.window_monitors()[&w(2)], vm(2));
+        assert_eq!(again.home[&w(2)], rect(2000.0, 100.0));
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

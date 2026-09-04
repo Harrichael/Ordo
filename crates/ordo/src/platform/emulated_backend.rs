@@ -7,7 +7,9 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use ordo_core::{MonitorId, Pid, Point, Rect, WindowId, WorkspaceId};
+use ordo_core::{
+    MonitorId, Pid, Point, Rect, VirtualMonitorId, VirtualMonitorsWord, WindowId, WorkspaceId,
+};
 use ordo_emulated::{Desktop, EmulatedWorkspaces, HoldStat, Unhide};
 
 use crate::backend::{
@@ -117,12 +119,12 @@ impl WorkspaceBackend for EmulatedBackend {
     fn topology(
         &mut self,
         windows: &[(WindowId, Pid)],
-        monitors: &[(MonitorId, bool)],
+        monitors: &[(MonitorId, Rect, bool)],
     ) -> Result<BackendTopology> {
         self.model.note_scan(&self.desktop, windows);
         let mons = monitors
             .iter()
-            .map(|(id, _)| MonitorWorkspace {
+            .map(|(id, _, _)| MonitorWorkspace {
                 monitor: *id,
                 active: self.model.current(),
                 count: self.model.count(),
@@ -131,6 +133,10 @@ impl WorkspaceBackend for EmulatedBackend {
         Ok(BackendTopology {
             monitors: mons,
             window_ws: self.model.window_ws().into_iter().collect(),
+            virtual_monitors: Some(VirtualMonitorsWord {
+                view: self.model.monitors(),
+                assignments: self.model.window_monitors(),
+            }),
         })
     }
 
@@ -149,6 +155,23 @@ impl WorkspaceBackend for EmulatedBackend {
         self.model
             .assign_window_to_workspace(window, target)
             .map_err(|e| BackendError(format!("workspace {} out of range", e.0 .0)))
+    }
+
+    fn view_monitor(&mut self, target: VirtualMonitorId) -> Result<()> {
+        self.model
+            .view_monitor(&self.desktop, target)
+            .map_err(|e| BackendError(format!("virtual monitor {} out of range", e.0 .0)))
+    }
+
+    fn set_virtual_monitors(&mut self, enabled: bool) -> Result<()> {
+        self.model.set_virtual_monitors(&self.desktop, enabled);
+        Ok(())
+    }
+
+    fn assign_window_to_monitor(&mut self, window: WindowId, target: VirtualMonitorId) -> Result<()> {
+        self.model
+            .assign_window_to_monitor(window, target)
+            .map_err(|e| BackendError(format!("virtual monitor {} out of range", e.0 .0)))
     }
 
     fn rescue_window(&mut self, window: WindowId) -> Result<()> {

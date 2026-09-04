@@ -4,9 +4,10 @@ use crate::effect::{CorrectionAxis, Effect, Expectation};
 use crate::event::{
     AxHintKind, Event, Gesture, HotkeyAction, OpOutcome, RescanTrigger, WorldSnapshot,
 };
-use crate::ids::{OpId, Pid, Rect, WindowId, WorkspaceId, FRAME_EPSILON};
+use crate::ids::{OpId, Pid, Rect, VirtualMonitorId, WindowId, WorkspaceId, FRAME_EPSILON};
+use crate::project::Projection;
 use crate::reconcile::{self, Delta};
-use crate::state::{FocusIntent, Mode, PendingOp, State};
+use crate::state::{FocusIntent, Mode, PendingOp, State, WindowRecord};
 
 /// How long an expectation may go unmet before its op is declared lost.
 ///
@@ -75,10 +76,22 @@ pub enum Note {
         within: Option<WindowId>,
     },
     /// A witnessed gesture (Cmd+Tab, a Dock click) landed focus on a hidden
-    /// workspace's window; we switched there to follow the user.
+    /// window; we switched workspace and/or viewed its monitor to follow the
+    /// user. `monitor` is set when the landing needed a view change.
     FollowedFocus {
         window: WindowId,
         target: WorkspaceId,
+        #[serde(default)]
+        monitor: Option<VirtualMonitorId>,
+    },
+    /// A visible window was moved between two live displays by a hand that
+    /// was not Ordo's — a drag, or an app placing itself — and its monitor
+    /// declaration followed. Placement within a workspace is observational;
+    /// this is the one observation that writes a monitor declaration, and it
+    /// is a delta (the move itself), never a standing position.
+    MonitorAdopted {
+        window: WindowId,
+        monitor: VirtualMonitorId,
     },
     /// Focus fell onto a hidden workspace with no gesture to explain it while
     /// the OS owned the slot. Nobody can type into an invisible window, so
@@ -164,21 +177,56 @@ pub fn update(state: &State, event: &Event) -> Step {
 }
 
 /// The workspace's visual stacking, front-to-back, as the MRU history implies
-/// it. Emitted alongside anything that reveals a workspace: parking and
-/// app-hiding scramble real z-order, and MRU is the single source of truth
-/// for what "on top" means here.
+/// it — restricted to the windows the projection puts on screen, since a
+/// raise is a focus and a parked window must not be handed either. Emitted
+/// alongside anything that reveals a workspace: parking and app-hiding
+/// scramble real z-order, and MRU is the single source of truth for what "on
+/// top" means here.
 fn mru_stack(s: &State, ws: WorkspaceId) -> Vec<WindowId> {
+    visible_stack(s, ws, &s.projection())
+}
+
+/// `mru_stack` under a projection that is not (yet) the one in force — what a
+/// view change is about to show.
+fn visible_stack(s: &State, ws: WorkspaceId, proj: &Projection) -> Vec<WindowId> {
     s.focus_history
         .iter()
-        .filter(|w| s.windows.get(w).is_some_and(|r| r.workspace == ws))
+        .filter(|w| {
+            s.windows
+                .get(w)
+                .is_some_and(|r| r.workspace == ws && proj.is_hosted(r.vmonitor))
+        })
         .collect()
 }
 
-fn push_restack(s: &State, ws: WorkspaceId, fx: &mut Vec<Effect>) {
-    let order = mru_stack(s, ws);
-    if order.len() >= 2 {
-        fx.push(Effect::RestackWindows { order });
+/// Issue a view change to `target`, with its expectation. The single emitter,
+/// so every path that reveals a monitor books it the same way.
+fn push_view(s: &mut State, target: VirtualMonitorId, now_ns: u64, fx: &mut Vec<Effect>) -> OpId {
+    let op = s.mint_op();
+    fx.push(Effect::ViewMonitor { op, target });
+    if s.virtual_monitors.is_some_and(|v| v.viewed != target) {
+        s.pending.push(PendingOp {
+            op,
+            expect: Expectation::Viewing(target),
+            issued_ns: now_ns,
+        });
     }
+    op
+}
+
+/// The monitor a focus target needs viewed, if it sits on a hidden one —
+/// nobody can type into a parked window — with the projection the world will
+/// be under once that view lands, for restacking and warping against. The
+/// caller emits the focus grant BEFORE the view, as a switch hands focus
+/// before it parks: the window being revealed should already be key when its
+/// app is un-hidden, and the app being hidden must not still hold focus.
+fn view_for(s: &State, target: WindowId) -> (Option<VirtualMonitorId>, Projection) {
+    let vm = s.windows[&target].vmonitor;
+    let proj = s.projection();
+    if proj.is_hosted(vm) || s.virtual_monitors.is_none() {
+        return (None, proj);
+    }
+    (Some(vm), s.projection_with(Some(vm), None))
 }
 
 /// The user reached for focus through the OS rather than through Ordo. Whatever
@@ -233,8 +281,12 @@ enum Command {
     },
     MoveToMonitor {
         window: WindowId,
-        frame: Rect,
+        target: VirtualMonitorId,
     },
+    View {
+        target: VirtualMonitorId,
+    },
+    ToggleVirtualMonitors,
 }
 
 fn handle_hotkey(s: &mut State, action: HotkeyAction, now_ns: u64, fx: &mut Vec<Effect>) {
@@ -305,11 +357,16 @@ fn resolve(s: &State, action: HotkeyAction) -> Option<Command> {
                 if r.workspace != cur_ws {
                     return false;
                 }
+                // Monitor scoping reads the DECLARED virtual monitor, never
+                // the display: two virtual monitors collapsed onto one
+                // display are still two monitors to Alt+Shift+Tab.
                 match action {
                     HotkeyAction::MruWorkspace => true,
-                    HotkeyAction::MruMonitor => focused_rec.is_some_and(|f| r.monitor == f.monitor),
+                    HotkeyAction::MruMonitor => {
+                        focused_rec.is_some_and(|f| r.vmonitor == f.vmonitor)
+                    }
                     HotkeyAction::MruOtherMonitor => {
-                        focused_rec.is_some_and(|f| r.monitor != f.monitor)
+                        focused_rec.is_some_and(|f| r.vmonitor != f.vmonitor)
                     }
                     HotkeyAction::MruApp => focused_rec.is_some_and(|f| r.app == f.app),
                     _ => unreachable!(),
@@ -333,18 +390,35 @@ fn resolve(s: &State, action: HotkeyAction) -> Option<Command> {
             })
         }
 
-        HotkeyAction::MoveFocusedToOtherMonitor => {
+        HotkeyAction::MoveFocusedToMonitorPrev | HotkeyAction::MoveFocusedToMonitorNext => {
             let window = s.declared_focus()?;
-            let rec = s.windows.get(&window)?;
-            let order = s.monitors_by_position();
-            if order.len() < 2 {
-                return None;
-            }
-            let i = order.iter().position(|m| *m == rec.monitor)?;
-            let to_id = order[(i + 1) % order.len()];
-            let (from_mon, to_mon) = (s.monitors.get(&rec.monitor)?, s.monitors.get(&to_id)?);
-            let frame = rec.frame.translate_between(&from_mon.frame, &to_mon.frame);
-            Some(Command::MoveToMonitor { window, frame })
+            let cur = s.windows.get(&window)?.vmonitor;
+            let target = match action {
+                HotkeyAction::MoveFocusedToMonitorPrev if cur.0 > 1 => VirtualMonitorId(cur.0 - 1),
+                HotkeyAction::MoveFocusedToMonitorNext if cur.0 < s.monitor_count() => {
+                    VirtualMonitorId(cur.0 + 1)
+                }
+                _ => return None, // clamped at the edge
+            };
+            Some(Command::MoveToMonitor { window, target })
+        }
+
+        HotkeyAction::ViewMonitorPrev | HotkeyAction::ViewMonitorNext => {
+            let v = s.virtual_monitors?;
+            s.current_workspace()?;
+            let target = match action {
+                HotkeyAction::ViewMonitorPrev if v.viewed.0 > 1 => VirtualMonitorId(v.viewed.0 - 1),
+                HotkeyAction::ViewMonitorNext if v.viewed.0 < v.count => {
+                    VirtualMonitorId(v.viewed.0 + 1)
+                }
+                _ => return None, // clamped at the edge
+            };
+            Some(Command::View { target })
+        }
+
+        HotkeyAction::ToggleVirtualMonitors => {
+            s.virtual_monitors?;
+            Some(Command::ToggleVirtualMonitors)
         }
     }
 }
@@ -369,7 +443,25 @@ fn execute(s: &mut State, cmd: Command, now_ns: u64, fx: &mut Vec<Effect>) -> Fo
             // SECOND MRU window on each return while the restack still named
             // the first, which made the ordering unsatisfiable and flipped
             // the top window every round trip.
-            let stack = mru_stack(s, target);
+            //
+            // Monitor selection is global, so a switch leaves the anchor alone
+            // — except when that would land the user on a blank screen: a
+            // destination whose windows all sit on hidden monitors. Then the
+            // view follows the focus the switch hands out, as it does
+            // everywhere else, to the destination's overall MRU head.
+            let mut stack = mru_stack(s, target);
+            let mut view: Option<VirtualMonitorId> = None;
+            if stack.is_empty() && s.virtual_monitors.is_some() {
+                let anywhere = s
+                    .focus_history
+                    .iter()
+                    .find(|w| s.windows.get(w).is_some_and(|r| r.workspace == target));
+                if let Some(w) = anywhere {
+                    let vm = s.windows[&w].vmonitor;
+                    view = Some(vm);
+                    stack = visible_stack(s, target, &s.projection_with(Some(vm), None));
+                }
+            }
             let head = stack.first().copied();
             if let Some(fw) = head {
                 let op = s.mint_op();
@@ -383,6 +475,9 @@ fn execute(s: &mut State, cmd: Command, now_ns: u64, fx: &mut Vec<Effect>) -> Fo
                         issued_ns: now_ns,
                     });
                 }
+            }
+            if let Some(vm) = view {
+                push_view(s, vm, now_ns, fx);
             }
             let op = s.mint_op();
             fx.push(Effect::SwitchWorkspace { op, target });
@@ -449,7 +544,10 @@ fn execute(s: &mut State, cmd: Command, now_ns: u64, fx: &mut Vec<Effect>) -> Fo
         }
 
         Command::Focus { target } => {
-            let center = s.windows[&target].frame.center();
+            // A target on a hidden monitor gets its monitor viewed right after
+            // the grant, and the newly visible set restacked with it on top.
+            let (view, proj) = view_for(s, target);
+            let center = s.projected_frame_in(&s.windows[&target], &proj).center();
             let op = s.mint_op();
             fx.push(Effect::FocusWindow { op, window: target });
             // Warp optimistically off our own belief of the frame rather than
@@ -463,6 +561,16 @@ fn execute(s: &mut State, cmd: Command, now_ns: u64, fx: &mut Vec<Effect>) -> Fo
                 expect: Expectation::Focused(target),
                 issued_ns: now_ns,
             });
+            if let Some(vm) = view {
+                push_view(s, vm, now_ns, fx);
+                if let Some(ws) = s.current_workspace() {
+                    let mut order = vec![target];
+                    order.extend(visible_stack(s, ws, &proj).into_iter().filter(|w| *w != target));
+                    if order.len() >= 2 {
+                        fx.push(Effect::RestackWindows { order });
+                    }
+                }
+            }
             fx.push(Effect::RequestRescan {
                 reason: RescanTrigger::PostEffect { op },
             });
@@ -475,15 +583,22 @@ fn execute(s: &mut State, cmd: Command, now_ns: u64, fx: &mut Vec<Effect>) -> Fo
             to,
         } => {
             s.focus_history.demote(from);
-            let center = s.windows[&to].frame.center();
+            let (view, proj) = view_for(s, to);
+            let center = s.projected_frame_in(&s.windows[&to], &proj).center();
             let op = s.mint_op();
             fx.push(Effect::FocusWindow { op, window: to });
             fx.push(Effect::WarpMouse { to: center });
+            if let Some(vm) = view {
+                push_view(s, vm, now_ns, fx);
+            }
             // Bury it visually too, AFTER the focus: restacking raises
             // everything above the demoted window, and raises land below the
             // key window — so the new focus must already be key. The history
             // was demoted above, so the MRU order now ends with `from`.
-            push_restack(s, workspace, fx);
+            let order = visible_stack(s, workspace, &proj);
+            if order.len() >= 2 {
+                fx.push(Effect::RestackWindows { order });
+            }
             s.pending.push(PendingOp {
                 op,
                 expect: Expectation::Focused(to),
@@ -495,19 +610,131 @@ fn execute(s: &mut State, cmd: Command, now_ns: u64, fx: &mut Vec<Effect>) -> Fo
             FocusIntent::Window(to)
         }
 
-        Command::MoveToMonitor { window, frame } => {
-            let op = s.mint_op();
-            fx.push(Effect::SetWindowFrame { op, window, frame });
+        Command::MoveToMonitor { window, target } => {
+            let rec = s.windows[&window].clone();
+            // Declaration first — assignment only, no frame. If the target is
+            // hidden, view it in the same breath: declaring first means the
+            // view's park/restore plan finds the window already a resident of
+            // a monitor that stays visible, so it is neither parked nor
+            // restored — it just stays put while the scenery changes. The
+            // frame write below is the only move it ever gets.
+            let before = s.projection();
+            let mut op = s.mint_op();
+            if s.virtual_monitors.is_some() {
+                fx.push(Effect::AssignWindowToMonitor { op, window, target });
+                s.pending.push(PendingOp {
+                    op,
+                    expect: Expectation::WindowOnMonitor {
+                        window,
+                        monitor: target,
+                    },
+                    issued_ns: now_ns,
+                });
+            }
+            let proj = if before.is_hosted(target) {
+                before.clone()
+            } else {
+                push_view(s, target, now_ns, fx);
+                s.projection_with(Some(target), None)
+            };
+            let moved = WindowRecord {
+                vmonitor: target,
+                ..rec.clone()
+            };
+            let frame = s.projected_frame_in(&moved, &proj);
+            if !frame.approx_eq(&rec.frame, FRAME_EPSILON) {
+                op = s.mint_op();
+                fx.push(Effect::SetWindowFrame { op, window, frame });
+                s.pending.push(PendingOp {
+                    op,
+                    expect: Expectation::WindowFramed { window, frame },
+                    issued_ns: now_ns,
+                });
+            }
             fx.push(Effect::WarpMouse { to: frame.center() });
-            s.pending.push(PendingOp {
-                op,
-                expect: Expectation::WindowFramed { window, frame },
-                issued_ns: now_ns,
-            });
+            if proj != before {
+                if let Some(ws) = s.current_workspace() {
+                    let mut order = vec![window];
+                    order.extend(visible_stack(s, ws, &proj).into_iter().filter(|w| *w != window));
+                    if order.len() >= 2 {
+                        fx.push(Effect::RestackWindows { order });
+                    }
+                }
+            }
             fx.push(Effect::RequestRescan {
                 reason: RescanTrigger::PostEffect { op },
             });
             FocusIntent::Window(window)
+        }
+
+        Command::View { target } => {
+            // The monitor twin of a workspace switch: focus goes to the
+            // target monitor's MRU window on the current workspace before the
+            // view moves, and the newly visible set is restacked under it.
+            let ws = s.current_workspace().expect("resolved against a workspace");
+            let proj = s.projection_with(Some(target), None);
+            let head = s.focus_history.iter().find(|w| {
+                s.windows
+                    .get(w)
+                    .is_some_and(|r| r.workspace == ws && r.vmonitor == target)
+            });
+            if let Some(fw) = head {
+                let op = s.mint_op();
+                fx.push(Effect::FocusWindow { op, window: fw });
+                if s.focused != Some(fw) {
+                    s.pending.push(PendingOp {
+                        op,
+                        expect: Expectation::Focused(fw),
+                        issued_ns: now_ns,
+                    });
+                }
+                fx.push(Effect::WarpMouse {
+                    to: s.projected_frame_in(&s.windows[&fw], &proj).center(),
+                });
+            }
+            let op = push_view(s, target, now_ns, fx);
+            let mut order: Vec<WindowId> = head.into_iter().collect();
+            order.extend(visible_stack(s, ws, &proj).into_iter().filter(|w| Some(*w) != head));
+            if order.len() >= 2 {
+                fx.push(Effect::RestackWindows { order });
+            }
+            fx.push(Effect::RequestRescan {
+                reason: RescanTrigger::PostEffect { op },
+            });
+            head.map_or(FocusIntent::Deferred, FocusIntent::Window)
+        }
+
+        Command::ToggleVirtualMonitors => {
+            let v = s.virtual_monitors.expect("resolved against a virtual layer");
+            let enabled = !v.enabled;
+            let op = s.mint_op();
+            fx.push(Effect::SetVirtualMonitors { op, enabled });
+            s.pending.push(PendingOp {
+                op,
+                expect: Expectation::VirtualMonitorsEnabled(enabled),
+                issued_ns: now_ns,
+            });
+            // Turning virtualization on must not hide the window the user is
+            // in: the anchor moves to its monitor first.
+            let mut viewed = v.viewed;
+            if enabled {
+                if let Some(vm) = s.declared_focus().and_then(|w| s.windows.get(&w)).map(|r| r.vmonitor) {
+                    if vm != v.viewed {
+                        push_view(s, vm, now_ns, fx);
+                        viewed = vm;
+                    }
+                }
+            }
+            if let Some(ws) = s.current_workspace() {
+                let order = visible_stack(s, ws, &s.projection_with(Some(viewed), Some(enabled)));
+                if order.len() >= 2 {
+                    fx.push(Effect::RestackWindows { order });
+                }
+            }
+            fx.push(Effect::RequestRescan {
+                reason: RescanTrigger::PostEffect { op },
+            });
+            s.focus_intent()
         }
     }
 }
@@ -571,7 +798,7 @@ fn handle_snapshot(
     // The user's focus context from BEFORE this observation: a new window that
     // steals focus must not get to define where it "should" be.
     let anchor_ws = pre.current_workspace();
-    let anchor_mon = pre.focused_monitor();
+    let anchor_vm = pre.focused_vmonitor();
     let entry_expectations: Vec<Expectation> =
         pre.pending.iter().map(|p| p.expect.clone()).collect();
     // A gesture explains only the observation that follows it.
@@ -581,16 +808,22 @@ fn handle_snapshot(
     reconcile::apply_snapshot(s, snap);
 
     // While the OS owns the slot, its choice among the VISIBLE windows is the
-    // only record of where the user went. A hidden-workspace landing is never
-    // recorded from observation: it is either navigation, which the follow
-    // below declares, or a fling, which must not touch the history at all.
+    // only record of where the user went. A hidden landing is never recorded
+    // from observation: it is either navigation, which the follow below
+    // declares, or a fling, which must not touch the history at all.
     if s.focus_target().is_none() {
         if let Some(f) = s.focused {
-            if s.windows.get(&f).map(|r| r.workspace) == s.current_workspace() {
+            if s.windows.get(&f).is_some_and(|r| s.is_visible(r)) {
                 s.focus_history.touch(f);
             }
         }
     }
+    // A display came or went. Every window on the vanished display was just
+    // re-homed by macOS, not by anyone's hand — nothing about a window's
+    // placement in this snapshot says anything about intent.
+    let topology_changed = deltas
+        .iter()
+        .any(|d| matches!(d, Delta::MonitorAdded(_) | Delta::MonitorRemoved(_)));
 
     // Resolve or age expectations against the fresh belief.
     let mut expired: Vec<PendingOp> = Vec::new();
@@ -729,7 +962,7 @@ fn handle_snapshot(
         kind: AxHintKind::WindowCreated,
     } = trigger
     {
-        if let (Some(anchor_ws), Some(anchor_mon)) = (anchor_ws, anchor_mon) {
+        if let (Some(anchor_ws), Some(anchor_vm)) = (anchor_ws, anchor_vm) {
             for d in &deltas {
                 let Delta::WindowCreated(w) = d else { continue };
                 // Only corral the window that actually took focus. A full rescan
@@ -774,11 +1007,33 @@ fn handle_snapshot(
                         },
                     );
                 }
-                if rec.monitor != anchor_mon {
-                    if let (Some(from_mon), Some(to_mon)) =
-                        (s.monitors.get(&rec.monitor), s.monitors.get(&anchor_mon))
-                    {
-                        let frame = rec.frame.translate_between(&from_mon.frame, &to_mon.frame);
+                // The monitor half: declare it onto the anchor monitor, and
+                // put its frame on that monitor's display. The declaration
+                // is a word to our own backend — uncontested, so undamped.
+                if rec.vmonitor != anchor_vm && s.virtual_monitors.is_some() {
+                    let op = s.mint_op();
+                    fx.push(Effect::AssignWindowToMonitor {
+                        op,
+                        window: *w,
+                        target: anchor_vm,
+                    });
+                    s.pending.push(PendingOp {
+                        op,
+                        expect: Expectation::WindowOnMonitor {
+                            window: *w,
+                            monitor: anchor_vm,
+                        },
+                        issued_ns: now_ns,
+                    });
+                    last_op = Some(op);
+                }
+                if let Some(host) = s.host_of(anchor_vm) {
+                    if rec.monitor != host {
+                        let placed = WindowRecord {
+                            vmonitor: anchor_vm,
+                            ..rec.clone()
+                        };
+                        let frame = s.projected_frame(&placed);
                         let window = *w;
                         correct_window(
                             s,
@@ -800,6 +1055,17 @@ fn handle_snapshot(
             }
         }
     }
+
+    project_windows(
+        s,
+        &deltas,
+        &entry_expectations,
+        topology_changed,
+        now_ns,
+        notes,
+        &mut last_op,
+        fx,
+    );
 
     enforce_focus(s, navigation_gesture, now_ns, notes, &mut last_op, fx);
 
@@ -845,6 +1111,121 @@ fn handle_snapshot(
         fx.push(Effect::RequestRescan {
             reason: RescanTrigger::PostEffect { op },
         });
+    }
+}
+
+/// The projection, asserted: every visible window sits on the display its
+/// virtual monitor is hosted by. Two resolutions for a window found on some
+/// other display, and telling them apart is the whole job:
+///
+/// - It MOVED there this snapshot, between two live displays, by a hand that
+///   was not Ordo's (a drag, an app placing itself): placement is
+///   observational, so the monitor declaration follows — the window is
+///   adopted onto the virtual monitor that display stands for. Delta-driven
+///   on purpose: a standing position says nothing, only the move does.
+/// - It merely SITS there — the display set changed under it (a replug
+///   brought its monitor's display back while it waits on the laptop), or a
+///   declaration moved it (a corral, a view): a violation of the projection,
+///   corrected by re-hosting the frame, damped on the frame axis.
+///
+/// Adoption is suppressed outright while the display set is changing (macOS
+/// re-homes every window of a vanished display, and those moves are nobody's
+/// intent), and for a window whose own monitor is hidden (it should not be on
+/// screen at all — that is the backend's park to assert, not a drag). Both
+/// resolutions yield to a pending op on the window and to a hand still on it.
+#[allow(clippy::too_many_arguments)]
+fn project_windows(
+    s: &mut State,
+    deltas: &[Delta],
+    entry_expectations: &[Expectation],
+    topology_changed: bool,
+    now_ns: u64,
+    notes: &mut Vec<Note>,
+    last_op: &mut Option<OpId>,
+    fx: &mut Vec<Effect>,
+) {
+    if s.virtual_monitors.is_none() {
+        return;
+    }
+    let unexplained_move = |w: WindowId| {
+        deltas.iter().any(|d| {
+            let same = match d {
+                Delta::WindowFrameChanged { window, .. }
+                | Delta::WindowMonitorChanged { window, .. } => *window == w,
+                _ => false,
+            };
+            same && !entry_expectations.iter().any(|e| reconcile::explains(e, d))
+        })
+    };
+    let busy = |s: &State, w: WindowId| s.pending.iter().any(|p| p.expect.window() == Some(w));
+
+    if !topology_changed {
+        for d in deltas {
+            let Delta::WindowMonitorChanged { window, to, .. } = d else {
+                continue;
+            };
+            if entry_expectations.iter().any(|e| reconcile::explains(e, d)) {
+                continue;
+            }
+            let Some(rec) = s.windows.get(window).cloned() else {
+                continue;
+            };
+            if !s.is_visible(&rec) || busy(s, *window) {
+                continue;
+            }
+            let Some(v) = s.canonical_vm_of(*to) else { continue };
+            if v == rec.vmonitor {
+                continue;
+            }
+            let op = s.mint_op();
+            fx.push(Effect::AssignWindowToMonitor {
+                op,
+                window: *window,
+                target: v,
+            });
+            s.pending.push(PendingOp {
+                op,
+                expect: Expectation::WindowOnMonitor {
+                    window: *window,
+                    monitor: v,
+                },
+                issued_ns: now_ns,
+            });
+            notes.push(Note::MonitorAdopted {
+                window: *window,
+                monitor: v,
+            });
+            *last_op = Some(op);
+        }
+    }
+
+    let misplaced: Vec<WindowRecord> = s
+        .windows
+        .values()
+        .filter(|r| s.is_visible(r) && s.host_of(r.vmonitor).is_some_and(|h| h != r.monitor))
+        .cloned()
+        .collect();
+    for rec in misplaced {
+        let window = rec.id;
+        if busy(s, window) || unexplained_move(window) {
+            continue;
+        }
+        let frame = s.projected_frame(&rec);
+        correct_window(
+            s,
+            window,
+            CorrectionAxis::Frame,
+            now_ns,
+            notes,
+            last_op,
+            fx,
+            |op| {
+                (
+                    Effect::SetWindowFrame { op, window, frame },
+                    Expectation::WindowFramed { window, frame },
+                )
+            },
+        );
     }
 }
 
@@ -897,26 +1278,43 @@ fn enforce_focus(
     let landed_hidden = s
         .focused
         .and_then(|w| s.windows.get(&w))
-        .filter(|r| r.workspace != here && r.workspace.0 >= 1 && r.workspace.0 <= s.workspace_count)
+        .filter(|r| !s.is_visible(r) && r.workspace.0 >= 1 && r.workspace.0 <= s.workspace_count)
         .cloned();
     if let (Some(rec), None) = (&landed_hidden, s.focus_target()) {
         if navigation_gesture {
+            // Follow on whichever axes hide the window: the workspace, the
+            // monitor, or both.
             let target = rec.workspace;
-            let op = s.mint_op();
-            fx.push(Effect::SwitchWorkspace { op, target });
-            s.pending.push(PendingOp {
-                op,
-                expect: Expectation::AllMonitorsOn(target),
-                issued_ns: now_ns,
-            });
+            let mut op = None;
+            if target != here {
+                let o = s.mint_op();
+                fx.push(Effect::SwitchWorkspace { op: o, target });
+                s.pending.push(PendingOp {
+                    op: o,
+                    expect: Expectation::AllMonitorsOn(target),
+                    issued_ns: now_ns,
+                });
+                op = Some(o);
+            }
+            let mut proj = s.projection();
+            let mut monitor = None;
+            if !proj.is_hosted(rec.vmonitor) {
+                op = Some(push_view(s, rec.vmonitor, now_ns, fx));
+                proj = s.projection_with(Some(rec.vmonitor), None);
+                monitor = Some(rec.vmonitor);
+            }
             // Declared first so the window the user chose heads the restack.
             s.declare_focus(FocusIntent::Window(rec.id));
-            push_restack(s, target, fx);
+            let order = visible_stack(s, target, &proj);
+            if order.len() >= 2 {
+                fx.push(Effect::RestackWindows { order });
+            }
             notes.push(Note::FollowedFocus {
                 window: rec.id,
                 target,
+                monitor,
             });
-            *last_op = Some(op);
+            *last_op = op;
             return;
         }
         // An empty visible workspace has nothing to hold focus: leave it, the
@@ -940,10 +1338,10 @@ fn enforce_focus(
         s.focus_corrections = 0;
         return;
     }
-    // A declaration for a window that is not on the visible workspace is
-    // unenforceable (its switch has not landed, or never will); granting it
-    // would put the keyboard into an invisible window.
-    if s.windows[&w].workspace != here {
+    // A declaration for a window that is not on screen is unenforceable (its
+    // switch or view has not landed, or never will); granting it would put
+    // the keyboard into an invisible window.
+    if !s.is_visible(&s.windows[&w]) {
         return;
     }
     // The grant is in flight; apps land it on their own schedule.
@@ -1053,6 +1451,14 @@ fn expectation_satisfied(e: &Expectation, s: &State) -> bool {
             .is_some_and(|r| r.workspace == *workspace),
         Expectation::WindowFramed { window, frame } => framed_satisfied(s, *window, frame),
         Expectation::Focused(w) => s.focused == Some(*w),
+        Expectation::WindowOnMonitor { window, monitor } => s
+            .windows
+            .get(window)
+            .is_some_and(|r| r.vmonitor == *monitor),
+        Expectation::Viewing(vm) => s.virtual_monitors.is_some_and(|v| v.viewed == *vm),
+        Expectation::VirtualMonitorsEnabled(e) => {
+            s.virtual_monitors.is_some_and(|v| v.enabled == *e)
+        }
     }
 }
 

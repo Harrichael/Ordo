@@ -18,7 +18,7 @@
 
 use std::collections::HashMap;
 
-use ordo_core::{MonitorId, Pid, Rect, WindowId, WorkspaceId};
+use ordo_core::{MonitorId, Pid, Rect, VirtualMonitorId, VirtualMonitorsWord, WindowId, WorkspaceId};
 use ordo_emulated::ParkTrace;
 
 pub type Result<T> = std::result::Result<T, BackendError>;
@@ -43,6 +43,9 @@ pub struct BackendTopology {
     pub monitors: Vec<MonitorWorkspace>,
     /// Every managed window's workspace assignment.
     pub window_ws: HashMap<WindowId, WorkspaceId>,
+    /// The virtual-monitor layer, for a backend that has one (emulated).
+    /// `None` is the statement that there is none (native).
+    pub virtual_monitors: Option<VirtualMonitorsWord>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -66,15 +69,16 @@ pub trait WorkspaceBackend {
     /// cross-checked against where windows actually are. Called on every rescan.
     ///
     /// Takes the world the enumerator already gathered — the current display
-    /// set (with which is main) and the scanned windows with their owning
-    /// apps — because both are needed to classify workspaces (native maps
-    /// window->space; emulated consults its ledger, whose identity unit is
-    /// the (id, pid) pair) and neither backend should re-enumerate them
+    /// set (frames, and which is main) and the scanned windows with their
+    /// owning apps — because both are needed to classify workspaces (native
+    /// maps window->space; emulated consults its ledger, whose identity unit
+    /// is the (id, pid) pair, and projects its virtual monitors onto the
+    /// displays by position) and neither backend should re-enumerate them
     /// independently.
     fn topology(
         &mut self,
         windows: &[(WindowId, Pid)],
-        monitors: &[(MonitorId, bool)],
+        monitors: &[(MonitorId, Rect, bool)],
     ) -> Result<BackendTopology>;
 
     /// Bring every display to its `target`-th workspace. Blocking and
@@ -92,6 +96,26 @@ pub trait WorkspaceBackend {
     /// touches the frame), so the default delegates.
     fn assign_window_to_workspace(&mut self, window: WindowId, target: WorkspaceId) -> Result<()> {
         self.move_window_to_workspace(window, target)
+    }
+
+    /// Make `target` the anchor virtual monitor (emulated: park the monitors
+    /// that leave the projection, restore the ones that enter it). Native has
+    /// no virtual layer, and says so.
+    fn view_monitor(&mut self, target: VirtualMonitorId) -> Result<()> {
+        let _ = target;
+        Err(BackendError("this backend has no virtual monitors".into()))
+    }
+
+    fn set_virtual_monitors(&mut self, enabled: bool) -> Result<()> {
+        let _ = enabled;
+        Err(BackendError("this backend has no virtual monitors".into()))
+    }
+
+    /// Rewrite the window's virtual-monitor declaration WITHOUT touching its
+    /// frame — the monitor twin of `assign_window_to_workspace`.
+    fn assign_window_to_monitor(&mut self, window: WindowId, target: VirtualMonitorId) -> Result<()> {
+        let _ = (window, target);
+        Err(BackendError("this backend has no virtual monitors".into()))
     }
 
     /// Emergency single-window recovery for the kill switch: make `window`

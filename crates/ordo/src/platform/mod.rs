@@ -16,6 +16,7 @@
 pub mod ax;
 pub mod cf;
 pub mod display;
+pub mod display_watch;
 pub mod effector;
 pub mod emulated_backend;
 pub mod mission_control;
@@ -71,6 +72,9 @@ pub struct MacWorldSource {
     /// rescued — a rescue gather frees windows the ledger still calls parked,
     /// and fighting the gather would be worse than any phantom.
     intercepting: Arc<AtomicBool>,
+    /// Display reconfiguration in progress: the world is unobservable until
+    /// it settles (see [`display_watch`]).
+    settle: display_watch::DisplaySettle,
     /// Last RAW frame logged per window, so the trace records movement rather
     /// than repeating a still picture every snapshot. Without this the table
     /// grows by every tracked window every two seconds; with it, a settled
@@ -81,10 +85,15 @@ pub struct MacWorldSource {
 }
 
 impl MacWorldSource {
-    pub fn new(backend: SharedBackend, intercepting: Arc<AtomicBool>) -> Self {
+    pub fn new(
+        backend: SharedBackend,
+        intercepting: Arc<AtomicBool>,
+        settle: display_watch::DisplaySettle,
+    ) -> Self {
         MacWorldSource {
             backend,
             intercepting,
+            settle,
             last_raw: HashMap::new(),
             trace: Vec::new(),
         }
@@ -93,8 +102,23 @@ impl MacWorldSource {
 
 impl WorldSource for MacWorldSource {
     fn snapshot(&mut self) -> WorldSnapshot {
+        // Mid-reconfiguration, frames are wherever macOS has got to with
+        // re-homing them and the display list may be half-updated. Reported
+        // as no displays at all — the existing "unobservable, not empty" path
+        // — so nothing is believed, corrected, or parked off a transient.
+        if self.settle.settling() {
+            return WorldSnapshot {
+                monitors: Vec::new(),
+                windows: Vec::new(),
+                focused: None,
+                workspaces: WorkspaceSnap::default(),
+            };
+        }
         let displays = display::active_displays();
-        let known: Vec<(MonitorId, bool)> = displays.iter().map(|d| (d.id, d.is_main)).collect();
+        let known: Vec<(MonitorId, Rect, bool)> = displays
+            .iter()
+            .map(|d| (d.id, d.frame, d.is_main))
+            .collect();
 
         let scan = ax::scan();
         let scanned: Vec<(WindowId, Pid)> = scan.windows.iter().map(|w| (w.id, w.app)).collect();
@@ -188,6 +212,7 @@ impl WorldSource for MacWorldSource {
                 })
                 .collect(),
             assignments: topo.window_ws.iter().map(|(w, ws)| (*w, *ws)).collect(),
+            virtual_monitors: topo.virtual_monitors.clone(),
         };
 
         WorldSnapshot {

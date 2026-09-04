@@ -308,6 +308,9 @@ fn effect_kind(e: &Effect) -> &'static str {
         Effect::SwitchWorkspace { .. } => "switch_workspace",
         Effect::MoveWindowToWorkspace { .. } => "move_window_to_workspace",
         Effect::AssignWindowToWorkspace { .. } => "assign_window_to_workspace",
+        Effect::AssignWindowToMonitor { .. } => "assign_window_to_monitor",
+        Effect::ViewMonitor { .. } => "view_monitor",
+        Effect::SetVirtualMonitors { .. } => "set_virtual_monitors",
         Effect::SetWindowFrame { .. } => "set_window_frame",
         Effect::FocusWindow { .. } => "focus_window",
         Effect::WarpMouse { .. } => "warp_mouse",
@@ -322,6 +325,9 @@ fn effect_op(e: &Effect) -> Option<OpId> {
         Effect::SwitchWorkspace { op, .. }
         | Effect::MoveWindowToWorkspace { op, .. }
         | Effect::AssignWindowToWorkspace { op, .. }
+        | Effect::AssignWindowToMonitor { op, .. }
+        | Effect::ViewMonitor { op, .. }
+        | Effect::SetVirtualMonitors { op, .. }
         | Effect::SetWindowFrame { op, .. }
         | Effect::FocusWindow { op, .. } => Some(*op),
         Effect::WarpMouse { .. }
@@ -339,6 +345,7 @@ fn note_kind(n: &Note) -> &'static str {
         Note::External { .. } => "external",
         Note::GestureClassified { .. } => "gesture_classified",
         Note::FollowedFocus { .. } => "followed_focus",
+        Note::MonitorAdopted { .. } => "monitor_adopted",
         Note::HeldFocus { .. } => "held_focus",
         Note::FocusReasserted { .. } => "focus_reasserted",
         Note::FocusDiverged { .. } => "focus_diverged",

@@ -1,9 +1,11 @@
 # Ordo
 
 A macOS workspace/window-navigation daemon, in Rust. Workspaces are the root
-concept: a workspace is a *scene* spanning every monitor. Ordo switches
-workspaces, jumps between windows by most-recent-use, keeps the mouse with the
-focused window, drops new windows where you're working, logs everything for
+concept: a workspace is a *scene* spanning every monitor — and the monitors
+are *virtual*, so the scene survives unplugging the display it was arranged
+on. Ordo switches workspaces, jumps between windows by most-recent-use, keeps
+the mouse with the focused window, drops new windows where you're working,
+remembers which monitor every window belongs to, logs everything for
 after-the-fact debugging, and has a kill switch for when it all goes wrong.
 
 ## Design: a functional core in an imperative shell
@@ -47,8 +49,18 @@ The two rules that make it work:
   to the focused window's center.
 - **New-window placement**: a newly created window is corralled onto the focused
   workspace and monitor.
-- **Move window to the other monitor**: `Cmd+Shift+Left/Right` — focus and
-  mouse travel with the window.
+- **Move window to the adjacent monitor**: `Cmd+Shift+Left/Right` — focus and
+  mouse travel with the window. If that monitor is hidden, the view follows.
+- **Virtual monitors** (emulated backend): every window is declared onto a
+  virtual monitor — a position, left to right, not a piece of hardware. With a
+  display per monitor they map one to one. With fewer displays (the laptop
+  unplugged), `Cmd+Alt+J/K` view the previous/next monitor (no wrap; global,
+  not per workspace), showing its windows and hiding the current one's, and
+  `Cmd+Alt+V` toggles virtualization: off collapses every monitor onto the
+  display(s) present. The view follows focus — Alt+Tab or Cmd+Tab onto a hidden
+  monitor's window reveals it. Plug the display back in and its windows return
+  to it, at the frames they had, within about a second. Mirrored displays
+  count once. Persisted in `state.json`; virtualization is on by default.
 - **Carry window to another workspace**: `Ctrl+Cmd+Left/Right` — the focused
   window moves to the adjacent workspace and the view switches with it.
 - **MRU demote**: `Alt+End` sends the focused window to the back of the MRU
@@ -62,7 +74,7 @@ The two rules that make it work:
 Two workspace backends behind one trait:
 
 - **`emulated`** (default) — Ordo owns workspaces AeroSpace-style, parking
-  hidden windows off-screen. Instant and animation-free, unlimited workspaces,
+  hidden windows off-screen — hidden by workspace or by virtual monitor alike. Instant and animation-free, unlimited workspaces,
   no private Space APIs. Best with a single native Space per display.
   Cmd+Tab, Cmd+` and Dock clicks are followed: the tap witnesses them, and
   a focus landing on a hidden workspace right after one switches Ordo there,

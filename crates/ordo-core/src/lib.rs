@@ -37,6 +37,7 @@ mod effect;
 mod event;
 mod ids;
 mod mru;
+pub mod project;
 mod reconcile;
 mod state;
 mod update;
@@ -44,10 +45,15 @@ mod update;
 pub use effect::{CorrectionAxis, Effect, Expectation};
 pub use event::{
     AxHintKind, Event, Gesture, HotkeyAction, MonitorSnap, MonitorWs, OpOutcome, RescanTrigger, Ts,
-    WindowSnap, WorkspaceSnap, WorldSnapshot,
+    VirtualMonitorsWord, WindowSnap, WorkspaceSnap, WorldSnapshot,
 };
-pub use ids::{MonitorId, OpId, Pid, Point, Rect, WindowId, WorkspaceId, FRAME_EPSILON};
+pub use ids::{
+    MonitorId, OpId, Pid, Point, Rect, VirtualMonitorId, WindowId, WorkspaceId, FRAME_EPSILON,
+};
 pub use mru::FocusHistory;
+pub use project::{project, Projection};
 pub use reconcile::Delta;
-pub use state::{FocusIntent, Mode, MonitorRecord, PendingOp, State, WindowRecord};
+pub use state::{
+    FocusIntent, Mode, MonitorRecord, PendingOp, State, VirtualMonitors, WindowRecord,
+};
 pub use update::{coalesce_hotkeys, update, Note, Step};

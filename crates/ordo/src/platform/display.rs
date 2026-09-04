@@ -6,9 +6,16 @@
 //! is y-flipped, and mixing the two spaces is the classic multi-monitor bug.
 //! Identity is the stable display UUID, not the CGDirectDisplayID, which churns
 //! across hot-plug and sleep.
+//!
+//! A mirror set counts ONCE: two panels showing the same pixels are one
+//! monitor to the user and one position to the projection. CG reports the
+//! secondaries of a hardware mirror set as inactive already; software mirrors
+//! and any edge case that slips through are caught by the mirror query and,
+//! belt and braces, by identical bounds (nothing but a mirror shares them).
 
 use objc2_core_graphics::{
-    CGDisplayBounds, CGDisplayIsMain, CGGetActiveDisplayList, CGMainDisplayID,
+    CGDisplayBounds, CGDisplayIsMain, CGDisplayMirrorsDisplay, CGGetActiveDisplayList,
+    CGMainDisplayID,
 };
 use ordo_core::{MonitorId, Rect};
 use ordo_skylight_sys as sys;
@@ -22,22 +29,32 @@ pub struct DisplayInfo {
 pub fn active_displays() -> Vec<DisplayInfo> {
     let ids = active_display_ids();
     let main = CGMainDisplayID();
-    ids.into_iter()
-        .filter_map(|cg_id| {
-            let uuid = display_uuid(cg_id)?;
-            let b = CGDisplayBounds(cg_id);
-            Some(DisplayInfo {
-                id: uuid,
-                frame: Rect {
-                    x: b.origin.x,
-                    y: b.origin.y,
-                    w: b.size.width,
-                    h: b.size.height,
-                },
-                is_main: cg_id == main || CGDisplayIsMain(cg_id),
-            })
-        })
-        .collect()
+    let mut out: Vec<DisplayInfo> = Vec::new();
+    for cg_id in ids {
+        // A display mirroring another is that other's pixels, not a monitor.
+        if CGDisplayMirrorsDisplay(cg_id) != 0 {
+            continue;
+        }
+        let Some(uuid) = display_uuid(cg_id) else { continue };
+        let b = CGDisplayBounds(cg_id);
+        let frame = Rect {
+            x: b.origin.x,
+            y: b.origin.y,
+            w: b.size.width,
+            h: b.size.height,
+        };
+        let is_main = cg_id == main || CGDisplayIsMain(cg_id);
+        if let Some(twin) = out.iter_mut().find(|d| d.frame == frame) {
+            twin.is_main |= is_main;
+            continue;
+        }
+        out.push(DisplayInfo {
+            id: uuid,
+            frame,
+            is_main,
+        });
+    }
+    out
 }
 
 fn active_display_ids() -> Vec<u32> {

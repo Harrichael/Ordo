@@ -169,6 +169,10 @@ fn run(
     // windows are opted in by the snapshot path (SubscribingWorld).
     let ws = ordo::platform::ws_events::install(tx.clone());
 
+    // Display plug/unplug: the world is unobservable while macOS rearranges
+    // it, then one rescan re-projects everything onto the new rig.
+    let settle = ordo::platform::display_watch::install(tx.clone());
+
     // The engine and all macOS handles live entirely on this one thread.
     let engine_intercepting = intercepting.clone();
     let world_intercepting = intercepting.clone();
@@ -203,7 +207,7 @@ fn run(
             }
         };
         let world = ordo::platform::ws_events::SubscribingWorld::new(
-            MacWorldSource::new(backend.clone(), world_intercepting),
+            MacWorldSource::new(backend.clone(), world_intercepting, settle),
             engine_ws,
         );
         let effector: Box<dyn Effector> = if observe {

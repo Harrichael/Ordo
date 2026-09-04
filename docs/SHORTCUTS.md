@@ -10,7 +10,9 @@
 | Alt + Shift + Tab | Focus MRU window in the current workspace and monitor |
 | Alt + Backtick (`) | Focus MRU window in the current workspace and app |
 | Ctrl + Alt + Tab | Focus MRU window on the other monitor |
-| Cmd + Shift + Left / Right | Move the focused window to the other monitor (focus and mouse go with it) |
+| Cmd + Shift + Left / Right | Move the focused window to the previous / next virtual monitor (focus and mouse go with it; a hidden monitor is viewed) |
+| Cmd + Alt + J / K | View the previous / next virtual monitor: focus its MRU window and, where displays are short, show its windows in place of the current monitor's (no wrap) |
+| Cmd + Alt + V | Virtualization on / off: off collapses every virtual monitor onto the displays present |
 | Ctrl + Cmd + Left / Right | Carry the focused window to the previous / next workspace and switch there with it |
 | Alt + End | Demote the focused window: back of the MRU history, back of the visual stack, focus moves to the next one |
 | Ctrl + Alt + Cmd + Esc (twice within 2s) | Rescue / kill switch: disengage and gather windows back on-screen |
@@ -20,6 +22,12 @@
 
 When Ordo changes focus, the mouse pointer follows to the center of the newly
 focused window. New windows open on the focused workspace and monitor.
+
+Virtual monitors are positions, left to right, not displays: unplug the
+external display and its monitor's windows are hidden (or, with virtualization
+off, collapsed onto the laptop); plug it back in and they return to it. The
+viewed monitor is an anchor — it is always on screen, and Cmd+Alt+J/K move it
+one step, so on a rig with a display per monitor they are focus jumps.
 
 ## Standard macOS shortcuts (context and conflicts)
 

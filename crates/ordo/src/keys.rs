@@ -6,8 +6,13 @@
 //!   - Cmd+Alt+1 … Cmd+Alt+9     → jump straight to that workspace (a
 //!     workspace that doesn't exist is a no-op). Alt-qualified so apps keep
 //!     their Cmd-digit tab switching.
-//!   - Cmd+Shift+Left / Right    → move the focused window to the other
-//!     monitor, dragging focus and mouse along with it
+//!   - Cmd+Shift+Left / Right    → move the focused window to the previous /
+//!     next virtual monitor, dragging focus and mouse along with it
+//!   - Cmd+Alt+J / Cmd+Alt+K     → view the previous / next virtual monitor
+//!     (focus jumps to its MRU window; where displays are short, its windows
+//!     are revealed and the current monitor's hidden)
+//!   - Cmd+Alt+V                 → virtualization on/off: off collapses every
+//!     virtual monitor onto the displays present
 //!   - Ctrl+Cmd+Left / Right     → carry the focused window to the adjacent
 //!     workspace and switch there with it
 //!   - Alt+Tab                   → MRU window in the workspace
@@ -51,6 +56,9 @@ mod code {
     pub const R: u16 = 0x0F;
     pub const S: u16 = 0x01;
     pub const END: u16 = 0x77;
+    pub const J: u16 = 0x26;
+    pub const K: u16 = 0x28;
+    pub const V: u16 = 0x09;
 
     /// Virtual keycodes for the top-row digits 1..9, in order. GOTCHA: these
     /// are not sequential and 5/6 are transposed — the layout is physical, not
@@ -139,12 +147,22 @@ pub fn match_chord(keycode: u16, m: Mods) -> Option<Chord> {
         if let Some(i) = code::DIGITS.iter().position(|c| *c == keycode) {
             return Some(Chord::Hotkey(WorkspaceSwitchTo(WorkspaceId(i as u8 + 1))));
         }
+        // Virtual monitors live under the same Cmd+Alt prefix as the direct
+        // workspace jumps: J/K step the view (vim's down/up, here left/right),
+        // V toggles virtualization.
+        match keycode {
+            code::J => return Some(Chord::Hotkey(ViewMonitorPrev)),
+            code::K => return Some(Chord::Hotkey(ViewMonitorNext)),
+            code::V => return Some(Chord::Hotkey(ToggleVirtualMonitors)),
+            _ => {}
+        }
     }
 
     match keycode {
         code::LEFT if only_cmd(m) => Some(Chord::Hotkey(WorkspacePrev)),
         code::RIGHT if only_cmd(m) => Some(Chord::Hotkey(WorkspaceNext)),
-        code::LEFT | code::RIGHT if cmd_shift(m) => Some(Chord::Hotkey(MoveFocusedToOtherMonitor)),
+        code::LEFT if cmd_shift(m) => Some(Chord::Hotkey(MoveFocusedToMonitorPrev)),
+        code::RIGHT if cmd_shift(m) => Some(Chord::Hotkey(MoveFocusedToMonitorNext)),
         code::LEFT if cmd_ctrl(m) => Some(Chord::Hotkey(CarryFocusedToWorkspacePrev)),
         code::RIGHT if cmd_ctrl(m) => Some(Chord::Hotkey(CarryFocusedToWorkspaceNext)),
         code::TAB if m.ctrl && m.alt && !m.cmd && !m.shift => Some(Chord::Hotkey(MruOtherMonitor)),
@@ -258,15 +276,39 @@ mod tests {
     }
 
     #[test]
+    fn cmd_alt_j_k_v_drive_virtual_monitors_and_bare_keys_pass_through() {
+        let chord = mods(true, true, false, false);
+        assert_eq!(
+            match_chord(code::J, chord),
+            Some(Chord::Hotkey(ViewMonitorPrev))
+        );
+        assert_eq!(
+            match_chord(code::K, chord),
+            Some(Chord::Hotkey(ViewMonitorNext))
+        );
+        assert_eq!(
+            match_chord(code::V, chord),
+            Some(Chord::Hotkey(ToggleVirtualMonitors))
+        );
+        // Cmd+V is Paste, Cmd+J/K are the apps' — only the exact prefix is ours.
+        for key in [code::J, code::K, code::V] {
+            assert_eq!(match_chord(key, mods(true, false, false, false)), None);
+            assert_eq!(match_chord(key, mods(false, true, false, false)), None);
+            assert_eq!(match_chord(key, mods(true, true, true, false)), None);
+            assert_eq!(match_chord(key, mods(false, false, false, false)), None);
+        }
+    }
+
+    #[test]
     fn cmd_shift_arrow_moves_window_and_other_decorated_arrows_pass_through() {
-        // Cmd+Shift+arrows are claimed (window to other monitor)…
+        // Cmd+Shift+arrows are claimed (window to the adjacent monitor)…
         assert_eq!(
             match_chord(code::LEFT, mods(true, false, true, false)),
-            Some(Chord::Hotkey(MoveFocusedToOtherMonitor))
+            Some(Chord::Hotkey(MoveFocusedToMonitorPrev))
         );
         assert_eq!(
             match_chord(code::RIGHT, mods(true, false, true, false)),
-            Some(Chord::Hotkey(MoveFocusedToOtherMonitor))
+            Some(Chord::Hotkey(MoveFocusedToMonitorNext))
         );
         // …but any other decoration still belongs to the apps.
         assert_eq!(

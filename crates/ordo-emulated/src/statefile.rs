@@ -27,8 +27,12 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use ordo_core::{Pid, Rect, WindowId, WorkspaceId};
+use ordo_core::{Pid, Rect, VirtualMonitorId, WindowId, WorkspaceId};
 
+/// Still 1: every field added since carries a default, so a file written by
+/// an older build loads as-is and its declarations upgrade in place. A bump
+/// would void every file on the next restart, which is exactly the stranding
+/// this module exists to prevent.
 pub const VERSION: u32 = 1;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -38,13 +42,34 @@ pub struct PersistedState {
     /// are from a previous WindowServer life and the file is void.
     pub boot_time_sec: i64,
     pub current: WorkspaceId,
+    /// The anchor virtual monitor (see `ordo_core::project`).
+    #[serde(default = "first_monitor")]
+    pub viewed: VirtualMonitorId,
+    #[serde(default = "enabled_by_default")]
+    pub virtual_monitors_enabled: bool,
+    /// How many virtual monitors exist. 0 (a pre-monitor file) means "learn
+    /// it from the displays present".
+    #[serde(default)]
+    pub virtual_monitor_count: u8,
     pub windows: Vec<PersistedWindow>,
+}
+
+fn first_monitor() -> VirtualMonitorId {
+    VirtualMonitorId(1)
+}
+
+fn enabled_by_default() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PersistedWindow {
     pub id: WindowId,
     pub workspace: WorkspaceId,
+    /// The declared virtual monitor. Files from before monitors existed put
+    /// everything on the first one, which is also what a one-display rig is.
+    #[serde(default = "first_monitor")]
+    pub monitor: VirtualMonitorId,
     /// The owning app at the time of the claim — half of the window's
     /// identity (ids recycle within a boot; see the ledger's `Claim`).
     /// Defaults to unknown for files written before it existed; unknown
@@ -59,6 +84,12 @@ pub struct PersistedWindow {
     /// self-heals on its next trustworthy sighting, whereas a recorded lie
     /// would strand it at 1px forever.
     pub saved: Option<Rect>,
+    /// The frame the window last held with the FULL rig present — where it
+    /// goes back to when its display returns. Distinct from `saved`, which is
+    /// the frame at park time and, after an unplug, can only ever be the
+    /// laptop frame macOS re-homed the window to.
+    #[serde(default)]
+    pub home: Option<Rect>,
 }
 
 fn unknown_owner() -> Pid {
@@ -121,19 +152,31 @@ mod tests {
             version: VERSION,
             boot_time_sec: 1234,
             current: WorkspaceId(2),
+            viewed: VirtualMonitorId(2),
+            virtual_monitors_enabled: false,
+            virtual_monitor_count: 2,
             windows: vec![
                 PersistedWindow {
                     id: WindowId(7),
                     workspace: WorkspaceId(2),
+                    monitor: VirtualMonitorId(1),
                     owner: Pid(100),
                     saved: None,
+                    home: None,
                 },
                 PersistedWindow {
                     id: WindowId(9),
                     workspace: WorkspaceId(3),
+                    monitor: VirtualMonitorId(2),
                     owner: Pid(200),
                     saved: Some(Rect {
                         x: 10.0,
+                        y: 20.0,
+                        w: 800.0,
+                        h: 600.0,
+                    }),
+                    home: Some(Rect {
+                        x: 2000.0,
                         y: 20.0,
                         w: 800.0,
                         h: 600.0,
@@ -161,10 +204,10 @@ mod tests {
     }
 
     #[test]
-    fn a_pre_owner_v1_file_still_loads_with_unknown_owners() {
-        // Files written before window identity carried an owner must keep
-        // loading — their claims upgrade in place on first sighting instead
-        // of being discarded wholesale on a schema bump.
+    fn a_pre_owner_pre_monitor_v1_file_still_loads_with_defaults() {
+        // Files written before window identity carried an owner, and before
+        // virtual monitors existed, must keep loading — their claims upgrade
+        // in place instead of being discarded wholesale on a schema bump.
         let body = r#"{
             "version": 1,
             "boot_time_sec": 1234,
@@ -175,5 +218,10 @@ mod tests {
         let state: PersistedState = serde_json::from_str(body).unwrap();
         assert_eq!(state.windows[0].owner, Pid(0));
         assert_eq!(state.windows[0].workspace, WorkspaceId(3));
+        assert_eq!(state.windows[0].monitor, VirtualMonitorId(1));
+        assert_eq!(state.windows[0].home, None);
+        assert_eq!(state.viewed, VirtualMonitorId(1));
+        assert!(state.virtual_monitors_enabled, "virtualization defaults ON");
+        assert_eq!(state.virtual_monitor_count, 0, "unknown until displays are seen");
     }
 }

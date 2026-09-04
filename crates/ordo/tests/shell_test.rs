@@ -15,7 +15,8 @@ use ordo::ports::{Effector, NullEffector, WorldSource};
 use ordo::replay::replay;
 use ordo_core::{
     Effect, FocusIntent, Gesture, HotkeyAction, MonitorId, MonitorSnap, MonitorWs, OpOutcome, Pid,
-    Rect, RescanTrigger, WindowId, WindowSnap, WorkspaceId, WorkspaceSnap, WorldSnapshot,
+    Rect, RescanTrigger, VirtualMonitorId, VirtualMonitors, VirtualMonitorsWord, WindowId,
+    WindowSnap, WorkspaceId, WorkspaceSnap, WorldSnapshot,
 };
 use rusqlite::Connection;
 
@@ -79,20 +80,27 @@ struct FakeOs {
     windows: Vec<WindowSnap>,
     focused: Option<WindowId>,
     policy: FocusPolicy,
+    /// The emulated backend's word on the virtual layer: two monitors, one per
+    /// display while both are plugged in.
+    view: VirtualMonitors,
+    monitors: BTreeMap<WindowId, VirtualMonitorId>,
+    /// How many displays are plugged in (1 or 2).
+    displays: usize,
 }
 
 impl FakeOs {
     fn snapshot(&self) -> WorldSnapshot {
+        let monitors: Vec<MonitorSnap> = [mon(1, 0.0), mon(2, 1920.0)]
+            .into_iter()
+            .take(self.displays)
+            .collect();
         WorldSnapshot {
-            monitors: vec![mon(1, 0.0), mon(2, 1920.0)],
-            windows: self.windows.clone(),
-            focused: self.focused,
             workspaces: WorkspaceSnap {
-                monitors: [MonitorId(1), MonitorId(2)]
-                    .into_iter()
+                monitors: monitors
+                    .iter()
                     .map(|m| {
                         (
-                            m,
+                            m.id,
                             MonitorWs {
                                 active: self.active,
                                 count: 3,
@@ -101,7 +109,14 @@ impl FakeOs {
                     })
                     .collect(),
                 assignments: self.assignments.clone(),
+                virtual_monitors: Some(VirtualMonitorsWord {
+                    view: self.view,
+                    assignments: self.monitors.clone(),
+                }),
             },
+            monitors,
+            windows: self.windows.clone(),
+            focused: self.focused,
         }
     }
 }
@@ -134,6 +149,11 @@ impl Effector for FakeEffector {
                     w.frame = *frame;
                 }
             }
+            Effect::AssignWindowToMonitor { window, target, .. } => {
+                os.monitors.insert(*window, *target);
+            }
+            Effect::ViewMonitor { target, .. } => os.view.viewed = *target,
+            Effect::SetVirtualMonitors { enabled, .. } => os.view.enabled = *enabled,
             Effect::FocusWindow { window, .. } => match os.policy {
                 FocusPolicy::Lands => os.focused = Some(*window),
                 FocusPolicy::Ignored => {}
@@ -174,6 +194,20 @@ fn fake_os(policy: FocusPolicy) -> Rc<RefCell<FakeOs>> {
         ],
         focused: Some(WindowId(1)),
         policy,
+        view: VirtualMonitors {
+            count: 2,
+            viewed: VirtualMonitorId(1),
+            enabled: true,
+        },
+        // By display: w1/w3 on the left one, w2/w4 on the right.
+        monitors: [
+            (WindowId(1), VirtualMonitorId(1)),
+            (WindowId(2), VirtualMonitorId(2)),
+            (WindowId(3), VirtualMonitorId(1)),
+            (WindowId(4), VirtualMonitorId(2)),
+        ]
+        .into(),
+        displays: 2,
     }))
 }
 
@@ -274,6 +308,8 @@ fn snap(focused: Option<u32>, a_ws: u8, b_ws: u8) -> WorldSnapshot {
                 (WindowId(3), WorkspaceId(a_ws)),
             ]
             .into(),
+            // A backend with no virtual layer, as every log before it existed.
+            virtual_monitors: None,
         },
     }
 }
@@ -665,5 +701,76 @@ fn a_gesture_keeps_its_place_between_hotkeys_and_replays_clean() {
     );
     let report = replay(&conn, run_id, None).unwrap();
     assert!(report.is_clean(), "{:?}", report.mismatches);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_view_change_on_one_display_runs_end_to_end_and_replays_clean() {
+    // The laptop rig, through the real engine, logger and replay: the
+    // external display is gone, so w2 and w4 (monitor 2) are hidden. Cmd+Alt+K
+    // views monitor 2 — focus goes to its MRU window, the backend's word
+    // confirms the anchor — and the logged run replays without divergence.
+    let dir = std::env::temp_dir().join(format!("ordo-view-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = dir.join("view.db");
+    let _ = std::fs::remove_file(&db);
+    let os = fake_os(FocusPolicy::Lands);
+    {
+        let mut o = os.borrow_mut();
+        o.displays = 1;
+        // w2 shares workspace 1 with w1 and w3, on the other monitor.
+        o.assignments.insert(WindowId(2), WorkspaceId(1));
+        // macOS re-homed the second display's windows onto the laptop.
+        for w in o.windows.iter_mut() {
+            if w.frame.x >= 1920.0 {
+                w.frame.x -= 1920.0;
+            }
+        }
+    }
+    let run_id = {
+        let logger = Logger::open(&db, "test", "emulated", 1_000).unwrap();
+        let run_id = logger.run_id();
+        let mut engine = engine_on(&os, logger);
+        engine.observe(RescanTrigger::Startup);
+        assert!(!engine
+            .state()
+            .is_visible(&engine.state().windows[&WindowId(2)]));
+
+        engine.pump(ordo_core::Event::Hotkey {
+            at: at(2_000),
+            action: HotkeyAction::ViewMonitorNext,
+        });
+        assert_eq!(os.borrow().view.viewed, VirtualMonitorId(2));
+        assert_eq!(os.borrow().focused, Some(WindowId(2)));
+        assert_eq!(
+            engine.state().focus_intent(),
+            FocusIntent::Window(WindowId(2))
+        );
+        assert!(engine
+            .state()
+            .is_visible(&engine.state().windows[&WindowId(2)]));
+        assert!(!engine
+            .state()
+            .is_visible(&engine.state().windows[&WindowId(1)]));
+
+        // At the edge nothing happens; back at monitor 1 the anchor is 1.
+        engine.pump(ordo_core::Event::Hotkey {
+            at: at(3_000),
+            action: HotkeyAction::ViewMonitorNext,
+        });
+        assert_eq!(os.borrow().view.viewed, VirtualMonitorId(2));
+        engine.pump(ordo_core::Event::Hotkey {
+            at: at(4_000),
+            action: HotkeyAction::ViewMonitorPrev,
+        });
+        assert_eq!(os.borrow().view.viewed, VirtualMonitorId(1));
+        assert_eq!(os.borrow().focused, Some(WindowId(1)));
+        run_id
+    };
+
+    let conn = Connection::open(&db).unwrap();
+    let report = replay(&conn, run_id, None).unwrap();
+    assert!(report.is_clean(), "{:?}", report.mismatches);
+    assert!(count(&conn, "SELECT COUNT(*) FROM effects WHERE kind = 'view_monitor'") >= 2);
     let _ = std::fs::remove_dir_all(&dir);
 }

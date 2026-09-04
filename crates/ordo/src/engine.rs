@@ -251,6 +251,12 @@ impl Engine {
             Effect::RequestRescan { reason } => {
                 let snap = self.world.snapshot();
                 self.drain_park_trace();
+                // The same blind-scan discard as `observe`: a post-effect
+                // rescan during display sleep or a display reconfiguration
+                // must not feed the core an empty world.
+                if snap.monitors.is_empty() {
+                    return;
+                }
                 queue.push_back(Event::WorldObserved {
                     at: self.clock.now(),
                     trigger: reason.clone(),
@@ -278,6 +284,9 @@ fn effect_op(e: &Effect) -> Option<OpId> {
         Effect::SwitchWorkspace { op, .. }
         | Effect::MoveWindowToWorkspace { op, .. }
         | Effect::AssignWindowToWorkspace { op, .. }
+        | Effect::AssignWindowToMonitor { op, .. }
+        | Effect::ViewMonitor { op, .. }
+        | Effect::SetVirtualMonitors { op, .. }
         | Effect::SetWindowFrame { op, .. }
         | Effect::FocusWindow { op, .. } => Some(*op),
         Effect::WarpMouse { .. }
