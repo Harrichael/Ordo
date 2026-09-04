@@ -168,6 +168,16 @@ pub struct State {
     #[serde(default)]
     pub(crate) conceded: Option<Pid>,
     pub focus_history: FocusHistory,
+    /// Visible windows found standing on a display other than their monitor's,
+    /// and when (`mono_ns`) each was first seen there. Adoption waits on this:
+    /// macOS re-homes a vanished display's windows a beat BEFORE it reports
+    /// the display gone, so a window that has just moved displays is either
+    /// the user's drag or the first sign of an unplug, and one snapshot cannot
+    /// tell them apart (run 56: Slack was adopted onto the laptop's monitor
+    /// in the snapshot before the removal arrived). Cleared by any topology
+    /// change and whenever the window is back on its host.
+    #[serde(default)]
+    pub(crate) misplaced_since: BTreeMap<WindowId, u64>,
     pub pending: Vec<PendingOp>,
     /// Damping for tear re-alignment, mirroring `WindowRecord::corrections`.
     pub tear_corrections: u8,
@@ -191,6 +201,7 @@ impl State {
             navigation_gesture: false,
             conceded: None,
             focus_history: FocusHistory::new(),
+            misplaced_since: BTreeMap::new(),
             pending: Vec::new(),
             tear_corrections: 0,
             next_op: 0,

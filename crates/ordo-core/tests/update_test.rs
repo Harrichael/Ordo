@@ -2528,6 +2528,28 @@ fn undocked(focus_seq: &[u32]) -> State {
     .state
 }
 
+/// Observe `snap_of` twice: now, and again once the adoption delay has passed
+/// — the shape of a drag that has come to rest. Returns both steps.
+fn drag_then_settle(state: &State, snap_of: impl Fn() -> WorldSnapshot) -> (Step, Step) {
+    let first = update(
+        state,
+        &Event::WorldObserved {
+            at: ts(),
+            trigger: RescanTrigger::Periodic,
+            snap: snap_of(),
+        },
+    );
+    let later = update(
+        &first.state,
+        &Event::WorldObserved {
+            at: plus_ms(ts(), 1_100),
+            trigger: RescanTrigger::Periodic,
+            snap: snap_of(),
+        },
+    );
+    (first, later)
+}
+
 fn view_targets(effects: &[Effect]) -> Vec<VirtualMonitorId> {
     effects
         .iter()
@@ -2896,15 +2918,12 @@ fn a_drag_across_live_displays_adopts_the_new_monitor_once() {
     let mut wins = std_windows();
     wins[1].snap.frame = rect(800.0, 100.0);
     wins[1] = on_monitor(wins[1].clone(), 2); // the word has not moved yet
-    let drag = update(
-        &s,
-        &observed(
-            vec![mon_a(1), mon_b(1)],
-            wins.clone(),
-            Some(1),
-            RescanTrigger::Periodic,
-        ),
-    );
+    let (moving, drag) =
+        drag_then_settle(&s, || world(&[mon_a(1), mon_b(1)], &wins, Some(1)));
+    // The instant it lands nothing is declared: this could be an unplug's
+    // first symptom (see the re-home test). Once it has rested a second, the
+    // declaration follows.
+    assert!(moving.effects.is_empty(), "{:?}", moving.effects);
     assert_eq!(monitor_assignments(&drag.effects), vec![(wid(2), vm(1))]);
     assert!(drag.notes.contains(&Note::MonitorAdopted {
         window: wid(2),
@@ -2981,16 +3000,9 @@ fn a_drag_onto_a_shared_display_adopts_the_monitor_it_stands_for() {
     let mut dragged = wins;
     dragged[0].snap.frame = rect(2200.0, 300.0);
     dragged[0] = on_monitor(dragged[0].clone(), 1);
-    let drag = update(
-        &s,
-        &observed_view(
-            view,
-            vec![mon_a(1), mon_b(1)],
-            dragged,
-            Some(1),
-            RescanTrigger::Periodic,
-        ),
-    );
+    let (_, drag) = drag_then_settle(&s, || {
+        world_view(view, &[mon_a(1), mon_b(1)], &dragged, Some(1))
+    });
     assert_eq!(monitor_assignments(&drag.effects), vec![(wid(1), vm(2))]);
     assert_eq!(count_set_frames(&drag.effects, 1), 0);
 }
@@ -3067,4 +3079,77 @@ fn without_a_virtual_layer_a_monitor_is_its_display() {
     assert!(set_frame_for(&moved.effects, 1).is_some_and(|f| f.x >= 1920.0));
     assert!(update(&s, &hotkey(HotkeyAction::ViewMonitorNext)).effects.is_empty());
     assert!(update(&s, &hotkey(HotkeyAction::ToggleVirtualMonitors)).effects.is_empty());
+}
+
+#[test]
+fn a_window_standing_on_another_live_display_is_adopted_never_reframed() {
+    // A window whose center has come to rest on the second display while its
+    // declaration still says monitor 1 — however it got there: a resize that
+    // carried the center over the seam, an adoption whose op was lost, a
+    // straddling window. With no display change there is nothing to re-host;
+    // the declaration follows the window, and no frame is ever written. (The
+    // first build wrote the frame back, size and all, and every resize
+    // across the seam became a fight.)
+    let mut wins = std_windows();
+    wins[0] = on_monitor(win(1, 100, 1, rect(1800.0, 100.0)), 1); // center at 2000: on B, says 1
+    // A standing position needs no move delta — only the second of rest.
+    let booted = update(
+        &State::new(),
+        &observed(vec![mon_a(1), mon_b(1)], wins.clone(), Some(1), RescanTrigger::Startup),
+    );
+    assert!(booted.effects.is_empty(), "{:?}", booted.effects);
+    let (_, settled) =
+        drag_then_settle(&booted.state, || world(&[mon_a(1), mon_b(1)], &wins, Some(1)));
+    assert_eq!(monitor_assignments(&settled.effects), vec![(wid(1), vm(2))]);
+    assert_eq!(count_set_frames(&settled.effects, 1), 0, "never a frame write");
+    assert!(settled.notes.contains(&Note::MonitorAdopted {
+        window: wid(1),
+        monitor: vm(2)
+    }));
+    // While the adoption is in flight nothing is repeated.
+    let again = update(
+        &settled.state,
+        &observed(vec![mon_a(1), mon_b(1)], wins, Some(1), RescanTrigger::Periodic),
+    );
+    assert!(again.effects.is_empty(), "{:?}", again.effects);
+}
+
+#[test]
+fn a_rehome_ahead_of_the_display_removal_is_never_adopted() {
+    // The real unplug, as run 56 logged it: macOS moved the second display's
+    // windows onto the laptop while CoreGraphics still listed both displays,
+    // and the removal arrived in the NEXT snapshot. Read alone, the first
+    // snapshot is indistinguishable from a drag — so a drag is not adopted on
+    // sight, and the removal cancels the adoption that was waiting.
+    let s = booted(&[1]);
+    let mut wins = std_windows();
+    wins[1].snap.frame = rect(80.0, 34.0);
+    wins[1] = on_monitor(wins[1].clone(), 2);
+    let rehomed = update(
+        &s,
+        &observed(vec![mon_a(1), mon_b(1)], wins.clone(), Some(1), RescanTrigger::Periodic),
+    );
+    assert!(rehomed.effects.is_empty(), "nothing on sight: {:?}", rehomed.effects);
+
+    let removed = update(
+        &rehomed.state,
+        &observed_view(laptop(1, true), vec![mon_a(1)], wins.clone(), Some(1), RescanTrigger::Periodic),
+    );
+    assert!(monitor_assignments(&removed.effects).is_empty());
+    assert_eq!(removed.state.windows[&wid(2)].vmonitor, vm(2), "still a monitor-2 window");
+    assert!(!removed.state.is_visible(&removed.state.windows[&wid(2)]));
+
+    // Long after, still undocked: the window is hidden, not a drag, and so
+    // viewing monitor 2 is what brings it up — the whole point of the memory.
+    let mut later = removed.state;
+    for _ in 0..8 {
+        later = update(
+            &later,
+            &observed_view(laptop(1, true), vec![mon_a(1)], wins.clone(), Some(1), RescanTrigger::Periodic),
+        )
+        .state;
+    }
+    assert_eq!(later.windows[&wid(2)].vmonitor, vm(2));
+    let view = update(&later, &hotkey(HotkeyAction::ViewMonitorNext));
+    assert_eq!(focus_targets(&view.effects), vec![wid(2)], "Slack comes up on monitor 2");
 }

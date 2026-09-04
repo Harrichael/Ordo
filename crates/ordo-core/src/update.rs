@@ -84,11 +84,11 @@ pub enum Note {
         #[serde(default)]
         monitor: Option<VirtualMonitorId>,
     },
-    /// A visible window was moved between two live displays by a hand that
-    /// was not Ordo's — a drag, or an app placing itself — and its monitor
-    /// declaration followed. Placement within a workspace is observational;
-    /// this is the one observation that writes a monitor declaration, and it
-    /// is a delta (the move itself), never a standing position.
+    /// A visible window stood on a live display other than its monitor's,
+    /// with no display change to explain it — a drag, a resize across the
+    /// seam, an app placing itself — and its monitor declaration followed.
+    /// Placement within a workspace is observational; this is the one
+    /// observation that writes a monitor declaration.
     MonitorAdopted {
         window: WindowId,
         monitor: VirtualMonitorId,
@@ -820,10 +820,14 @@ fn handle_snapshot(
     }
     // A display came or went. Every window on the vanished display was just
     // re-homed by macOS, not by anyone's hand — nothing about a window's
-    // placement in this snapshot says anything about intent.
-    let topology_changed = deltas
-        .iter()
-        .any(|d| matches!(d, Delta::MonitorAdded(_) | Delta::MonitorRemoved(_)));
+    // placement in this snapshot says anything about intent. The FIRST
+    // observation is not a change: every display arrives as an addition then,
+    // and reading that as a plug event re-hosted straddling windows on every
+    // daemon start (run 56).
+    let topology_changed = !pre.monitors.is_empty()
+        && deltas
+            .iter()
+            .any(|d| matches!(d, Delta::MonitorAdded(_) | Delta::MonitorRemoved(_)));
 
     // Resolve or age expectations against the fresh belief.
     let mut expired: Vec<PendingOp> = Vec::new();
@@ -1114,25 +1118,39 @@ fn handle_snapshot(
     }
 }
 
+/// How long a window must stand on another display before its monitor
+/// declaration follows it. macOS re-homes a vanished display's windows before
+/// it reports the display gone — in run 56 the re-homed Slack window and the
+/// still-two-display list arrived in one snapshot, the removal in the next —
+/// so the instant a window changes displays it is either a drag or the first
+/// sign of an unplug. The display change, when it is one, arrives within the
+/// settle window (`SETTLE` in the shell, one second); waiting that long costs
+/// a drag one rescan of latency and costs an unplug nothing.
+const ADOPTION_DELAY_NS: u64 = 1_000_000_000;
+
 /// The projection, asserted: every visible window sits on the display its
-/// virtual monitor is hosted by. Two resolutions for a window found on some
-/// other display, and telling them apart is the whole job:
+/// virtual monitor is hosted by. A window found on some other display gets
+/// one of two resolutions, and which one depends on nothing but whether the
+/// display set changed in this snapshot:
 ///
-/// - It MOVED there this snapshot, between two live displays, by a hand that
-///   was not Ordo's (a drag, an app placing itself): placement is
-///   observational, so the monitor declaration follows — the window is
-///   adopted onto the virtual monitor that display stands for. Delta-driven
-///   on purpose: a standing position says nothing, only the move does.
-/// - It merely SITS there — the display set changed under it (a replug
-///   brought its monitor's display back while it waits on the laptop), or a
-///   declaration moved it (a corral, a view): a violation of the projection,
-///   corrected by re-hosting the frame, damped on the frame axis.
+/// - It did not: the window is on a LIVE display that stands for some other
+///   monitor, and the only way it got there is a hand that was not Ordo's —
+///   a drag, a resize carrying its center across the seam, an app placing
+///   itself. Placement within a workspace is observational, so the monitor
+///   declaration follows: the window is adopted onto the monitor that display
+///   stands for, once it has stood there for `ADOPTION_DELAY_NS`. Never a
+///   frame write: the first build corrected these, and a resize across the
+///   seam became a fight against the user's own hands (run 56, 2026-09-04),
+///   the exact fight this project exists to avoid.
+/// - It did: macOS just re-homed every window of a vanished display, and a
+///   returned display is hosting a monitor whose windows still sit where the
+///   laptop had them. None of that is anyone's placement; the frame is
+///   re-hosted onto the display its monitor is projected onto, damped on the
+///   frame axis and yielding to a hand still on the window. Every pending
+///   adoption is dropped: what looked like a drag was the unplug beginning.
 ///
-/// Adoption is suppressed outright while the display set is changing (macOS
-/// re-homes every window of a vanished display, and those moves are nobody's
-/// intent), and for a window whose own monitor is hidden (it should not be on
-/// screen at all — that is the backend's park to assert, not a drag). Both
-/// resolutions yield to a pending op on the window and to a hand still on it.
+/// Adoption is a word to Ordo's own backend and needs no damping; both
+/// resolutions yield to an op already pending on the window.
 #[allow(clippy::too_many_arguments)]
 fn project_windows(
     s: &mut State,
@@ -1145,6 +1163,7 @@ fn project_windows(
     fx: &mut Vec<Effect>,
 ) {
     if s.virtual_monitors.is_none() {
+        s.misplaced_since.clear();
         return;
     }
     let unexplained_move = |w: WindowId| {
@@ -1159,73 +1178,68 @@ fn project_windows(
     };
     let busy = |s: &State, w: WindowId| s.pending.iter().any(|p| p.expect.window() == Some(w));
 
-    if !topology_changed {
-        for d in deltas {
-            let Delta::WindowMonitorChanged { window, to, .. } = d else {
-                continue;
-            };
-            if entry_expectations.iter().any(|e| reconcile::explains(e, d)) {
-                continue;
-            }
-            let Some(rec) = s.windows.get(window).cloned() else {
-                continue;
-            };
-            if !s.is_visible(&rec) || busy(s, *window) {
-                continue;
-            }
-            let Some(v) = s.canonical_vm_of(*to) else { continue };
-            if v == rec.vmonitor {
-                continue;
-            }
-            let op = s.mint_op();
-            fx.push(Effect::AssignWindowToMonitor {
-                op,
-                window: *window,
-                target: v,
-            });
-            s.pending.push(PendingOp {
-                op,
-                expect: Expectation::WindowOnMonitor {
-                    window: *window,
-                    monitor: v,
-                },
-                issued_ns: now_ns,
-            });
-            notes.push(Note::MonitorAdopted {
-                window: *window,
-                monitor: v,
-            });
-            *last_op = Some(op);
-        }
-    }
-
     let misplaced: Vec<WindowRecord> = s
         .windows
         .values()
         .filter(|r| s.is_visible(r) && s.host_of(r.vmonitor).is_some_and(|h| h != r.monitor))
         .cloned()
         .collect();
+    let still: std::collections::BTreeSet<WindowId> = misplaced.iter().map(|r| r.id).collect();
+    s.misplaced_since.retain(|w, _| still.contains(w));
+    if topology_changed {
+        s.misplaced_since.clear();
+    }
+
     for rec in misplaced {
         let window = rec.id;
-        if busy(s, window) || unexplained_move(window) {
+        if busy(s, window) {
             continue;
         }
-        let frame = s.projected_frame(&rec);
-        correct_window(
-            s,
+        if topology_changed {
+            if unexplained_move(window) {
+                continue;
+            }
+            let frame = s.projected_frame(&rec);
+            correct_window(
+                s,
+                window,
+                CorrectionAxis::Frame,
+                now_ns,
+                notes,
+                last_op,
+                fx,
+                |op| {
+                    (
+                        Effect::SetWindowFrame { op, window, frame },
+                        Expectation::WindowFramed { window, frame },
+                    )
+                },
+            );
+            continue;
+        }
+        let since = *s.misplaced_since.entry(window).or_insert(now_ns);
+        if now_ns.saturating_sub(since) < ADOPTION_DELAY_NS {
+            continue;
+        }
+        let Some(monitor) = s.canonical_vm_of(rec.monitor) else {
+            continue;
+        };
+        if monitor == rec.vmonitor {
+            continue;
+        }
+        let op = s.mint_op();
+        fx.push(Effect::AssignWindowToMonitor {
+            op,
             window,
-            CorrectionAxis::Frame,
-            now_ns,
-            notes,
-            last_op,
-            fx,
-            |op| {
-                (
-                    Effect::SetWindowFrame { op, window, frame },
-                    Expectation::WindowFramed { window, frame },
-                )
-            },
-        );
+            target: monitor,
+        });
+        s.pending.push(PendingOp {
+            op,
+            expect: Expectation::WindowOnMonitor { window, monitor },
+            issued_ns: now_ns,
+        });
+        notes.push(Note::MonitorAdopted { window, monitor });
+        *last_op = Some(op);
     }
 }
 
