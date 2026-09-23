@@ -153,9 +153,10 @@ fn run(
     let intercepting = Arc::new(AtomicBool::new(!observe && !paused));
     let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
 
+    let menu_bars = ordo::platform::display::MenuBars::default();
     if !observe {
         // The tap runs even when paused — it's what hears the engage chord.
-        tap::spawn(tx.clone(), intercepting.clone());
+        tap::spawn(tx.clone(), intercepting.clone(), menu_bars.clone());
         // New-window corralling depends on the WindowCreated hint this emits.
         observer::spawn(tx.clone());
     }
@@ -176,7 +177,7 @@ fn run(
 
     // Display plug/unplug: the world is unobservable while macOS rearranges
     // it, then one rescan re-projects everything onto the new rig.
-    let settle = ordo::platform::display_watch::install(tx.clone());
+    let settle = ordo::platform::display_watch::install(tx.clone(), menu_bars);
 
     // The engine and all macOS handles live entirely on this one thread.
     let engine_intercepting = intercepting.clone();

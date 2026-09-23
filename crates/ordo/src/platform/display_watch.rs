@@ -23,12 +23,15 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::Sender;
+use dispatch2::DispatchQueue;
+use objc2::MainThreadMarker;
 use objc2_core_graphics::{
     CGDisplayChangeSummaryFlags, CGDisplayRegisterReconfigurationCallback, CGDirectDisplayID,
 };
 use ordo_core::RescanTrigger;
 
 use crate::engine::Msg;
+use crate::platform::display::MenuBars;
 
 const SETTLE: Duration = Duration::from_millis(1000);
 
@@ -84,8 +87,9 @@ impl Default for DisplaySettle {
 
 /// Register the reconfiguration callback and start the poster. Call on the
 /// main thread before it enters the AppKit run loop, which is what delivers
-/// the callback. Returns the handle the world source gates on.
-pub fn install(tx: Sender<Msg>) -> DisplaySettle {
+/// the callback. Returns the handle the world source gates on. `menu_bars`
+/// is refreshed once the displays settle, and once as the run loop starts.
+pub fn install(tx: Sender<Msg>, menu_bars: MenuBars) -> DisplaySettle {
     let settle = DisplaySettle::new();
     // Leaked on purpose: the callback outlives everything but the process.
     let ctx = Box::into_raw(Box::new(settle.clone()));
@@ -95,6 +99,11 @@ pub fn install(tx: Sender<Msg>) -> DisplaySettle {
     if err.0 != 0 {
         eprintln!("ordo: could not register for display changes (CGError {})", err.0);
     }
+
+    let bars = menu_bars.clone();
+    DispatchQueue::main().exec_async(move || {
+        bars.refresh(MainThreadMarker::new().expect("main queue"));
+    });
 
     let poster = settle.clone();
     std::thread::spawn(move || {
@@ -106,6 +115,11 @@ pub fn install(tx: Sender<Msg>) -> DisplaySettle {
                 continue;
             }
             posted_for = last;
+            // The menu bars moved with the displays; only AppKit knows where.
+            let bars = menu_bars.clone();
+            DispatchQueue::main().exec_async(move || {
+                bars.refresh(MainThreadMarker::new().expect("main queue"));
+            });
             if tx
                 .send(Msg::Rescan(RescanTrigger::BackendHint {
                     kind: "display_reconfigured".into(),

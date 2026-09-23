@@ -160,3 +160,44 @@ pub fn labels(mtm: objc2::MainThreadMarker) -> std::collections::HashMap<Monitor
     }
     out
 }
+
+/// Every display's menu bar, in CG coordinates. Read from AppKit on the main
+/// thread, consulted by the event tap, which reports clicks there as their
+/// own gesture (see `ordo_core::Gesture::MenuBar`).
+#[derive(Clone, Default)]
+pub struct MenuBars(std::sync::Arc<std::sync::RwLock<Vec<Rect>>>);
+
+impl MenuBars {
+    pub fn contains(&self, p: ordo_core::Point) -> bool {
+        self.0.read().unwrap().iter().any(|r| r.contains(p))
+    }
+
+    pub fn refresh(&self, mtm: objc2::MainThreadMarker) {
+        use objc2_app_kit::{NSScreen, NSStatusBar};
+
+        let screens = NSScreen::screens(mtm);
+        // Cocoa's y runs up from the bottom of the first screen; CG's runs
+        // down from its top.
+        let Some(primary_h) = screens.iter().next().map(|s| s.frame().size.height) else {
+            return;
+        };
+        let thickness = NSStatusBar::systemStatusBar().thickness();
+        let bars = screens
+            .iter()
+            .map(|s| {
+                let (f, v) = (s.frame(), s.visibleFrame());
+                let top = f.origin.y + f.size.height;
+                // Taller than the status bar under a notch; the visible frame
+                // doesn't exclude an auto-hidden bar, hence the floor.
+                let h = (top - (v.origin.y + v.size.height)).max(thickness);
+                Rect {
+                    x: f.origin.x,
+                    y: primary_h - top,
+                    w: f.size.width,
+                    h,
+                }
+            })
+            .collect();
+        *self.0.write().unwrap() = bars;
+    }
+}

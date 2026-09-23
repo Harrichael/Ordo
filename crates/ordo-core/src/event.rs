@@ -67,8 +67,15 @@ pub enum Gesture {
     /// Any mouse button went down here (global CG coordinates). The point is
     /// what lets the core tell a click INTO a visible window (the OS keys the
     /// right thing; a later hidden-workspace landing is a fling) from a click
-    /// elsewhere — Dock, menu bar, a notification — that can be navigation.
+    /// elsewhere — the Dock, a notification — that can be navigation.
     MouseDown { at: Point },
+    /// A mouse button went down in a display's menu bar. It moves the user to
+    /// that display — macOS hands focus to its front window, or its desktop
+    /// when it shows nothing — so focus is the OS's again. But nothing in a
+    /// menu bar picks a window: a hidden landing after it is never followed
+    /// (opening Ordo's own menu was once read as navigating to a parked
+    /// window, and slid the view away).
+    MenuBar { at: Point },
     /// macOS's app switcher completed (Cmd released after Cmd+Tab) or its
     /// in-app window cycle fired (Cmd+`). The target is the OS's to know; a
     /// focus landing on a hidden workspace right after is the user going there.

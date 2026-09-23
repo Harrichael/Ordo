@@ -8,7 +8,7 @@
 //!     re-enable itself, or hotkeys silently die after a while.
 //!
 //! The same tap WITNESSES the user's focus gestures Ordo does not own — every
-//! mouse-down, and macOS's Cmd+Tab / Cmd+` — and reports them as
+//! mouse-down (telling menu bar clicks apart), and macOS's Cmd+Tab / Cmd+` — and reports them as
 //! [`Msg::Gesture`] while passing the event through untouched. Without that
 //! trace, a click and a notification stealing focus look identical to the
 //! core. Ordinary keystrokes are deliberately NOT reported: they say nothing
@@ -37,6 +37,7 @@ use ordo_core::{Gesture, Point};
 
 use crate::engine::Msg;
 use crate::keys::{self, Chord, Mods, Witness};
+use crate::platform::display::MenuBars;
 
 /// Two presses of the rescue chord within this window engage rescue.
 const RESCUE_WINDOW: Duration = Duration::from_secs(2);
@@ -44,6 +45,7 @@ const RESCUE_WINDOW: Duration = Duration::from_secs(2);
 struct TapContext {
     tx: Sender<Msg>,
     intercepting: Arc<AtomicBool>,
+    menu_bars: MenuBars,
     /// Set after the tap is created, so the callback can re-enable it.
     tap: RefCell<Option<CFRetained<CFMachPort>>>,
     last_rescue: Cell<Option<Instant>>,
@@ -56,11 +58,12 @@ struct TapContext {
 /// the process exits. Returns immediately; if the tap can't be created (no
 /// Accessibility permission), logs and the thread ends — Ordo still observes,
 /// just without hotkeys.
-pub fn spawn(tx: Sender<Msg>, intercepting: Arc<AtomicBool>) {
+pub fn spawn(tx: Sender<Msg>, intercepting: Arc<AtomicBool>, menu_bars: MenuBars) {
     std::thread::spawn(move || {
         let ctx = Box::into_raw(Box::new(TapContext {
             tx,
             intercepting,
+            menu_bars,
             tap: RefCell::new(None),
             last_rescue: Cell::new(None),
             app_switcher_armed: Cell::new(false),
@@ -134,9 +137,13 @@ unsafe extern "C-unwind" fn callback(
     match ty {
         CGEventType::LeftMouseDown | CGEventType::RightMouseDown | CGEventType::OtherMouseDown => {
             let p = CGEvent::location(Some(ev));
-            let _ = ctx.tx.send(Msg::Gesture(Gesture::MouseDown {
-                at: Point { x: p.x, y: p.y },
-            }));
+            let at = Point { x: p.x, y: p.y };
+            let gesture = if ctx.menu_bars.contains(at) {
+                Gesture::MenuBar { at }
+            } else {
+                Gesture::MouseDown { at }
+            };
+            let _ = ctx.tx.send(Msg::Gesture(gesture));
             return pass;
         }
         CGEventType::FlagsChanged => {

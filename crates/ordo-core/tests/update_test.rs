@@ -770,6 +770,44 @@ fn a_witnessed_switch_to_a_hidden_window_is_followed_and_an_unwitnessed_one_is_h
 }
 
 #[test]
+fn a_menu_bar_click_moves_focus_to_its_display_but_never_follows_a_hidden_window() {
+    // w3 declared on the left display; the right display shows nothing on
+    // this workspace; w2 is parked on workspace 2. Clicking the right
+    // display's menu bar (its Ordo icon, say) makes macOS move focus to that
+    // display — its desktop, since it is empty. That is the user's doing and
+    // stands. Without the click, the same loss of focus is fought.
+    let mut wins = std_windows();
+    wins[1].workspace = ws(2);
+    let obs = |focused: Option<u32>| {
+        observed(
+            vec![mon_a(1), mon_b(1)],
+            wins.clone(),
+            focused,
+            RescanTrigger::Periodic,
+        )
+    };
+    let s = update(&booted(&[3, 1]), &obs(Some(1))).state;
+    let s = update(&s, &hotkey(HotkeyAction::MruWorkspace)).state;
+    let s = update(&s, &obs(Some(3))).state;
+    assert_eq!(s.focus_intent(), FocusIntent::Window(wid(3)));
+
+    let unexplained = update(&s, &obs(None));
+    assert_eq!(focus_targets(&unexplained.effects), vec![wid(3)], "fought");
+
+    let menu_bar = Gesture::MenuBar {
+        at: Point { x: 2500.0, y: 10.0 },
+    };
+    let clicked = update(&s, &gesture(menu_bar)).state;
+    let moved = update(&clicked, &obs(None));
+    assert!(moved.effects.is_empty(), "{:?}", moved.effects);
+
+    // And a parked window keyed after a menu bar click is not followed.
+    let clicked = update(&s, &gesture(menu_bar)).state;
+    let landed = update(&clicked, &obs(Some(2)));
+    assert_eq!(count_switches(&landed.effects), 0);
+}
+
+#[test]
 fn a_click_into_a_visible_window_does_not_license_a_follow_but_a_click_elsewhere_does() {
     // Same world: w2 parked on workspace 2, w1 (100,100 400x300) visible.
     let mut wins = std_windows();

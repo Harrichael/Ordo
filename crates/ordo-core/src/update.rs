@@ -237,21 +237,24 @@ fn view_for(s: &State, target: WindowId) -> (Option<VirtualMonitorId>, Projectio
 /// child Ordo does not model), so a hidden landing after it is a fling.
 fn handle_gesture(s: &mut State, gesture: Gesture, notes: &mut Vec<Note>) {
     s.declare_focus(FocusIntent::Deferred);
-    let within = match gesture {
-        Gesture::SystemSwitch => None,
+    let (armed, within) = match gesture {
+        Gesture::SystemSwitch => (true, None),
+        Gesture::MenuBar { .. } => (false, None),
         Gesture::MouseDown { at } => {
             let here = s.current_workspace();
-            s.windows
+            let within = s
+                .windows
                 .values()
                 .find(|r| Some(r.workspace) == here && r.frame.contains(at))
-                .map(|r| r.id)
+                .map(|r| r.id);
+            (within.is_none(), within)
         }
     };
     // After the declaration, which clears it.
-    s.navigation_gesture = within.is_none();
+    s.navigation_gesture = armed;
     notes.push(Note::GestureClassified {
         gesture,
-        armed: s.navigation_gesture,
+        armed,
         within,
     });
 }
