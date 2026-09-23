@@ -52,6 +52,9 @@ The two rules that make it work:
   pick one to switch there. Below them, a diagram of the virtual monitors —
   a tile each, dotted with this workspace's windows, dashed while hidden —
   under a frame for the physical displays that slides as the view changes.
+  While there are more monitors than displays, drag one tile onto another to
+  merge them: after a confirm, the first monitor's windows join the second on
+  every workspace, and the monitors after it renumber down by one.
   Dimmed while Ordo is paused. Not shown with
   `--observe`. Preview the design without the daemon:
   `cargo run --example menubar_preview`.

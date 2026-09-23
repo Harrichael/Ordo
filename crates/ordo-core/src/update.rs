@@ -7,7 +7,7 @@ use crate::event::{
 use crate::ids::{
     MonitorId, OpId, Pid, Rect, VirtualMonitorId, WindowId, WorkspaceId, FRAME_EPSILON,
 };
-use crate::project::Projection;
+use crate::project::{after_merge, project, Projection};
 use crate::reconcile::{self, Delta};
 use crate::state::{FocusIntent, Mode, PendingOp, State, WindowRecord};
 
@@ -316,6 +316,10 @@ enum Command {
         target: VirtualMonitorId,
     },
     ToggleVirtualMonitors,
+    Merge {
+        from: VirtualMonitorId,
+        into: VirtualMonitorId,
+    },
 }
 
 fn handle_hotkey(s: &mut State, action: HotkeyAction, now_ns: u64, fx: &mut Vec<Effect>) {
@@ -448,6 +452,14 @@ fn resolve(s: &State, action: HotkeyAction) -> Option<Command> {
         HotkeyAction::ToggleVirtualMonitors => {
             s.virtual_monitors?;
             Some(Command::ToggleVirtualMonitors)
+        }
+
+        HotkeyAction::MergeMonitors { from, into } => {
+            let v = s.virtual_monitors?;
+            let spare = v.count as usize > s.monitors.len().max(1);
+            let exists = |m: VirtualMonitorId| (1..=v.count).contains(&m.0);
+            (spare && from != into && exists(from) && exists(into))
+                .then_some(Command::Merge { from, into })
         }
     }
 }
@@ -774,6 +786,44 @@ fn execute(s: &mut State, cmd: Command, now_ns: u64, fx: &mut Vec<Effect>) -> Fo
             }
             if let Some(ws) = s.current_workspace() {
                 let order = visible_stack(s, ws, &s.projection_with(Some(viewed), Some(enabled)));
+                if order.len() >= 2 {
+                    fx.push(Effect::RestackWindows { order });
+                }
+            }
+            fx.push(Effect::RequestRescan {
+                reason: RescanTrigger::PostEffect { op },
+            });
+            s.focus_intent()
+        }
+
+        Command::Merge { from, into } => {
+            let v = s.virtual_monitors.expect("resolved against a virtual layer");
+            let op = s.mint_op();
+            fx.push(Effect::MergeMonitors { op, from, into });
+            s.pending.push(PendingOp {
+                op,
+                expect: Expectation::MonitorsMerged { count: v.count - 1 },
+                issued_ns: now_ns,
+            });
+            // What a merge reveals comes up through app un-hiding, which
+            // scrambles z-order, as a view change's does.
+            if let Some(ws) = s.current_workspace() {
+                let merged = project(
+                    v.count - 1,
+                    after_merge(v.viewed, from, into),
+                    v.enabled,
+                    s.monitors.len(),
+                );
+                let order: Vec<WindowId> = s
+                    .focus_history
+                    .iter()
+                    .filter(|w| {
+                        s.windows.get(w).is_some_and(|r| {
+                            r.workspace == ws
+                                && merged.is_hosted(after_merge(r.vmonitor, from, into))
+                        })
+                    })
+                    .collect();
                 if order.len() >= 2 {
                     fx.push(Effect::RestackWindows { order });
                 }
@@ -1564,6 +1614,9 @@ fn expectation_satisfied(e: &Expectation, s: &State) -> bool {
         Expectation::Viewing(vm) => s.virtual_monitors.is_some_and(|v| v.viewed == *vm),
         Expectation::VirtualMonitorsEnabled(e) => {
             s.virtual_monitors.is_some_and(|v| v.enabled == *e)
+        }
+        Expectation::MonitorsMerged { count } => {
+            s.virtual_monitors.is_some_and(|v| v.count == *count)
         }
     }
 }

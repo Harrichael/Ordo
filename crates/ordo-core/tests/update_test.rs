@@ -2785,6 +2785,62 @@ fn moving_onto_an_empty_monitor_gives_focus_to_its_desktop_and_holds_it_there() 
 }
 
 #[test]
+fn a_merge_from_the_menu_folds_one_monitor_into_another_while_one_is_spare() {
+    // Three monitors on two displays; w2 lives on hidden monitor 3. Dragging
+    // monitor 3 onto monitor 1 in the menu bar asks the backend for the fold,
+    // and the backend's word of two monitors, w2 now on 1, is our own echo.
+    // Then two monitors on two displays: nothing is spare, and a merge is
+    // refused. A monitor is never merged into itself.
+    let view = |count| VirtualMonitors {
+        count,
+        viewed: vm(1),
+        enabled: true,
+    };
+    let three = observed_view(
+        view(3),
+        vec![mon_a(1), mon_b(1)],
+        vec![
+            win(1, 100, 1, rect(100.0, 100.0)),
+            on_monitor(win(2, 200, 1, rect(2000.0, 100.0)), 3),
+        ],
+        Some(1),
+        RescanTrigger::Periodic,
+    );
+    let s = update(&State::new(), &three).state;
+    let merge = |s: &State, from, into| {
+        update(
+            s,
+            &hotkey(HotkeyAction::MergeMonitors {
+                from: vm(from),
+                into: vm(into),
+            }),
+        )
+    };
+    assert!(merge(&s, 2, 2).effects.is_empty());
+
+    let merged = merge(&s, 3, 1);
+    assert!(merged.effects.iter().any(|e| matches!(
+        e,
+        Effect::MergeMonitors { from, into, .. } if *from == vm(3) && *into == vm(1)
+    )));
+
+    let two = observed_view(
+        view(2),
+        vec![mon_a(1), mon_b(1)],
+        vec![
+            win(1, 100, 1, rect(100.0, 100.0)),
+            on_monitor(win(2, 200, 1, rect(300.0, 300.0)), 1),
+        ],
+        Some(1),
+        RescanTrigger::Periodic,
+    );
+    let landed = update(&merged.state, &two).state;
+    assert_eq!(landed.windows[&wid(2)].vmonitor, vm(1));
+    assert!(landed.pending.is_empty(), "{:?}", landed.pending);
+    assert!(merge(&landed, 2, 1).effects.is_empty(), "no monitor is spare");
+}
+
+#[test]
 fn toggling_virtualization_on_views_the_focused_windows_monitor() {
     let s = undocked(&[1]);
     // Off: everything collapses onto the display; no view change needed.

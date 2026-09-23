@@ -510,7 +510,15 @@ impl Controller {
     }
 
     fn map(&self) -> &MonitorMap {
-        self.ivars().map.get_or_init(|| MonitorMap::new(self.mtm()))
+        self.ivars().map.get_or_init(|| {
+            let tx = self.ivars().mailbox.tx.clone();
+            MonitorMap::new(
+                self.mtm(),
+                Box::new(move |from, into| {
+                    let _ = tx.send(Msg::Hotkey(HotkeyAction::MergeMonitors { from, into }));
+                }),
+            )
+        })
     }
 
     /// A view that changed under an open menu: only the diagram follows it,
@@ -520,7 +528,7 @@ impl Controller {
             return;
         }
         if let (Some(monitors), Some(map)) = (&view.monitors, self.ivars().map.get()) {
-            map.show(monitors, true);
+            map.show(monitors, view.engaged, true);
         }
     }
 
@@ -580,7 +588,7 @@ impl Controller {
         }
         if let Some(monitors) = &view.monitors {
             menu.addItem(&NSMenuItem::separatorItem(mtm));
-            fill_monitors(menu, self.map(), monitors, mtm);
+            fill_monitors(menu, self.map(), monitors, view.engaged, mtm);
         }
         if !view.engaged {
             menu.addItem(&NSMenuItem::separatorItem(mtm));
@@ -590,12 +598,18 @@ impl Controller {
 }
 
 /// The monitors diagram plus the one mode line the picture can't show.
-fn fill_monitors(menu: &NSMenu, map: &MonitorMap, view: &MonitorsView, mtm: MainThreadMarker) {
+fn fill_monitors(
+    menu: &NSMenu,
+    map: &MonitorMap,
+    view: &MonitorsView,
+    engaged: bool,
+    mtm: MainThreadMarker,
+) {
     menu.addItem(&NSMenuItem::sectionHeaderWithTitle(
         ns_string!("Monitors"),
         mtm,
     ));
-    map.show(view, false);
+    map.show(view, engaged, false);
     let item = NSMenuItem::new(mtm);
     item.setView(Some(map));
     menu.addItem(&item);

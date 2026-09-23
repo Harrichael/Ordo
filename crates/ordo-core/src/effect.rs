@@ -55,6 +55,14 @@ pub enum Effect {
         op: OpId,
         enabled: bool,
     },
+    /// Fold `from` into `into` on every workspace (see
+    /// [`crate::after_merge`]). The backend moves what the merge moves on
+    /// screen — it owns the before-and-after plan, as for a view change.
+    MergeMonitors {
+        op: OpId,
+        from: VirtualMonitorId,
+        into: VirtualMonitorId,
+    },
     /// The core computes target geometry itself (pure math over monitor
     /// frames); the shell only performs the AX write.
     SetWindowFrame {
@@ -124,6 +132,10 @@ pub enum Expectation {
     },
     Viewing(VirtualMonitorId),
     VirtualMonitorsEnabled(bool),
+    /// A merge landed: this many monitors remain.
+    MonitorsMerged {
+        count: u8,
+    },
 }
 
 /// Which independent placement fight a correction belongs to. Workspace

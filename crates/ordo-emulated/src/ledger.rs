@@ -21,11 +21,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use ordo_core::{project, Pid, Projection, VirtualMonitorId, VirtualMonitors, WindowId, WorkspaceId};
+use ordo_core::{
+    after_merge, project, Pid, Projection, VirtualMonitorId, VirtualMonitors, WindowId, WorkspaceId,
+};
 
 /// What a change requires: hide the windows that left the screen, reveal the
 /// ones that entered it, and move the ones still on screen whose monitor now
-/// stands on another display (a view sliding under two displays).
+/// stands on another display (a view sliding under two displays, a merge).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SwitchPlan {
     pub park: Vec<WindowId>,
@@ -300,6 +302,29 @@ impl Ledger {
                     monitor: viewed,
                     owner: Pid(0),
                 });
+        }))
+    }
+
+    /// Fold monitor `from` into `into` on every workspace, one fewer monitor
+    /// (see [`after_merge`]); the anchor renumbers like any window. `None`
+    /// when either is out of range, they are the same, or no monitor is
+    /// spare: each display needs one to stand for.
+    pub fn merge_monitor(
+        &mut self,
+        from: VirtualMonitorId,
+        into: VirtualMonitorId,
+    ) -> Option<SwitchPlan> {
+        let n = self.monitors.count;
+        let exists = |m: VirtualMonitorId| (1..=n).contains(&m.0);
+        if from == into || !exists(from) || !exists(into) || n as usize <= self.physical.max(1) {
+            return None;
+        }
+        Some(self.retarget(|l| {
+            for c in l.assign.values_mut() {
+                c.monitor = after_merge(c.monitor, from, into);
+            }
+            l.monitors.viewed = after_merge(l.monitors.viewed, from, into);
+            l.monitors.count = n - 1;
         }))
     }
 

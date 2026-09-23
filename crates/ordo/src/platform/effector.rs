@@ -91,6 +91,9 @@ impl Effector for MacEffector {
             Effect::SetVirtualMonitors { enabled, .. } => Some(result_outcome(
                 self.backend.borrow_mut().set_virtual_monitors(*enabled),
             )),
+            Effect::MergeMonitors { from, into, .. } => Some(result_outcome(
+                self.backend.borrow_mut().merge_monitors(*from, *into),
+            )),
             Effect::WarpMouse { to } => {
                 mouse::warp_to(*to);
                 None

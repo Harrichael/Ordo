@@ -168,6 +168,12 @@ impl WorkspaceBackend for EmulatedBackend {
         Ok(())
     }
 
+    fn merge_monitors(&mut self, from: VirtualMonitorId, into: VirtualMonitorId) -> Result<()> {
+        self.model
+            .merge_monitors(&self.desktop, from, into)
+            .map_err(|_| BackendError(format!("cannot merge monitor {} into {}", from.0, into.0)))
+    }
+
     fn assign_window_to_monitor(&mut self, window: WindowId, target: VirtualMonitorId) -> Result<()> {
         self.model
             .assign_window_to_monitor(window, target)

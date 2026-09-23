@@ -111,6 +111,13 @@ pub trait WorkspaceBackend {
         Err(BackendError("this backend has no virtual monitors".into()))
     }
 
+    /// Fold `from` into `into` on every workspace, one fewer monitor, and
+    /// make the screen match (see `ordo_core::after_merge`).
+    fn merge_monitors(&mut self, from: VirtualMonitorId, into: VirtualMonitorId) -> Result<()> {
+        let _ = (from, into);
+        Err(BackendError("this backend has no virtual monitors".into()))
+    }
+
     /// Rewrite the window's virtual-monitor declaration WITHOUT touching its
     /// frame — the monitor twin of `assign_window_to_workspace`.
     fn assign_window_to_monitor(&mut self, window: WindowId, target: VirtualMonitorId) -> Result<()> {

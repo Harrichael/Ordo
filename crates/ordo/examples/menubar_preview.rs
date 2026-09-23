@@ -86,6 +86,7 @@ fn monitors(enabled: bool) -> MonitorsView {
                     id,
                     display: proj.host(id),
                     windows,
+                    all_windows: windows * 3,
                 }
             })
             .collect(),

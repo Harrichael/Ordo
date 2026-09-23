@@ -81,6 +81,22 @@ impl Projection {
     }
 }
 
+/// Where monitor `m` stands once `from` is merged into `into`: `from`'s
+/// windows go to `into`, and every monitor after `from` steps down one to
+/// close the gap. Shared by the core, which must picture the merged world
+/// before the backend's word arrives, and the backend, which makes it — so
+/// the two can never disagree about the renumbering.
+pub fn after_merge(m: VirtualMonitorId, from: VirtualMonitorId, into: VirtualMonitorId) -> VirtualMonitorId {
+    let close = |v: VirtualMonitorId| {
+        if v.0 > from.0 {
+            VirtualMonitorId(v.0 - 1)
+        } else {
+            v
+        }
+    };
+    close(if m == from { into } else { m })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

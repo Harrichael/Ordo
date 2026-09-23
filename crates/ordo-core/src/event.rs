@@ -128,6 +128,13 @@ pub enum HotkeyAction {
     /// scenery.
     CarryFocusedToWorkspacePrev,
     CarryFocusedToWorkspaceNext,
+    /// From the menu bar, never a chord: fold virtual monitor `from` into
+    /// `into` on every workspace, one fewer monitor. Refused while there are
+    /// no more monitors than displays — each display needs one to stand for.
+    MergeMonitors {
+        from: VirtualMonitorId,
+        into: VirtualMonitorId,
+    },
 }
 
 /// Why a rescan ran. Purely diagnostic except for `AxHint(WindowCreated)`,

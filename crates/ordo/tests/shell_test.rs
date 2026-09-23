@@ -15,7 +15,7 @@ use ordo::menubar::{MenuBarView, MonitorEntry, MonitorsView, WorkspaceEntry};
 use ordo::ports::{Effector, NullEffector, WorldSource};
 use ordo::replay::replay;
 use ordo_core::{
-    Effect, FocusIntent, Gesture, HotkeyAction, MonitorId, MonitorSnap, MonitorWs, OpOutcome, Pid,
+    after_merge, Effect, FocusIntent, Gesture, HotkeyAction, MonitorId, MonitorSnap, MonitorWs, OpOutcome, Pid,
     Rect, RescanTrigger, VirtualMonitorId, VirtualMonitors, VirtualMonitorsWord, WindowId,
     WindowSnap, WorkspaceId, WorkspaceSnap, WorldSnapshot,
 };
@@ -157,6 +157,13 @@ impl Effector for FakeEffector {
             // The desktop is no window of the model.
             Effect::FocusDesktop { .. } => os.focused = None,
             Effect::SetVirtualMonitors { enabled, .. } => os.view.enabled = *enabled,
+            Effect::MergeMonitors { from, into, .. } => {
+                for m in os.monitors.values_mut() {
+                    *m = after_merge(*m, *from, *into);
+                }
+                os.view.viewed = after_merge(os.view.viewed, *from, *into);
+                os.view.count -= 1;
+            }
             Effect::FocusWindow { window, .. } => match os.policy {
                 FocusPolicy::Lands => os.focused = Some(*window),
                 FocusPolicy::Ignored => {}
@@ -806,17 +813,19 @@ fn menu_bar_views(os: &Rc<RefCell<FakeOs>>, script: Vec<Msg>) -> Vec<MenuBarView
 fn monitors_view(
     viewed: u8,
     displays: &[u128],
-    hosts_and_windows: &[(Option<usize>, usize)],
+    // Per monitor: its display, its windows here, its windows everywhere.
+    monitors: &[(Option<usize>, usize, usize)],
 ) -> MonitorsView {
     MonitorsView {
         displays: displays.iter().map(|d| MonitorId(*d)).collect(),
-        monitors: hosts_and_windows
+        monitors: monitors
             .iter()
             .enumerate()
-            .map(|(i, (display, windows))| MonitorEntry {
+            .map(|(i, (display, windows, all_windows))| MonitorEntry {
                 id: VirtualMonitorId(i as u8 + 1),
                 display: *display,
                 windows: *windows,
+                all_windows: *all_windows,
             })
             .collect(),
         viewed: VirtualMonitorId(viewed),
@@ -844,8 +853,8 @@ fn the_menu_bar_shows_every_workspace_and_follows_a_pick_from_its_menu() {
         apps: apps.iter().map(|p| Pid(*p)).collect(),
     };
     let workspaces = vec![entry(1, &[100]), entry(2, &[200]), entry(3, &[])];
-    let on_1 = monitors_view(1, &[1, 2], &[(Some(0), 2), (Some(1), 0)]);
-    let on_2 = monitors_view(1, &[1, 2], &[(Some(0), 0), (Some(1), 2)]);
+    let on_1 = monitors_view(1, &[1, 2], &[(Some(0), 2, 2), (Some(1), 0, 2)]);
+    let on_2 = monitors_view(1, &[1, 2], &[(Some(0), 0, 2), (Some(1), 2, 2)]);
     assert_eq!(
         seen,
         vec![
@@ -893,8 +902,8 @@ fn the_menu_bar_shows_which_monitor_the_one_display_is_showing() {
     assert_eq!(
         monitors,
         vec![
-            monitors_view(1, &[1], &[(Some(0), 2), (None, 1)]),
-            monitors_view(2, &[1], &[(None, 2), (Some(0), 1)]),
+            monitors_view(1, &[1], &[(Some(0), 2, 2), (None, 1, 2)]),
+            monitors_view(2, &[1], &[(None, 2, 2), (Some(0), 1, 2)]),
         ]
     );
 }

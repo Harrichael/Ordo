@@ -541,6 +541,24 @@ impl EmulatedWorkspaces {
         self.apply_plan(d, plan, boundary);
     }
 
+    pub fn merge_monitors(
+        &mut self,
+        d: &dyn Desktop,
+        from: VirtualMonitorId,
+        into: VirtualMonitorId,
+    ) -> Result<(), MonitorOutOfRange> {
+        let plan = self
+            .ledger
+            .merge_monitor(from, into)
+            .ok_or(MonitorOutOfRange(from))?;
+        let current = self.ledger.current();
+        let boundary = ParkTrace::new(WindowId(0), ParkTraceKind::View)
+            .ws(current, current)
+            .detail(format!("monitor {} merged into {}", from.0, into.0));
+        self.apply_plan(d, plan, boundary);
+        Ok(())
+    }
+
     pub fn move_window_to_workspace(
         &mut self,
         d: &dyn Desktop,
@@ -3083,5 +3101,28 @@ mod tests {
         assert_eq!(d.frame(w(2)), rect(2000.0, 100.0), "home again, exactly");
         assert_eq!(d.frame(w(1)), rect(100.0, 100.0));
         assert!(in_park_corner(&d.frame(w(3)), &geo()));
+    }
+
+    /// Dragging monitor 1 onto monitor 3: 1's windows join 3 on every
+    /// workspace, and the monitors after 1 step down — old 2 is the new 1,
+    /// old 3 the new 2. Two monitors on two displays then show everything,
+    /// each window on the display its new number stands for. Nothing is
+    /// spare after that, so another merge is refused.
+    #[test]
+    fn merging_a_monitor_folds_it_into_another_on_every_workspace() {
+        let (d, mut b) = three_on_two();
+        let w4 = w(4);
+        b.move_window_to_workspace(&d, w4, ws(2)).unwrap();
+
+        b.merge_monitors(&d, vm(1), vm(3)).unwrap();
+
+        assert_eq!(b.monitors().count, 2);
+        let m = b.window_monitors();
+        assert_eq!((m[&w(1)], m[&w(2)], m[&w(3)], m[&w4]), (vm(2), vm(1), vm(2), vm(2)));
+        assert!(on(SECOND, d.frame(w(1))), "went right with its monitor");
+        assert!(on(MAIN, d.frame(w(2))), "monitor 2, now 1, moved left");
+        assert!(on(SECOND, d.frame(w(3))), "revealed on the right");
+        assert!(in_park_corner(&d.frame(w4), &geo()), "workspace 2 stays hidden");
+        assert!(b.merge_monitors(&d, vm(2), vm(1)).is_err());
     }
 }

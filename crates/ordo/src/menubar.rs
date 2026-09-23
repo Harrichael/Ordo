@@ -41,6 +41,9 @@ pub struct MonitorEntry {
     /// Windows of the current workspace declared onto this monitor — what
     /// a hidden one is keeping out of sight.
     pub windows: usize,
+    /// Windows on this monitor across every workspace: what merging it away
+    /// would carry.
+    pub all_windows: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -94,14 +97,14 @@ impl MonitorsView {
         let current = s.current_workspace();
         let monitors = (1..=v.count.max(1))
             .map(VirtualMonitorId)
-            .map(|id| MonitorEntry {
-                id,
-                display: proj.host(id),
-                windows: s
-                    .windows
-                    .values()
-                    .filter(|r| r.vmonitor == id && Some(r.workspace) == current)
-                    .count(),
+            .map(|id| {
+                let here = s.windows.values().filter(|r| r.vmonitor == id);
+                MonitorEntry {
+                    id,
+                    display: proj.host(id),
+                    windows: here.clone().filter(|r| Some(r.workspace) == current).count(),
+                    all_windows: here.count(),
+                }
             })
             .collect();
         Some(MonitorsView {

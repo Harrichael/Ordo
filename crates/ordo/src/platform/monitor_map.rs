@@ -5,8 +5,12 @@
 //!
 //! The frame is its own subview, so a view change animates as one thing
 //! moving rather than a redraw.
+//!
+//! While some monitor is spare (more monitors than displays), a tile can be
+//! dragged onto another to merge the two; the drop asks first, in place of
+//! the tiles, because a merge renumbers monitors on every workspace.
 
-use std::cell::{OnceCell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 
 use objc2::rc::Retained;
 use objc2::{define_class, msg_send, AnyThread, DefinedClass, MainThreadOnly};
@@ -14,13 +18,15 @@ use objc2_app_kit::{
     NSAccessibility, NSAnimatablePropertyContainer, NSAnimationContext,
     NSAttributedStringNSStringDrawing, NSBezierPath, NSColor, NSFont, NSFontAttributeName,
     NSFontWeightSemibold, NSForegroundColorAttributeName, NSLineBreakMode, NSMutableParagraphStyle,
-    NSParagraphStyleAttributeName, NSTextAlignment, NSView,
+    NSAutoresizingMaskOptions, NSEvent, NSParagraphStyleAttributeName, NSTextAlignment, NSView,
 };
 use objc2_foundation::{
     MainThreadMarker, NSAttributedString, NSDictionary, NSPoint, NSRect, NSSize, NSString,
 };
 
-use crate::menubar::MonitorsView;
+use ordo_core::VirtualMonitorId;
+
+use crate::menubar::{MonitorEntry, MonitorsView};
 
 const MARGIN_X: f64 = 20.0;
 const TOP: f64 = 4.0;
@@ -37,11 +43,31 @@ const DOT_GAP: f64 = 3.0;
 /// Windows shown as dots before the row stops growing.
 const MAX_DOTS: usize = 6;
 const SLIDE_SECS: f64 = 0.15;
+/// How far a tile must travel before a press becomes a drag.
+const DRAG_SLOP: f64 = 3.0;
+const BUTTON_W: f64 = 72.0;
+const BUTTON_H: f64 = 20.0;
+const BUTTON_GAP: f64 = 8.0;
+const BUTTON_R: f64 = 6.0;
 
-#[derive(Default)]
+/// A tile in the hand: which one, where the pointer holds it, and where the
+/// pointer is now.
+#[derive(Clone, Copy)]
+struct Drag {
+    from: usize,
+    grab: NSPoint,
+    at: NSPoint,
+    moved: bool,
+}
+
 pub struct MapIvars {
     view: RefCell<Option<MonitorsView>>,
     frame: OnceCell<Retained<DisplayFrame>>,
+    mergeable: Cell<bool>,
+    drag: Cell<Option<Drag>>,
+    /// A drop awaiting its answer, as tile indices (from, into).
+    confirm: Cell<Option<(usize, usize)>>,
+    on_merge: Box<dyn Fn(VirtualMonitorId, VirtualMonitorId)>,
 }
 
 define_class!(
@@ -64,8 +90,86 @@ define_class!(
             let Some(view) = &*self.ivars().view.borrow() else {
                 return;
             };
+            let n = view.monitors.len();
+            if let Some((from, into)) = self.ivars().confirm.get() {
+                draw_confirm(self.bounds(), &view.monitors[from], &view.monitors[into]);
+                return;
+            }
+            let drag = self.ivars().drag.get().filter(|d| d.moved);
+            let target = drag.and_then(|d| tile_at(n, d.at).filter(|t| *t != d.from));
             for (i, m) in view.monitors.iter().enumerate() {
-                draw_tile(tile_rect(i), m.id.0, m.windows, m.display.is_some(), m.id == view.viewed);
+                let r = tile_rect(i);
+                if drag.is_some_and(|d| d.from == i) {
+                    draw_slot(r);
+                    continue;
+                }
+                if target == Some(i) {
+                    draw_target(r);
+                }
+                draw_tile(r, m.id.0, m.windows, m.display.is_some(), m.id == view.viewed);
+            }
+            if let Some(d) = drag {
+                let m = &view.monitors[d.from];
+                let r = NSRect::new(
+                    NSPoint::new(d.at.x - d.grab.x, d.at.y - d.grab.y),
+                    NSSize::new(TILE_W, TILE_H),
+                );
+                draw_lifted(r);
+                draw_tile(r, m.id.0, m.windows, true, m.id == view.viewed);
+            }
+        }
+
+        #[unsafe(method(mouseDown:))]
+        fn mouse_down(&self, event: &NSEvent) {
+            let ivars = self.ivars();
+            if ivars.confirm.get().is_some() || !ivars.mergeable.get() {
+                return;
+            }
+            let p = self.local(event);
+            let n = ivars.view.borrow().as_ref().map_or(0, |v| v.monitors.len());
+            if let Some(i) = tile_at(n, p) {
+                let o = tile_rect(i).origin;
+                ivars.drag.set(Some(Drag {
+                    from: i,
+                    grab: NSPoint::new(p.x - o.x, p.y - o.y),
+                    at: p,
+                    moved: false,
+                }));
+            }
+        }
+
+        #[unsafe(method(mouseDragged:))]
+        fn mouse_dragged(&self, event: &NSEvent) {
+            let Some(mut d) = self.ivars().drag.get() else {
+                return;
+            };
+            d.at = self.local(event);
+            let o = tile_rect(d.from).origin;
+            let (dx, dy) = (d.at.x - (o.x + d.grab.x), d.at.y - (o.y + d.grab.y));
+            d.moved |= dx.hypot(dy) > DRAG_SLOP;
+            self.ivars().drag.set(Some(d));
+            self.redraw();
+        }
+
+        #[unsafe(method(mouseUp:))]
+        fn mouse_up(&self, event: &NSEvent) {
+            let p = self.local(event);
+            if let Some((from, into)) = self.ivars().confirm.get() {
+                let (cancel, merge) = buttons(self.bounds());
+                if contains(merge, p) {
+                    self.merge(from, into);
+                } else if contains(cancel, p) {
+                    self.answer();
+                }
+                return;
+            }
+            let Some(d) = self.ivars().drag.take() else {
+                return;
+            };
+            let n = self.ivars().view.borrow().as_ref().map_or(0, |v| v.monitors.len());
+            match tile_at(n, p).filter(|t| d.moved && *t != d.from) {
+                Some(into) => self.ask(d.from, into),
+                None => self.redraw(),
             }
         }
     }
@@ -79,6 +183,12 @@ define_class!(
     struct DisplayFrame;
 
     impl DisplayFrame {
+        // Transparent to the mouse: the tiles under it are what a drag grabs.
+        #[unsafe(method(hitTest:))]
+        fn hit_test(&self, _point: NSPoint) -> *mut NSView {
+            std::ptr::null_mut()
+        }
+
         #[unsafe(method(drawRect:))]
         fn draw_rect(&self, _dirty: NSRect) {
             let size = self.frame().size;
@@ -99,9 +209,23 @@ define_class!(
 );
 
 impl MonitorMap {
-    pub fn new(mtm: MainThreadMarker) -> Retained<Self> {
-        let this = Self::alloc(mtm).set_ivars(MapIvars::default());
+    /// `on_merge` is handed (from, into) once a drop is confirmed.
+    pub fn new(
+        mtm: MainThreadMarker,
+        on_merge: Box<dyn Fn(VirtualMonitorId, VirtualMonitorId)>,
+    ) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(MapIvars {
+            view: RefCell::new(None),
+            frame: OnceCell::new(),
+            mergeable: Cell::new(false),
+            drag: Cell::new(None),
+            confirm: Cell::new(None),
+            on_merge,
+        });
         let this: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: NSRect::ZERO] };
+        // Stretched to the menu's width, so the merge prompt has room even
+        // when two tiles alone would not give it any.
+        this.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
         // Layer-backed so the slide is Core Animation's, which keeps running
         // while the menu holds the run loop in its tracking mode.
         this.setWantsLayer(true);
@@ -114,8 +238,24 @@ impl MonitorMap {
 
     /// Show `view`, sliding the display frame from where it stood when
     /// `animate` — the menu is open and the user just watched it change.
-    pub fn show(&self, view: &MonitorsView, animate: bool) {
+    /// `engaged`: Ordo acts on commands, so a merge could be carried out.
+    pub fn show(&self, view: &MonitorsView, engaged: bool, animate: bool) {
         let n = view.monitors.len();
+        let ivars = self.ivars();
+        // A fresh menu starts clean, and a drop's tile indices mean nothing
+        // once the monitors themselves change under it.
+        let same = ivars.view.borrow().as_ref().is_some_and(|v| v.monitors.len() == n);
+        if !animate || !same {
+            ivars.drag.set(None);
+            ivars.confirm.set(None);
+        }
+        let mergeable = engaged && n > view.displays.len().max(1);
+        ivars.mergeable.set(mergeable);
+        self.setToolTip(
+            mergeable
+                .then(|| NSString::from_str("Drag a monitor onto another to merge them"))
+                .as_deref(),
+        );
         let frame_h = TILE_H + 2.0 * FRAME_PAD;
         self.setFrameSize(NSSize::new(
             2.0 * MARGIN_X
@@ -134,6 +274,8 @@ impl MonitorMap {
             .collect();
         let frame = self.ivars().frame.get().expect("built in new");
         match (hosted.first(), hosted.last()) {
+            // The prompt takes the tiles' place, frame and all.
+            _ if ivars.confirm.get().is_some() => frame.setHidden(true),
             (Some(&first), Some(&last)) => {
                 let x = tile_rect(first).origin.x - FRAME_PAD;
                 let w = tile_rect(last).origin.x + TILE_W + FRAME_PAD - x;
@@ -155,9 +297,167 @@ impl MonitorMap {
         }
 
         self.setAccessibilityLabel(Some(&NSString::from_str(&describe(view))));
-        *self.ivars().view.borrow_mut() = Some(view.clone());
-        self.setNeedsDisplay(true);
+        *ivars.view.borrow_mut() = Some(view.clone());
+        self.redraw();
     }
+
+    fn local(&self, event: &NSEvent) -> NSPoint {
+        self.convertPoint_fromView(event.locationInWindow(), None)
+    }
+
+    /// Now, not at the end of the run loop pass: a menu tracking the mouse
+    /// may not get to one before the next drag event.
+    fn redraw(&self) {
+        self.setNeedsDisplay(true);
+        self.displayIfNeeded();
+    }
+
+    fn ask(&self, from: usize, into: usize) {
+        self.ivars().confirm.set(Some((from, into)));
+        self.ivars().frame.get().expect("built in new").setHidden(true);
+        self.redraw();
+    }
+
+    /// Back to the tiles, as they were.
+    fn answer(&self) {
+        self.ivars().confirm.set(None);
+        let view = self.ivars().view.borrow().clone();
+        if let Some(view) = view {
+            self.show(&view, self.ivars().mergeable.get(), true);
+        }
+    }
+
+    /// Closes the menu too: the merge renumbers the very tiles it drew.
+    fn merge(&self, from: usize, into: usize) {
+        let ids = self
+            .ivars()
+            .view
+            .borrow()
+            .as_ref()
+            .map(|v| (v.monitors[from].id, v.monitors[into].id));
+        self.ivars().confirm.set(None);
+        if let Some((from, into)) = ids {
+            (self.ivars().on_merge)(from, into);
+        }
+        // SAFETY: the item is in the menu that is showing this view.
+        if let Some(menu) = self.enclosingMenuItem().and_then(|item| unsafe { item.menu() }) {
+            menu.cancelTracking();
+        }
+    }
+}
+
+fn contains(r: NSRect, p: NSPoint) -> bool {
+    p.x >= r.origin.x
+        && p.x < r.origin.x + r.size.width
+        && p.y >= r.origin.y
+        && p.y < r.origin.y + r.size.height
+}
+
+fn tile_at(n: usize, p: NSPoint) -> Option<usize> {
+    (0..n).find(|i| contains(tile_rect(*i), p))
+}
+
+fn inset(r: NSRect, d: f64) -> NSRect {
+    NSRect::new(
+        NSPoint::new(r.origin.x + d, r.origin.y + d),
+        NSSize::new(r.size.width - 2.0 * d, r.size.height - 2.0 * d),
+    )
+}
+
+fn rounded(r: NSRect, radius: f64) -> Retained<NSBezierPath> {
+    NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(r, radius, radius)
+}
+
+/// Where a lifted tile came from: an outline, so the row keeps its shape.
+fn draw_slot(r: NSRect) {
+    let path = rounded(inset(r, 0.5), TILE_R);
+    let dash: [f64; 2] = [3.0, 2.0];
+    unsafe { path.setLineDash_count_phase(dash.as_ptr(), 2, 0.0) };
+    NSColor::tertiaryLabelColor().setStroke();
+    path.setLineWidth(1.0);
+    path.stroke();
+}
+
+/// The tile a drop would merge into.
+fn draw_target(r: NSRect) {
+    let path = rounded(inset(r, 1.0), TILE_R);
+    let accent = NSColor::controlAccentColor();
+    accent.colorWithAlphaComponent(0.25).setFill();
+    path.fill();
+    accent.setStroke();
+    path.setLineWidth(2.0);
+    path.stroke();
+}
+
+/// Backing for the tile in the hand, so what it passes over doesn't show
+/// through its translucent fill.
+fn draw_lifted(r: NSRect) {
+    let path = rounded(r, TILE_R);
+    NSColor::windowBackgroundColor().setFill();
+    path.fill();
+    NSColor::controlAccentColor().setStroke();
+    path.setLineWidth(1.5);
+    path.stroke();
+}
+
+/// Cancel and Merge, side by side and centered at the foot of the prompt.
+fn buttons(bounds: NSRect) -> (NSRect, NSRect) {
+    let x = (bounds.size.width - 2.0 * BUTTON_W - BUTTON_GAP) / 2.0;
+    let y = TOP + 33.0;
+    let at = |x: f64| NSRect::new(NSPoint::new(x, y), NSSize::new(BUTTON_W, BUTTON_H));
+    (at(x), at(x + BUTTON_W + BUTTON_GAP))
+}
+
+fn draw_confirm(bounds: NSRect, from: &MonitorEntry, into: &MonitorEntry) {
+    let line = |s: &str, font: &NSFont, color: &NSColor, y: f64, h: f64| {
+        text(s, font, color).drawInRect(NSRect::new(
+            NSPoint::new(MARGIN_X / 2.0, y),
+            NSSize::new(bounds.size.width - MARGIN_X, h),
+        ));
+    };
+    line(
+        &format!("Merge monitor {} into {}?", from.id.0, into.id.0),
+        &NSFont::systemFontOfSize_weight(13.0, unsafe { NSFontWeightSemibold }),
+        &NSColor::labelColor(),
+        TOP - 1.0,
+        17.0,
+    );
+    let detail = match from.all_windows {
+        0 => "No windows to move".to_string(),
+        1 => "1 window moves, on every workspace".to_string(),
+        n => format!("{n} windows move, on every workspace"),
+    };
+    line(
+        &detail,
+        &NSFont::systemFontOfSize(11.0),
+        &NSColor::secondaryLabelColor(),
+        TOP + 16.0,
+        14.0,
+    );
+
+    let (cancel, merge) = buttons(bounds);
+    let label_font = NSFont::systemFontOfSize(12.0);
+    let label = |r: NSRect, s: &str, font: &NSFont, color: &NSColor| {
+        text(s, font, color).drawInRect(NSRect::new(
+            NSPoint::new(r.origin.x, r.origin.y + 2.5),
+            NSSize::new(r.size.width, 16.0),
+        ));
+    };
+    let c = rounded(inset(cancel, 0.5), BUTTON_R);
+    NSColor::labelColor().colorWithAlphaComponent(0.08).setFill();
+    c.fill();
+    NSColor::labelColor().colorWithAlphaComponent(0.2).setStroke();
+    c.setLineWidth(1.0);
+    c.stroke();
+    label(cancel, "Cancel", &label_font, &NSColor::labelColor());
+    NSColor::controlAccentColor().setFill();
+    rounded(merge, BUTTON_R).fill();
+    label(
+        merge,
+        "Merge",
+        &NSFont::systemFontOfSize_weight(12.0, unsafe { NSFontWeightSemibold }),
+        &NSColor::whiteColor(),
+    );
 }
 
 fn tile_rect(i: usize) -> NSRect {
@@ -171,11 +471,7 @@ fn tile_rect(i: usize) -> NSRect {
 }
 
 fn draw_tile(r: NSRect, number: u8, windows: usize, shown: bool, viewed: bool) {
-    let inset = NSRect::new(
-        NSPoint::new(r.origin.x + 0.5, r.origin.y + 0.5),
-        NSSize::new(r.size.width - 1.0, r.size.height - 1.0),
-    );
-    let path = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(inset, TILE_R, TILE_R);
+    let path = rounded(inset(r, 0.5), TILE_R);
     let ink = if shown {
         NSColor::labelColor()
     } else {
