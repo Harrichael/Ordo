@@ -141,12 +141,19 @@ pub fn save(path: &Path, state: &PersistedState) {
     }
 }
 
+/// How far `kern.boottime` may wander within one boot. The kernel derives it
+/// from the wall clock minus uptime, so every clock correction nudges it, and
+/// an exact match discards a live arrangement. Two genuine boots are never
+/// this close together.
+const BOOT_TIME_DRIFT_SEC: i64 = 60;
+
 /// Load and validate. `None` means "start empty" — missing file, unparseable
 /// file, wrong version, or a reboot since it was written.
 pub fn load(path: &Path, boot_time: i64) -> Option<PersistedState> {
     let body = std::fs::read_to_string(path).ok()?;
     let state: PersistedState = serde_json::from_str(&body).ok()?;
-    if state.version != VERSION || state.boot_time_sec != boot_time || boot_time == 0 {
+    let same_boot = (state.boot_time_sec - boot_time).abs() <= BOOT_TIME_DRIFT_SEC;
+    if state.version != VERSION || !same_boot || boot_time == 0 {
         return None;
     }
     Some(state)
@@ -197,7 +204,7 @@ mod tests {
     }
 
     #[test]
-    fn roundtrips_and_rejects_a_stale_boot() {
+    fn roundtrips_through_boot_time_drift_and_rejects_a_stale_boot() {
         let dir = std::env::temp_dir().join(format!("ordo-statefile-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("state.json");
@@ -205,8 +212,10 @@ mod tests {
         let state = sample();
         save(&path, &state);
         assert_eq!(load(&path, 1234), Some(state.clone()));
+        // The same boot, read after a clock correction.
+        assert_eq!(load(&path, 1235), Some(state.clone()));
         // Different boot time = different WindowServer life = void.
-        assert_eq!(load(&path, 1235), None);
+        assert_eq!(load(&path, 1234 + 3600), None);
         // Unknowable boot time must never validate anything.
         assert_eq!(load(&path, 0), None);
 
