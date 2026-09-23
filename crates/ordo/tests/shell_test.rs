@@ -11,6 +11,7 @@ use std::rc::Rc;
 use ordo::clock::Clock;
 use ordo::engine::{Engine, Msg};
 use ordo::logger::Logger;
+use ordo::menubar::{MenuBarView, WorkspaceEntry};
 use ordo::ports::{Effector, NullEffector, WorldSource};
 use ordo::replay::replay;
 use ordo_core::{
@@ -773,4 +774,59 @@ fn a_view_change_on_one_display_runs_end_to_end_and_replays_clean() {
     assert!(report.is_clean(), "{:?}", report.mismatches);
     assert!(count(&conn, "SELECT COUNT(*) FROM effects WHERE kind = 'view_monitor'") >= 2);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_menu_bar_shows_every_workspace_and_follows_a_pick_from_its_menu() {
+    // Through the engine's real loop, which publishes the menu bar's view
+    // after every batch. The "user" reads each redraw and only then makes
+    // the next pick, so every view is a settled one: first the startup scene,
+    // then a pick from the menu (the same WorkspaceSwitchTo a chord mints)
+    // landing on workspace 2, then a rescue graying the whole thing out.
+    let os = fake_os(FocusPolicy::Lands);
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let mut picks = vec![
+        Msg::Hotkey(HotkeyAction::WorkspaceSwitchTo(WorkspaceId(2))),
+        Msg::Rescue,
+        Msg::Shutdown,
+    ]
+    .into_iter();
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let engine = engine_on(&os, in_memory_logger("emulated")).on_state({
+        let seen = seen.clone();
+        move |s| {
+            seen.borrow_mut().push(MenuBarView::of(s));
+            if let Some(next) = picks.next() {
+                tx.send(next).unwrap();
+            }
+        }
+    });
+    engine.run(rx);
+
+    let entry = |n: u8, apps: &[i32]| WorkspaceEntry {
+        id: WorkspaceId(n),
+        apps: apps.iter().map(|p| Pid(*p)).collect(),
+    };
+    let workspaces = vec![entry(1, &[100]), entry(2, &[200]), entry(3, &[])];
+    assert_eq!(
+        *seen.borrow(),
+        vec![
+            MenuBarView {
+                workspaces: workspaces.clone(),
+                current: Some(WorkspaceId(1)),
+                engaged: true,
+            },
+            MenuBarView {
+                workspaces: workspaces.clone(),
+                current: Some(WorkspaceId(2)),
+                engaged: true,
+            },
+            MenuBarView {
+                workspaces,
+                current: Some(WorkspaceId(2)),
+                engaged: false,
+            },
+        ]
+    );
+    assert_eq!(os.borrow().active, WorkspaceId(2));
 }

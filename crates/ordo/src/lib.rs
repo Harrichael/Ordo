@@ -14,6 +14,7 @@
 //!   in their own crates (`ordo-emulated`; SkyLight FFI in
 //!   `ordo-skylight-sys`), bound to the trait under [`platform`].
 //! - [`clock`] — the one place time is read.
+//! - [`menubar`] — what the menu bar item shows, derived from the core's state.
 //! - [`platform`] — the macOS FFI: displays, Accessibility, SkyLight, mouse.
 //! - [`rescue`] — the log-driven recovery gather.
 
@@ -22,6 +23,7 @@ pub mod clock;
 pub mod engine;
 pub mod keys;
 pub mod logger;
+pub mod menubar;
 pub mod ports;
 pub mod replay;
 pub mod rescue;

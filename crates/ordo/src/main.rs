@@ -118,6 +118,7 @@ fn run(
     use ordo::clock::{Clock, SystemClock};
     use ordo::engine::{Engine, Msg};
     use ordo::logger::Logger;
+    use ordo::menubar::MenuBarView;
     use ordo::platform::{
         emulated_backend, native_backend, observer, tap, MacEffector, MacWorldSource,
     };
@@ -169,6 +170,10 @@ fn run(
     // windows are opted in by the snapshot path (SubscribingWorld).
     let ws = ordo::platform::ws_events::install(tx.clone());
 
+    // Observe mode stays out of the menu bar: it executes nothing, so a menu
+    // offering to switch workspaces would be a lie.
+    let menubar = (!observe).then(|| ordo::platform::status_item::install(tx.clone()));
+
     // Display plug/unplug: the world is unobservable while macOS rearranges
     // it, then one rescan re-projects everything onto the new rig.
     let settle = ordo::platform::display_watch::install(tx.clone());
@@ -215,7 +220,10 @@ fn run(
         } else {
             Box::new(MacEffector::new(backend, engine_intercepting, restack))
         };
-        let engine = Engine::new(logger, Box::new(world), effector, Box::new(clock));
+        let mut engine = Engine::new(logger, Box::new(world), effector, Box::new(clock));
+        if let Some(menubar) = menubar {
+            engine = engine.on_state(move |s| menubar.show(MenuBarView::of(s)));
+        }
         engine.run(rx);
     });
 

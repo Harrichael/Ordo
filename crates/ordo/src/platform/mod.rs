@@ -26,6 +26,7 @@ pub mod observer;
 pub mod rescue_gather;
 pub mod restack_worker;
 pub mod skylight;
+pub mod status_item;
 pub mod tap;
 pub mod ws_events;
 pub mod zorder;

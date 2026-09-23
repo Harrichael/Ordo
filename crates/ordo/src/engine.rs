@@ -68,7 +68,10 @@ pub struct Engine {
     world: Box<dyn WorldSource>,
     effector: Box<dyn Effector>,
     clock: Box<dyn Clock>,
+    on_state: Option<StateWatcher>,
 }
+
+type StateWatcher = Box<dyn FnMut(&State)>;
 
 impl Engine {
     pub fn new(
@@ -83,6 +86,21 @@ impl Engine {
             world,
             effector,
             clock,
+            on_state: None,
+        }
+    }
+
+    /// Hand the state to `f` whenever a batch of messages has been fully
+    /// processed — how displays outside the loop (the menu bar) keep up
+    /// without reaching into it. Settled state only: never mid-cascade.
+    pub fn on_state(mut self, f: impl FnMut(&State) + 'static) -> Self {
+        self.on_state = Some(Box::new(f));
+        self
+    }
+
+    fn publish(&mut self) {
+        if let Some(f) = &mut self.on_state {
+            f(&self.state);
         }
     }
 
@@ -135,6 +153,7 @@ impl Engine {
     /// — a gesture included, since "hotkey, click, hotkey" is not one burst.
     pub fn run(mut self, rx: Receiver<Msg>) {
         self.observe(RescanTrigger::Startup);
+        self.publish();
         'recv: while let Ok(msg) = rx.recv() {
             let mut batch = vec![msg];
             while let Ok(m) = rx.try_recv() {
@@ -198,6 +217,7 @@ impl Engine {
                 }
             }
             self.flush_hotkeys(&mut hotkeys);
+            self.publish();
         }
         let _ = self.logger.close(self.clock.now().wall_ms);
     }

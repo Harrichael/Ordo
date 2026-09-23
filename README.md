@@ -44,6 +44,12 @@ The two rules that make it work:
   or `Cmd+Alt+1`…`Cmd+Alt+9` to jump straight to one. The arrows are swallowed
   while Ordo is engaged; the digits are Alt-qualified so apps keep their
   `Cmd`-digit tab switching.
+- **Menu bar item**: a mark per workspace — the current one a pill with its
+  number, the others dots, solid where windows live and hollow where none do.
+  Its menu lists every workspace by the apps on it, most recently used first;
+  pick one to switch there. Dimmed while Ordo is paused. Not shown with
+  `--observe`. Preview the design without the daemon:
+  `cargo run --example menubar_preview`.
 - **MRU window focus**: `Alt+Tab` (in workspace), `Alt+Shift+Tab` (+ monitor),
   `Alt+Backtick` (+ app), `Ctrl+Alt+Tab` (the *other* monitor). The mouse warps
   to the focused window's center.
