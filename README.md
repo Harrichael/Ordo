@@ -46,7 +46,9 @@ The two rules that make it work:
   `Cmd`-digit tab switching.
 - **Menu bar item**: a mark per workspace — the current one a pill with its
   number, the others dots, solid where windows live and hollow where none do.
-  Its menu lists every workspace by the apps on it, most recently used first;
+  When there are more virtual monitors than displays, a small screen per
+  monitor follows, solid where a display shows it, under a frame that slides
+  as the view moves. Its menu lists every workspace by the apps on it, most recently used first;
   pick one to switch there. Below them, a diagram of the virtual monitors —
   a tile each, dotted with this workspace's windows, dashed while hidden —
   under a frame for the physical displays that slides as the view changes.

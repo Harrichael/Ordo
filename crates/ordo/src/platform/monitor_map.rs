@@ -1,10 +1,10 @@
 //! The monitors diagram in the menu bar item's menu: a tile per virtual
 //! monitor, left to right, and over them a frame for the physical displays —
-//! the part of the row that is actually on screen, named display by display.
-//! When the view changes while the menu is open, the frame slides.
+//! the part of the row that is actually on screen. When the view changes
+//! while the menu is open, the frame slides.
 //!
-//! The frame is its own subview, carrying the display names beneath it, so a
-//! view change animates as one thing moving rather than a redraw.
+//! The frame is its own subview, so a view change animates as one thing
+//! moving rather than a redraw.
 
 use std::cell::{OnceCell, RefCell};
 
@@ -21,7 +21,6 @@ use objc2_foundation::{
 };
 
 use crate::menubar::MonitorsView;
-use crate::platform::display::{DisplayLabel, MirrorPanel};
 
 const MARGIN_X: f64 = 20.0;
 const TOP: f64 = 4.0;
@@ -32,23 +31,12 @@ const TILE_R: f64 = 5.0;
 const FRAME_PAD: f64 = 5.0;
 const FRAME_R: f64 = 9.0;
 const FRAME_LINE: f64 = 2.0;
-const LABEL_GAP: f64 = 3.0;
-const LINE_H: f64 = 13.0;
 const BOTTOM: f64 = 6.0;
 const DOT: f64 = 4.0;
 const DOT_GAP: f64 = 3.0;
 /// Windows shown as dots before the row stops growing.
 const MAX_DOTS: usize = 6;
-const SLIDE_SECS: f64 = 0.3;
-
-/// A display's name under the frame, centered over the tiles it shows.
-struct Caption {
-    /// In the frame's own coordinates, so the name travels with it.
-    center_x: f64,
-    width: f64,
-    name: String,
-    mirror: Option<&'static str>,
-}
+const SLIDE_SECS: f64 = 0.15;
 
 #[derive(Default)]
 pub struct MapIvars {
@@ -83,31 +71,20 @@ define_class!(
     }
 );
 
-#[derive(Default)]
-struct FrameIvars {
-    captions: RefCell<Vec<Caption>>,
-}
-
 define_class!(
     // SAFETY: as for MonitorMap.
     #[unsafe(super(NSView))]
     #[thread_kind = MainThreadOnly]
     #[name = "OrdoDisplayFrame"]
-    #[ivars = FrameIvars]
     struct DisplayFrame;
 
     impl DisplayFrame {
-        #[unsafe(method(isFlipped))]
-        fn is_flipped(&self) -> bool {
-            true
-        }
-
         #[unsafe(method(drawRect:))]
         fn draw_rect(&self, _dirty: NSRect) {
-            let w = self.frame().size.width;
+            let size = self.frame().size;
             let outline = NSRect::new(
                 NSPoint::new(FRAME_LINE / 2.0, FRAME_LINE / 2.0),
-                NSSize::new(w - FRAME_LINE, TILE_H + 2.0 * FRAME_PAD - FRAME_LINE),
+                NSSize::new(size.width - FRAME_LINE, size.height - FRAME_LINE),
             );
             let path =
                 NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(outline, FRAME_R, FRAME_R);
@@ -117,20 +94,6 @@ define_class!(
             accent.setStroke();
             path.setLineWidth(FRAME_LINE);
             path.stroke();
-
-            let name_y = TILE_H + 2.0 * FRAME_PAD + LABEL_GAP;
-            for c in self.ivars().captions.borrow().iter() {
-                let x = c.center_x - c.width / 2.0;
-                let name = text(&c.name, &NSFont::systemFontOfSize(10.0), &NSColor::secondaryLabelColor());
-                name.drawInRect(NSRect::new(NSPoint::new(x, name_y), NSSize::new(c.width, LINE_H)));
-                if let Some(mirror) = c.mirror {
-                    let m = text(mirror, &NSFont::systemFontOfSize(9.0), &NSColor::tertiaryLabelColor());
-                    m.drawInRect(NSRect::new(
-                        NSPoint::new(x, name_y + LINE_H),
-                        NSSize::new(c.width, LINE_H),
-                    ));
-                }
-            }
         }
     }
 );
@@ -142,9 +105,8 @@ impl MonitorMap {
         // Layer-backed so the slide is Core Animation's, which keeps running
         // while the menu holds the run loop in its tracking mode.
         this.setWantsLayer(true);
-        let frame = DisplayFrame::alloc(mtm).set_ivars(FrameIvars::default());
         let frame: Retained<DisplayFrame> =
-            unsafe { msg_send![super(frame), initWithFrame: NSRect::ZERO] };
+            unsafe { msg_send![DisplayFrame::alloc(mtm), initWithFrame: NSRect::ZERO] };
         this.addSubview(&frame);
         let _ = this.ivars().frame.set(frame);
         this
@@ -152,17 +114,9 @@ impl MonitorMap {
 
     /// Show `view`, sliding the display frame from where it stood when
     /// `animate` — the menu is open and the user just watched it change.
-    pub fn show(
-        &self,
-        view: &MonitorsView,
-        labels: &std::collections::HashMap<ordo_core::MonitorId, DisplayLabel>,
-        animate: bool,
-    ) {
+    pub fn show(&self, view: &MonitorsView, animate: bool) {
         let n = view.monitors.len();
-        let captions = captions(view, labels);
-        let mirrored = captions.iter().any(|c| c.mirror.is_some());
-        let label_lines = if mirrored { 2.0 } else { 1.0 };
-        let frame_h = TILE_H + 2.0 * FRAME_PAD + LABEL_GAP + label_lines * LINE_H;
+        let frame_h = TILE_H + 2.0 * FRAME_PAD;
         self.setFrameSize(NSSize::new(
             2.0 * MARGIN_X
                 + 2.0 * FRAME_PAD
@@ -184,15 +138,7 @@ impl MonitorMap {
                 let x = tile_rect(first).origin.x - FRAME_PAD;
                 let w = tile_rect(last).origin.x + TILE_W + FRAME_PAD - x;
                 let rect = NSRect::new(NSPoint::new(x, TOP), NSSize::new(w, frame_h));
-                *frame.ivars().captions.borrow_mut() = captions
-                    .into_iter()
-                    .map(|c| Caption {
-                        center_x: c.center_x - x,
-                        ..c
-                    })
-                    .collect();
                 frame.setHidden(false);
-                frame.setNeedsDisplay(true);
                 if animate {
                     NSAnimationContext::beginGrouping();
                     let ctx = NSAnimationContext::currentContext();
@@ -208,7 +154,7 @@ impl MonitorMap {
             _ => frame.setHidden(true),
         }
 
-        self.setAccessibilityLabel(Some(&NSString::from_str(&describe(view, labels))));
+        self.setAccessibilityLabel(Some(&NSString::from_str(&describe(view))));
         *self.ivars().view.borrow_mut() = Some(view.clone());
         self.setNeedsDisplay(true);
     }
@@ -287,56 +233,12 @@ fn draw_tile(r: NSRect, number: u8, windows: usize, shown: bool, viewed: bool) {
     }
 }
 
-/// One caption per display, centered over the tiles it shows — under
-/// collapse the rightmost display shows several.
-fn captions(
-    view: &MonitorsView,
-    labels: &std::collections::HashMap<ordo_core::MonitorId, DisplayLabel>,
-) -> Vec<Caption> {
-    view.displays
-        .iter()
-        .enumerate()
-        .filter_map(|(d, id)| {
-            let tiles: Vec<usize> = view
-                .monitors
-                .iter()
-                .enumerate()
-                .filter(|(_, m)| m.display == Some(d))
-                .map(|(i, _)| i)
-                .collect();
-            let (first, last) = (*tiles.first()?, *tiles.last()?);
-            let left = tile_rect(first).origin.x;
-            let right = tile_rect(last).origin.x + TILE_W;
-            let label = labels.get(id);
-            Some(Caption {
-                center_x: (left + right) / 2.0,
-                width: right - left + TILE_GAP,
-                name: label.map_or_else(|| format!("Display {}", d + 1), |l| l.name.clone()),
-                mirror: label.and_then(|l| l.mirrors.first()).map(|m| match m {
-                    MirrorPanel::BuiltIn => "+ built-in mirror",
-                    MirrorPanel::External => "+ mirror",
-                }),
-            })
-        })
-        .collect()
-}
-
-fn describe(
-    view: &MonitorsView,
-    labels: &std::collections::HashMap<ordo_core::MonitorId, DisplayLabel>,
-) -> String {
+fn describe(view: &MonitorsView) -> String {
     let parts: Vec<String> = view
         .monitors
         .iter()
         .map(|m| match m.display {
-            Some(d) => {
-                let name = view
-                    .displays
-                    .get(d)
-                    .and_then(|id| labels.get(id))
-                    .map_or_else(|| format!("display {}", d + 1), |l| l.name.clone());
-                format!("monitor {} on {name}", m.id.0)
-            }
+            Some(d) => format!("monitor {} on display {}", m.id.0, d + 1),
             None => format!("monitor {} hidden", m.id.0),
         })
         .collect();

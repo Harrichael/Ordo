@@ -1,6 +1,8 @@
 //! Ordo's menu bar item: one mark per workspace — the current one a pill
 //! with its number, the rest dots, solid where windows live and hollow where
-//! none do — and a menu that switches workspace on a pick.
+//! none do — then the virtual monitors, solid where a display shows them,
+//! under a frame that slides as the view moves. Its menu switches workspace
+//! on a pick.
 //!
 //! The engine thread owns the model; AppKit owns the main thread. They meet
 //! in a mailbox: [`MenuBar::show`] (any thread) leaves the newest view there
@@ -13,10 +15,11 @@
 
 use std::cell::{Cell, OnceCell};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use block2::RcBlock;
 use crossbeam_channel::Sender;
-use dispatch2::DispatchQueue;
+use dispatch2::{DispatchQueue, DispatchTime};
 use objc2::rc::Retained;
 use objc2::runtime::{Bool, ProtocolObject};
 use objc2::{define_class, msg_send, sel, AnyThread, DefinedClass, MainThreadOnly};
@@ -35,7 +38,6 @@ use ordo_core::{HotkeyAction, WorkspaceId};
 
 use crate::engine::Msg;
 use crate::menubar::{MenuBarView, MonitorsView};
-use crate::platform::display;
 use crate::platform::monitor_map::MonitorMap;
 
 /// Image height; the status bar centers it vertically.
@@ -47,6 +49,19 @@ const PILL_H: f64 = 14.0;
 const PILL_MIN_W: f64 = 17.0;
 const PILL_PAD: f64 = 5.0;
 const GAP: f64 = 4.0;
+/// Wider than GAP, so workspaces and monitors read as two groups.
+const GROUP_GAP: f64 = 8.0;
+const SCREEN_W: f64 = 10.0;
+const SCREEN_H: f64 = 7.0;
+const SCREEN_R: f64 = 1.5;
+/// Wider than the frame's reach past a screen (pad plus line), or the frame's
+/// edge would cut into the hidden neighbour.
+const SCREEN_GAP: f64 = 4.0;
+const FRAME_PAD: f64 = 1.5;
+const FRAME_LINE: f64 = 1.0;
+const FRAME_R: f64 = 3.0;
+const SLIDE_SECS: f64 = 0.12;
+const SLIDE_FRAMES: u32 = 8;
 /// App names a menu row spells out before summarizing the rest as "+N".
 const NAMED_APPS: usize = 3;
 
@@ -93,6 +108,12 @@ struct Ui {
     item: Retained<NSStatusItem>,
     /// Owned here because the menu holds its delegate weakly.
     controller: Retained<Controller>,
+    /// The monitors glyph as last drawn, mid-slide included: where the next
+    /// slide starts from.
+    strip: Cell<Option<Strip>>,
+    /// Bumped by every repaint that is not a step of the running slide, which
+    /// is how that slide learns it has been overtaken.
+    slide: Cell<u64>,
 }
 
 thread_local! {
@@ -110,7 +131,15 @@ fn redraw(mailbox: &Arc<Mailbox>) {
         let Some(button) = ui.item.button(mtm) else {
             return;
         };
-        button.setImage(Some(&icon(&view)));
+        match (ui.strip.get(), Strip::of(&view)) {
+            (Some(from), Some(to)) if from.screens == to.screens && from != to => {
+                slide(mailbox, ui, from, to)
+            }
+            (_, to) => {
+                ui.slide.set(ui.slide.get() + 1);
+                ui.paint(&view, to);
+            }
+        }
         // Dimmed, the way macOS marks an item that is present but inert.
         button.setAppearsDisabled(!view.engaged);
         let summary = NSString::from_str(&summary(&view));
@@ -130,7 +159,46 @@ impl Ui {
         menu.setAutoenablesItems(false);
         menu.setDelegate(Some(ProtocolObject::from_ref(&*controller)));
         item.setMenu(Some(&menu));
-        Ui { item, controller }
+        Ui {
+            item,
+            controller,
+            strip: Cell::new(None),
+            slide: Cell::new(0),
+        }
+    }
+
+    fn paint(&self, view: &MenuBarView, strip: Option<Strip>) {
+        let Some(button) = self.item.button(self.controller.mtm()) else {
+            return;
+        };
+        button.setImage(Some(&icon(view, strip)));
+        self.strip.set(strip);
+    }
+}
+
+/// Steps the icon's frame from `from` to `to`, as the menu's frame slides.
+/// Dispatched frame by frame rather than animated by AppKit, because a status
+/// item shows an image, and only a template image follows the menu bar's
+/// appearance.
+fn slide(mailbox: &Arc<Mailbox>, ui: &Ui, from: Strip, to: Strip) {
+    let run = ui.slide.get() + 1;
+    ui.slide.set(run);
+    for k in 1..=SLIDE_FRAMES {
+        let t = k as f64 / SLIDE_FRAMES as f64;
+        let at = DispatchTime::try_from(Duration::from_secs_f64(SLIDE_SECS * t))
+            .unwrap_or(DispatchTime::NOW);
+        let mailbox = mailbox.clone();
+        let _ = DispatchQueue::main().after(at, move || {
+            UI.with(|ui| {
+                let Some(ui) = ui.get().filter(|ui| ui.slide.get() == run) else {
+                    return;
+                };
+                let Some(view) = mailbox.latest.lock().unwrap().clone() else {
+                    return;
+                };
+                ui.paint(&view, Some(from.toward(to, t)));
+            })
+        });
     }
 }
 
@@ -140,10 +208,32 @@ fn summary(view: &MenuBarView) -> String {
         Some(ws) => format!("Ordo — workspace {} of {count}", ws.0),
         None => format!("Ordo — {count} workspaces"),
     };
+    if let Some(m) = slidable(view) {
+        let shown: Vec<String> = m
+            .monitors
+            .iter()
+            .filter(|e| e.display.is_some())
+            .map(|e| e.id.0.to_string())
+            .collect();
+        s.push_str(&format!(
+            ", showing monitors {} of {}",
+            shown.join(" and "),
+            m.monitors.len()
+        ));
+    }
     if !view.engaged {
         s.push_str(" (paused)");
     }
     s
+}
+
+/// The monitors, when any can be out of sight. With virtualization off, or
+/// no more monitors than displays, every one is always shown, and a glyph
+/// that never changes would only take up menu bar.
+fn slidable(view: &MenuBarView) -> Option<&MonitorsView> {
+    view.monitors
+        .as_ref()
+        .filter(|m| m.enabled && m.monitors.len() > m.displays.len())
 }
 
 // --- the icon ----------------------------------------------------------------
@@ -210,6 +300,83 @@ impl Mark {
     }
 }
 
+/// The monitors glyph: how many screens, and where the display frame stands
+/// over them, its outer edges in the glyph's own x. A screen is solid wherever
+/// the frame covers it, so mid-slide the screens light up as it passes.
+#[derive(Clone, Copy, PartialEq)]
+struct Strip {
+    screens: usize,
+    left: f64,
+    right: f64,
+}
+
+impl Strip {
+    fn of(view: &MenuBarView) -> Option<Strip> {
+        let m = slidable(view)?;
+        let first = m.monitors.iter().position(|e| e.display.is_some())?;
+        let last = m.monitors.iter().rposition(|e| e.display.is_some())?;
+        Some(Strip {
+            screens: m.monitors.len(),
+            left: screen_x(first) - FRAME_PAD - FRAME_LINE,
+            right: screen_x(last) + SCREEN_W + FRAME_PAD + FRAME_LINE,
+        })
+    }
+
+    fn width(&self) -> f64 {
+        let n = self.screens as f64;
+        2.0 * (FRAME_LINE + FRAME_PAD) + n * SCREEN_W + (n - 1.0) * SCREEN_GAP
+    }
+
+    /// Eased out: the frame moves the instant the view does, and only its
+    /// landing is soft.
+    fn toward(self, to: Strip, t: f64) -> Strip {
+        let e = 1.0 - (1.0 - t).powi(3);
+        Strip {
+            screens: to.screens,
+            left: self.left + (to.left - self.left) * e,
+            right: self.right + (to.right - self.right) * e,
+        }
+    }
+
+    fn draw(&self, x0: f64) {
+        NSColor::blackColor().setFill();
+        NSColor::blackColor().setStroke();
+        let y = (HEIGHT - SCREEN_H) / 2.0;
+        for i in 0..self.screens {
+            let x = screen_x(i);
+            if (self.left..self.right).contains(&(x + SCREEN_W / 2.0)) {
+                let r = NSRect::new(NSPoint::new(x0 + x, y), NSSize::new(SCREEN_W, SCREEN_H));
+                NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(r, SCREEN_R, SCREEN_R)
+                    .fill();
+            } else {
+                let r = NSRect::new(
+                    NSPoint::new(x0 + x + RING_LINE / 2.0, y + RING_LINE / 2.0),
+                    NSSize::new(SCREEN_W - RING_LINE, SCREEN_H - RING_LINE),
+                );
+                let path =
+                    NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(r, SCREEN_R, SCREEN_R);
+                path.setLineWidth(RING_LINE);
+                path.stroke();
+            }
+        }
+        let h = SCREEN_H + 2.0 * (FRAME_PAD + FRAME_LINE);
+        let r = NSRect::new(
+            NSPoint::new(
+                x0 + self.left + FRAME_LINE / 2.0,
+                (HEIGHT - h) / 2.0 + FRAME_LINE / 2.0,
+            ),
+            NSSize::new(self.right - self.left - FRAME_LINE, h - FRAME_LINE),
+        );
+        let frame = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(r, FRAME_R, FRAME_R);
+        frame.setLineWidth(FRAME_LINE);
+        frame.stroke();
+    }
+}
+
+fn screen_x(i: usize) -> f64 {
+    FRAME_LINE + FRAME_PAD + i as f64 * (SCREEN_W + SCREEN_GAP)
+}
+
 fn dot_rect(x: f64, inset: f64) -> NSRect {
     NSRect::new(
         NSPoint::new(x + inset, (HEIGHT - DOT) / 2.0 + inset),
@@ -235,7 +402,7 @@ fn attributed(text: &str, font: &NSFont, color: &NSColor) -> Retained<NSAttribut
     }
 }
 
-fn icon(view: &MenuBarView) -> Retained<NSImage> {
+fn icon(view: &MenuBarView, strip: Option<Strip>) -> Retained<NSImage> {
     let marks: Vec<Mark> = view
         .workspaces
         .iter()
@@ -253,13 +420,17 @@ fn icon(view: &MenuBarView) -> Retained<NSImage> {
             }
         })
         .collect();
-    let width =
+    let marks_w =
         marks.iter().map(Mark::width).sum::<f64>() + GAP * marks.len().saturating_sub(1) as f64;
+    let width = marks_w + strip.map_or(0.0, |s| GROUP_GAP + s.width());
     let draw = RcBlock::new(move |_: NSRect| -> Bool {
         let mut x = 0.0;
         for m in &marks {
             m.draw(x);
             x += m.width() + GAP;
+        }
+        if let Some(s) = strip {
+            s.draw(marks_w + GROUP_GAP);
         }
         Bool::YES
     });
@@ -349,7 +520,7 @@ impl Controller {
             return;
         }
         if let (Some(monitors), Some(map)) = (&view.monitors, self.ivars().map.get()) {
-            map.show(monitors, &display::labels(self.mtm()), true);
+            map.show(monitors, true);
         }
     }
 
@@ -424,7 +595,7 @@ fn fill_monitors(menu: &NSMenu, map: &MonitorMap, view: &MonitorsView, mtm: Main
         ns_string!("Monitors"),
         mtm,
     ));
-    map.show(view, &display::labels(mtm), false);
+    map.show(view, false);
     let item = NSMenuItem::new(mtm);
     item.setView(Some(map));
     menu.addItem(&item);
