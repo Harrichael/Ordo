@@ -947,6 +947,7 @@ impl EmulatedWorkspaces {
     fn load_state(&mut self) {
         let Some(path) = &self.state_path else { return };
         let Some(ps) = statefile::load(path, self.boot_time) else {
+            statefile::set_aside(path);
             return;
         };
         let count = self.ledger.count();
@@ -2960,6 +2961,46 @@ mod tests {
         let again = EmulatedWorkspaces::with_persistence(3, path);
         assert!(!again.learn_monitors);
         assert_eq!(again.window_monitors()[&w(2)], vm(2));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A state file from another boot is rightly ignored, but the blank
+    /// start must not destroy it: if the judgement was wrong, those promises
+    /// are all that says which workspace each parked window belongs to.
+    #[test]
+    fn a_rejected_state_file_is_set_aside_before_a_blank_start_writes_over_it() {
+        let dir = std::env::temp_dir().join(format!("ordo-reject-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        let stale = PersistedState {
+            version: statefile::VERSION,
+            boot_time_sec: statefile::boot_time_sec() - 3600,
+            current: ws(2),
+            viewed: vm(1),
+            virtual_monitors_enabled: true,
+            virtual_monitor_count: 2,
+            monitors_assigned: true,
+            windows: vec![PersistedWindow {
+                id: w(7),
+                workspace: ws(2),
+                monitor: vm(1),
+                owner: Pid(10),
+                saved: Some(rect(100.0, 100.0)),
+                home: None,
+            }],
+        };
+        statefile::save(&path, &stale);
+
+        let d = FakeDesktop::new(&[(w(1), Pid(10), rect(100.0, 100.0))]);
+        let mut b = EmulatedWorkspaces::with_persistence(3, path.clone());
+        rescan(&d, &mut b);
+
+        assert_eq!(b.current(), ws(1), "the stale file was not believed");
+        let started = statefile::load(&path, statefile::boot_time_sec()).unwrap();
+        assert_eq!(started.windows.iter().map(|w| w.id).collect::<Vec<_>>(), vec![w(1)]);
+        let rejected = std::fs::read_to_string(path.with_extension("json.rejected")).unwrap();
+        assert_eq!(serde_json::from_str::<PersistedState>(&rejected).unwrap(), stale);
+
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

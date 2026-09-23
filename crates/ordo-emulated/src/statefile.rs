@@ -11,6 +11,10 @@
 //! - The whole file is discarded if the machine rebooted since it was
 //!   written (CGWindowIDs regenerate when WindowServer restarts, so every id
 //!   in the file is garbage). Boot time is the tamper seal.
+//! - A discarded file is set aside, never overwritten. The blank start that
+//!   follows writes through on its first mutation, and if the discard was
+//!   wrong (boot-time drift once voided a live file) the set-aside copy is
+//!   the only record of where every hidden window belongs.
 //! - Entries for windows that no longer exist are pruned only on
 //!   CG-confirmed death, exactly like live ledger entries — never on mere
 //!   absence from an AX scan (the first scan after a restart is the one
@@ -139,6 +143,13 @@ pub fn save(path: &Path, state: &PersistedState) {
     if std::fs::write(&tmp, body).is_ok() {
         let _ = std::fs::rename(&tmp, path);
     }
+}
+
+/// Move a file `load` refused to `state.json.rejected`, replacing the last
+/// one. Only the latest is worth keeping: a blank start writes a file the
+/// next restart accepts, so a second rejection means another reboot.
+pub fn set_aside(path: &Path) {
+    let _ = std::fs::rename(path, path.with_extension("json.rejected"));
 }
 
 /// How far `kern.boottime` may wander within one boot. The kernel derives it
