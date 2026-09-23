@@ -64,7 +64,9 @@ The two rules that make it work:
   virtual monitor — a position, left to right, not a piece of hardware. With a
   display per monitor they map one to one. With fewer displays (the laptop
   unplugged), `Cmd+Alt+J/K` view the previous/next monitor (no wrap; global,
-  not per workspace), showing its windows and hiding the current one's, and
+  not per workspace), showing its windows and hiding the current one's —
+  a monitor with nothing on it gets its display's desktop as focus, as a
+  click on empty desktop would, so an empty monitor is still a place to be — and
   `Ctrl+Alt+Cmd+V` toggles virtualization: off collapses every monitor onto the
   display(s) present. The view follows focus — Alt+Tab or Cmd+Tab onto a hidden
   monitor's window reveals it. Plug the display back in and its windows return

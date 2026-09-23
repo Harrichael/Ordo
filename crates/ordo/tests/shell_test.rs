@@ -154,6 +154,8 @@ impl Effector for FakeEffector {
                 os.monitors.insert(*window, *target);
             }
             Effect::ViewMonitor { target, .. } => os.view.viewed = *target,
+            // The desktop is no window of the model.
+            Effect::FocusDesktop { .. } => os.focused = None,
             Effect::SetVirtualMonitors { enabled, .. } => os.view.enabled = *enabled,
             Effect::FocusWindow { window, .. } => match os.policy {
                 FocusPolicy::Lands => os.focused = Some(*window),

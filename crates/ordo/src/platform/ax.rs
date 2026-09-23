@@ -277,6 +277,25 @@ pub fn focus(target: WindowId) -> bool {
     .is_some()
 }
 
+/// Key the desktop of the display at `display`, the way a click on empty
+/// desktop does: the desktop window's owner (Finder) comes frontmost with that
+/// window key, by the same private handoff as [`focus`]. The desktop is no AX
+/// window, so there is nothing to raise.
+pub fn focus_desktop(display: Rect) -> bool {
+    let Some((wid, pid)) = super::zorder::desktop_window_on(display) else {
+        return false;
+    };
+    unsafe {
+        let mut psn = sys::ProcessSerialNumber::default();
+        if sys::GetProcessForPID(pid, &mut psn) != 0 {
+            return false;
+        }
+        let _ = sys::SLPSSetFrontProcessWithOptions(&psn, wid, sys::kCPSUserGenerated);
+        make_key_window(&psn, wid);
+    }
+    true
+}
+
 /// Raise `target` in the global z-order without touching focus or app
 /// activation — the building block for "send to back", which WindowServer
 /// won't do directly for foreign windows (SLSOrderWindow → error 1000 from a

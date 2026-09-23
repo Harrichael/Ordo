@@ -123,6 +123,47 @@ pub fn window_bounds(w: WindowId) -> Option<Rect> {
     }
 }
 
+/// The window that draws a display's desktop — Finder's, at the desktop-icon
+/// level, covering exactly the display — with its owner's pid. `None` when
+/// there is none, e.g. with Finder's desktop turned off.
+pub fn desktop_window_on(display: Rect) -> Option<(u32, i32)> {
+    // kCGDesktopIconWindowLevel.
+    const DESKTOP_ICON_LEVEL: i64 = -2147483603;
+    unsafe {
+        let arr = CGWindowListCopyWindowInfo(ON_SCREEN_ONLY, 0);
+        if arr.is_null() {
+            return None;
+        }
+        let mut out = None;
+        for i in 0..cf::array_len(arr) {
+            let d = cf::array_get(arr, i) as sys::CFDictionaryRef;
+            if cf::number_i64(cf::dict_get(d, "kCGWindowLayer")) != Some(DESKTOP_ICON_LEVEL) {
+                continue;
+            }
+            let b = cf::dict_get(d, "kCGWindowBounds");
+            let bounds = (|| {
+                Some(Rect {
+                    x: cf::number_f64(cf::dict_get(b, "X"))?,
+                    y: cf::number_f64(cf::dict_get(b, "Y"))?,
+                    w: cf::number_f64(cf::dict_get(b, "Width"))?,
+                    h: cf::number_f64(cf::dict_get(b, "Height"))?,
+                })
+            })();
+            if !bounds.is_some_and(|r| r.approx_eq(&display, 1.0)) {
+                continue;
+            }
+            let wid = cf::number_i64(cf::dict_get(d, "kCGWindowNumber"));
+            let pid = cf::number_i64(cf::dict_get(d, "kCGWindowOwnerPID"));
+            if let (Some(w), Some(p)) = (wid, pid) {
+                out = Some((w as u32, p as i32));
+                break;
+            }
+        }
+        sys::CFRelease(arr);
+        out
+    }
+}
+
 /// On-screen normal (layer-0) windows, front to back.
 pub fn stack_front_to_back() -> Vec<WindowId> {
     let mut out = Vec::new();

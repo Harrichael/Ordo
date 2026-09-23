@@ -308,7 +308,8 @@ fn effect_op(e: &Effect) -> Option<OpId> {
         | Effect::ViewMonitor { op, .. }
         | Effect::SetVirtualMonitors { op, .. }
         | Effect::SetWindowFrame { op, .. }
-        | Effect::FocusWindow { op, .. } => Some(*op),
+        | Effect::FocusWindow { op, .. }
+        | Effect::FocusDesktop { op, .. } => Some(*op),
         Effect::WarpMouse { .. }
         | Effect::RestackWindows { .. }
         | Effect::RequestRescan { .. }

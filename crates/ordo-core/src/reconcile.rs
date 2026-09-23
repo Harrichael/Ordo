@@ -320,6 +320,7 @@ pub(crate) fn explains(e: &Expectation, d: &Delta) -> bool {
             Delta::WindowMonitorChanged { window: w, .. },
         ) => w == window,
         (Expectation::Focused(t), Delta::FocusChanged { to, .. }) => *to == Some(*t),
+        (Expectation::DesktopFocused, Delta::FocusChanged { to, .. }) => to.is_none(),
         (
             Expectation::WindowOnMonitor { window, monitor },
             Delta::WindowMonitorAssigned { window: w, to, .. },

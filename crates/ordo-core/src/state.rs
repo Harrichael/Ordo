@@ -100,6 +100,14 @@ pub enum FocusIntent {
     /// Ordo asserts this window should be key; a contradicting observation is
     /// a violation to re-assert (damped), never to absorb.
     Window(WindowId),
+    /// Ordo asserts that NO window should be key: the user is on a virtual
+    /// monitor with nothing on it (the anchor), and its display's desktop has
+    /// focus — what macOS itself does for a click on empty desktop. Without
+    /// this an empty monitor could not hold focus at all: it stayed on the
+    /// window the view had just hidden, and the visible-key-window invariant
+    /// handed it to some window on another display — which macOS, still
+    /// counting the hidden window's app as the one in use, kept taking back.
+    Desktop,
     #[default]
     Deferred,
 }
@@ -255,7 +263,10 @@ impl State {
     /// (run 51 seq 22484: a carry dropped because focus had been flung to a
     /// parked sibling).
     pub fn declared_focus(&self) -> Option<WindowId> {
-        self.focus_target().or(self.focused)
+        match self.focus_intent {
+            FocusIntent::Desktop => None,
+            _ => self.focus_target().or(self.focused),
+        }
     }
 
     /// The monitor the user is "at": the focused window's monitor, falling
@@ -365,6 +376,11 @@ impl State {
     /// else the one the main display stands for, else the anchor. The monitor
     /// twin of `focused_monitor`, and what new windows are corralled onto.
     pub fn focused_vmonitor(&self) -> Option<VirtualMonitorId> {
+        if self.focus_intent == FocusIntent::Desktop {
+            if let Some(v) = self.virtual_monitors {
+                return Some(v.viewed);
+            }
+        }
         self.declared_focus()
             .and_then(|w| self.windows.get(&w))
             .map(|r| r.vmonitor)

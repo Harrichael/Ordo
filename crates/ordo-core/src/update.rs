@@ -4,7 +4,9 @@ use crate::effect::{CorrectionAxis, Effect, Expectation};
 use crate::event::{
     AxHintKind, Event, Gesture, HotkeyAction, OpOutcome, RescanTrigger, WorldSnapshot,
 };
-use crate::ids::{OpId, Pid, Rect, VirtualMonitorId, WindowId, WorkspaceId, FRAME_EPSILON};
+use crate::ids::{
+    MonitorId, OpId, Pid, Rect, VirtualMonitorId, WindowId, WorkspaceId, FRAME_EPSILON,
+};
 use crate::project::Projection;
 use crate::reconcile::{self, Delta};
 use crate::state::{FocusIntent, Mode, PendingOp, State, WindowRecord};
@@ -114,6 +116,14 @@ pub enum Note {
         winner: Option<WindowId>,
         winner_app: Option<Pid>,
     },
+    /// A window took focus from the desktop the user is on; re-granted.
+    DesktopReasserted { display: MonitorId, from: WindowId },
+    /// The desktop could not hold focus within the damping budget; the slot
+    /// is conceded to the app holding it, as for a window declaration.
+    DesktopDiverged {
+        winner: Option<WindowId>,
+        winner_app: Option<Pid>,
+    },
     /// Monitors disagreed on workspace without an in-flight switch of ours.
     TearDetected { target: WorkspaceId },
     /// Tear realignment hit the damping limit; we stopped re-aligning.
@@ -208,6 +218,22 @@ fn push_view(s: &mut State, target: VirtualMonitorId, now_ns: u64, fx: &mut Vec<
         s.pending.push(PendingOp {
             op,
             expect: Expectation::Viewing(target),
+            issued_ns: now_ns,
+        });
+    }
+    op
+}
+
+/// Hand focus to a display's desktop, with its expectation. The single
+/// emitter, shared by the command that moves onto an empty monitor and the
+/// enforcement that holds it there.
+fn push_desktop(s: &mut State, display: MonitorId, now_ns: u64, fx: &mut Vec<Effect>) -> OpId {
+    let op = s.mint_op();
+    fx.push(Effect::FocusDesktop { op, display });
+    if s.focused.is_some() {
+        s.pending.push(PendingOp {
+            op,
+            expect: Expectation::DesktopFocused,
             issued_ns: now_ns,
         });
     }
@@ -674,6 +700,8 @@ fn execute(s: &mut State, cmd: Command, now_ns: u64, fx: &mut Vec<Effect>) -> Fo
             // The monitor twin of a workspace switch: focus goes to the
             // target monitor's MRU window on the current workspace before the
             // view moves, and the newly visible set is restacked under it.
+            // A monitor with nothing on it gets its display's desktop instead:
+            // an empty monitor is still a place to be.
             let ws = s.current_workspace().expect("resolved against a workspace");
             let proj = s.projection_with(Some(target), None);
             let head = s.focus_history.iter().find(|w| {
@@ -695,6 +723,18 @@ fn execute(s: &mut State, cmd: Command, now_ns: u64, fx: &mut Vec<Effect>) -> Fo
                     to: s.projected_frame_in(&s.windows[&fw], &proj).center(),
                 });
             }
+            let desktop = match head {
+                Some(_) => None,
+                None => s.host_in(target, &proj),
+            };
+            if let Some(display) = desktop {
+                push_desktop(s, display, now_ns, fx);
+                if let Some(m) = s.monitors.get(&display) {
+                    fx.push(Effect::WarpMouse {
+                        to: m.frame.center(),
+                    });
+                }
+            }
             let op = push_view(s, target, now_ns, fx);
             let mut order: Vec<WindowId> = head.into_iter().collect();
             order.extend(visible_stack(s, ws, &proj).into_iter().filter(|w| Some(*w) != head));
@@ -704,7 +744,11 @@ fn execute(s: &mut State, cmd: Command, now_ns: u64, fx: &mut Vec<Effect>) -> Fo
             fx.push(Effect::RequestRescan {
                 reason: RescanTrigger::PostEffect { op },
             });
-            head.map_or(FocusIntent::Deferred, FocusIntent::Window)
+            match (head, desktop) {
+                (Some(fw), _) => FocusIntent::Window(fw),
+                (None, Some(_)) => FocusIntent::Desktop,
+                (None, None) => FocusIntent::Deferred,
+            }
         }
 
         Command::ToggleVirtualMonitors => {
@@ -1335,8 +1379,9 @@ fn enforce_focus(
             return;
         }
         // An empty visible workspace has nothing to hold focus: leave it, the
-        // next birth here declares itself.
-        if s.conceded != Some(rec.app) {
+        // next birth here declares itself. Under a desktop declaration the
+        // desktop is what holds it, enforced below.
+        if s.focus_intent() != FocusIntent::Desktop && s.conceded != Some(rec.app) {
             if let Some(head) = mru_stack(s, here).first().copied() {
                 s.declare_focus(FocusIntent::Window(head));
                 notes.push(Note::HeldFocus {
@@ -1348,6 +1393,10 @@ fn enforce_focus(
         }
     }
 
+    if s.focus_intent() == FocusIntent::Desktop {
+        enforce_desktop(s, now_ns, notes, last_op, fx);
+        return;
+    }
     let Some(w) = s.focus_target() else {
         return;
     };
@@ -1396,6 +1445,45 @@ fn enforce_focus(
         issued_ns: now_ns,
     });
     notes.push(Note::FocusReasserted { window: w });
+    *last_op = Some(op);
+}
+
+/// The desktop twin of window enforcement: a window taking focus from the
+/// empty monitor the user is on gets the desktop re-granted, damped and
+/// conceded exactly as a window declaration is. A user's own click or switch
+/// never reaches here — its gesture declared `Deferred` first.
+fn enforce_desktop(
+    s: &mut State,
+    now_ns: u64,
+    notes: &mut Vec<Note>,
+    last_op: &mut Option<OpId>,
+    fx: &mut Vec<Effect>,
+) {
+    let Some(from) = s.focused else {
+        s.focus_corrections = 0;
+        return;
+    };
+    let Some(display) = s.virtual_monitors.and_then(|v| s.host_of(v.viewed)) else {
+        return;
+    };
+    if s.pending
+        .iter()
+        .any(|p| p.expect == Expectation::DesktopFocused)
+    {
+        return;
+    }
+    if s.focus_corrections >= DAMPING_LIMIT {
+        notes.push(Note::DesktopDiverged {
+            winner: s.focused,
+            winner_app: key_app(s),
+        });
+        s.declare_focus(FocusIntent::Deferred);
+        s.conceded = key_app(s);
+        return;
+    }
+    s.focus_corrections += 1;
+    let op = push_desktop(s, display, now_ns, fx);
+    notes.push(Note::DesktopReasserted { display, from });
     *last_op = Some(op);
 }
 
@@ -1468,6 +1556,7 @@ fn expectation_satisfied(e: &Expectation, s: &State) -> bool {
             .is_some_and(|r| r.workspace == *workspace),
         Expectation::WindowFramed { window, frame } => framed_satisfied(s, *window, frame),
         Expectation::Focused(w) => s.focused == Some(*w),
+        Expectation::DesktopFocused => s.focused.is_none(),
         Expectation::WindowOnMonitor { window, monitor } => s
             .windows
             .get(window)

@@ -13,7 +13,7 @@ use ordo_core::{Effect, OpOutcome};
 use crate::ports::Effector;
 
 use super::restack_worker::RestackHandle;
-use super::{ax, mouse, SharedBackend};
+use super::{ax, display, mouse, SharedBackend};
 
 pub struct MacEffector {
     backend: SharedBackend,
@@ -52,6 +52,16 @@ impl Effector for MacEffector {
         match effect {
             Effect::FocusWindow { window, .. } => {
                 Some(found_outcome(ax::focus(*window), "focus: window not found"))
+            }
+            Effect::FocusDesktop { display, .. } => {
+                let frame = display::active_displays()
+                    .into_iter()
+                    .find(|d| d.id == *display)
+                    .map(|d| d.frame);
+                Some(found_outcome(
+                    frame.is_some_and(ax::focus_desktop),
+                    "focus_desktop: no desktop window on that display",
+                ))
             }
             Effect::SetWindowFrame { window, frame, .. } => Some(found_outcome(
                 ax::set_frame(*window, *frame),

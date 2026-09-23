@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::event::RescanTrigger;
-use crate::ids::{OpId, Point, Rect, VirtualMonitorId, WindowId, WorkspaceId};
+use crate::ids::{MonitorId, OpId, Point, Rect, VirtualMonitorId, WindowId, WorkspaceId};
 
 /// Instructions to the shell. Executors perform them and report back via
 /// `Event::EffectResult`; the world's actual reaction arrives via the next
@@ -70,6 +70,12 @@ pub enum Effect {
         op: OpId,
         window: WindowId,
     },
+    /// Key the desktop of this display, as a click on it would: the focus of
+    /// a monitor with nothing on it.
+    FocusDesktop {
+        op: OpId,
+        display: MonitorId,
+    },
     WarpMouse {
         to: Point,
     },
@@ -110,6 +116,8 @@ pub enum Expectation {
         frame: Rect,
     },
     Focused(WindowId),
+    /// No window of the model is key — the desktop, or nothing, has it.
+    DesktopFocused,
     WindowOnMonitor {
         window: WindowId,
         monitor: VirtualMonitorId,

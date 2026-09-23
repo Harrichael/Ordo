@@ -2726,6 +2726,65 @@ fn moving_a_window_to_a_hidden_monitor_views_it_and_never_touches_its_frame() {
 }
 
 #[test]
+fn moving_onto_an_empty_monitor_gives_focus_to_its_desktop_and_holds_it_there() {
+    // Three monitors on two displays, viewing 1+2. The user is in w1 (a
+    // terminal) on monitor 1; monitor 2 has nothing on this workspace; w2
+    // sits on hidden monitor 3. Cmd+Alt+K slides the view to 2+3, hiding w1.
+    // Focus must land on the empty monitor itself — its display's desktop —
+    // not on w2 across the way just because w2 is visible. And when macOS
+    // hands focus back to w1's app (it does, on a click in the menu bar),
+    // the desktop is re-granted rather than w2 grabbed or the view followed.
+    let view = |viewed| VirtualMonitors {
+        count: 3,
+        viewed: vm(viewed),
+        enabled: true,
+    };
+    let windows = vec![
+        win(1, 100, 1, rect(100.0, 100.0)),
+        on_monitor(win(2, 200, 1, rect(2000.0, 100.0)), 3),
+    ];
+    let world = |viewed, focused: Option<u32>| {
+        observed_view(
+            view(viewed),
+            vec![mon_a(1), mon_b(1)],
+            windows.clone(),
+            focused,
+            RescanTrigger::Periodic,
+        )
+    };
+    let s = update(&State::new(), &world(1, Some(1))).state;
+
+    let slide = update(&s, &hotkey(HotkeyAction::ViewMonitorNext));
+    assert_eq!(view_targets(&slide.effects), vec![vm(2)]);
+    assert!(
+        focus_targets(&slide.effects).is_empty(),
+        "nothing on another display is grabbed"
+    );
+    // Monitor 2 now stands on the LEFT display: the desktop focused is that one.
+    assert!(slide
+        .effects
+        .iter()
+        .any(|e| matches!(e, Effect::FocusDesktop { display, .. } if *display == mid(1))));
+    assert_eq!(slide.state.focus_intent(), FocusIntent::Desktop);
+
+    // The view lands and the desktop has focus: nothing more to do.
+    let landed = update(&slide.state, &world(2, None));
+    assert!(landed.effects.is_empty(), "{:?}", landed.effects);
+
+    // macOS re-activates the terminal, now hidden with monitor 1.
+    let churn = update(&landed.state, &world(2, Some(1)));
+    assert!(focus_targets(&churn.effects).is_empty());
+    assert!(
+        view_targets(&churn.effects).is_empty(),
+        "the view stays on 2+3"
+    );
+    assert!(churn
+        .effects
+        .iter()
+        .any(|e| matches!(e, Effect::FocusDesktop { display, .. } if *display == mid(1))));
+}
+
+#[test]
 fn toggling_virtualization_on_views_the_focused_windows_monitor() {
     let s = undocked(&[1]);
     // Off: everything collapses onto the display; no view change needed.

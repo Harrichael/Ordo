@@ -313,6 +313,7 @@ fn effect_kind(e: &Effect) -> &'static str {
         Effect::SetVirtualMonitors { .. } => "set_virtual_monitors",
         Effect::SetWindowFrame { .. } => "set_window_frame",
         Effect::FocusWindow { .. } => "focus_window",
+        Effect::FocusDesktop { .. } => "focus_desktop",
         Effect::WarpMouse { .. } => "warp_mouse",
         Effect::RestackWindows { .. } => "restack_windows",
         Effect::RequestRescan { .. } => "request_rescan",
@@ -329,7 +330,8 @@ fn effect_op(e: &Effect) -> Option<OpId> {
         | Effect::ViewMonitor { op, .. }
         | Effect::SetVirtualMonitors { op, .. }
         | Effect::SetWindowFrame { op, .. }
-        | Effect::FocusWindow { op, .. } => Some(*op),
+        | Effect::FocusWindow { op, .. }
+        | Effect::FocusDesktop { op, .. } => Some(*op),
         Effect::WarpMouse { .. }
         | Effect::RestackWindows { .. }
         | Effect::RequestRescan { .. }
@@ -349,6 +351,8 @@ fn note_kind(n: &Note) -> &'static str {
         Note::HeldFocus { .. } => "held_focus",
         Note::FocusReasserted { .. } => "focus_reasserted",
         Note::FocusDiverged { .. } => "focus_diverged",
+        Note::DesktopReasserted { .. } => "desktop_reasserted",
+        Note::DesktopDiverged { .. } => "desktop_diverged",
         Note::TearDetected { .. } => "tear_detected",
         Note::TearPersisting => "tear_persisting",
         Note::Diverged { .. } => "diverged",
