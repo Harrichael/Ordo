@@ -1,5 +1,6 @@
 //! What the menu bar shows of Ordo: every workspace, which one is current,
-//! and what is on each.
+//! and what is on each — and how the virtual monitors land on the displays
+//! present.
 //!
 //! Read from the core's belief, never from intent, so the menu bar cannot
 //! show a switch that has not landed. Pure, so the whole account is testable
@@ -7,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use ordo_core::{Mode, Pid, State, WorkspaceId};
+use ordo_core::{Mode, MonitorId, Pid, State, VirtualMonitorId, WorkspaceId};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MenuBarView {
@@ -17,6 +18,29 @@ pub struct MenuBarView {
     /// False once rescued (or started paused): the core ignores every
     /// command then, so a pick from the menu would do nothing.
     pub engaged: bool,
+    /// None under a backend with no virtual layer (native Spaces).
+    pub monitors: Option<MonitorsView>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MonitorsView {
+    /// The physical displays, left to right.
+    pub displays: Vec<MonitorId>,
+    /// One per virtual monitor, in order.
+    pub monitors: Vec<MonitorEntry>,
+    /// The anchor Cmd+Alt+J/K step from; always on screen.
+    pub viewed: VirtualMonitorId,
+    pub enabled: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MonitorEntry {
+    pub id: VirtualMonitorId,
+    /// Index into [`MonitorsView::displays`], or None while hidden.
+    pub display: Option<usize>,
+    /// Windows of the current workspace declared onto this monitor — what
+    /// a hidden one is keeping out of sight.
+    pub windows: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -58,6 +82,33 @@ impl MenuBarView {
             workspaces,
             current: s.current_workspace(),
             engaged: s.mode == Mode::Active,
+            monitors: MonitorsView::of(s),
         }
+    }
+}
+
+impl MonitorsView {
+    fn of(s: &State) -> Option<Self> {
+        let v = s.virtual_monitors?;
+        let proj = s.projection();
+        let current = s.current_workspace();
+        let monitors = (1..=v.count.max(1))
+            .map(VirtualMonitorId)
+            .map(|id| MonitorEntry {
+                id,
+                display: proj.host(id),
+                windows: s
+                    .windows
+                    .values()
+                    .filter(|r| r.vmonitor == id && Some(r.workspace) == current)
+                    .count(),
+            })
+            .collect();
+        Some(MonitorsView {
+            displays: s.monitors_by_position(),
+            monitors,
+            viewed: v.viewed,
+            enabled: v.enabled,
+        })
     }
 }

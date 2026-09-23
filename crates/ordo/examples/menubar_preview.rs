@@ -4,17 +4,21 @@
 //!
 //!   cargo run --example menubar_preview            # 9 workspaces, on 3
 //!   cargo run --example menubar_preview -- paused  # the rescued look
+//!   cargo run --example menubar_preview -- off     # virtualization off
 //!
 //! Apps named in the menu are whatever is running now (pids from this
-//! machine), since the menu resolves names live.
+//! machine), and the monitors section projects three virtual monitors, the
+//! third viewed, onto the displays actually plugged in — the menu resolves
+//! both live.
 
 use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSWorkspace};
 use ordo::engine::Msg;
-use ordo::menubar::{MenuBarView, WorkspaceEntry};
-use ordo_core::{HotkeyAction, Pid, WorkspaceId};
+use ordo::menubar::{MenuBarView, MonitorEntry, MonitorsView, WorkspaceEntry};
+use ordo_core::{project, HotkeyAction, Pid, VirtualMonitorId, WorkspaceId};
 
 fn main() {
     let paused = std::env::args().any(|a| a == "paused");
+    let enabled = !std::env::args().any(|a| a == "off");
     let mtm = objc2::MainThreadMarker::new().unwrap();
 
     let running: Vec<Pid> = NSWorkspace::sharedWorkspace()
@@ -47,6 +51,7 @@ fn main() {
             .collect(),
         current: Some(WorkspaceId(3)),
         engaged: !paused,
+        monitors: Some(monitors(enabled)),
     };
 
     let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
@@ -63,4 +68,28 @@ fn main() {
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Prohibited);
     app.run();
+}
+
+fn monitors(enabled: bool) -> MonitorsView {
+    let mut displays = ordo::platform::display::active_displays();
+    displays.sort_by(|a, b| a.frame.x.total_cmp(&b.frame.x));
+    let viewed = VirtualMonitorId(3);
+    let proj = project(3, viewed, enabled, displays.len());
+    MonitorsView {
+        displays: displays.iter().map(|d| d.id).collect(),
+        monitors: [8, 1, 2]
+            .into_iter()
+            .enumerate()
+            .map(|(i, windows)| {
+                let id = VirtualMonitorId(i as u8 + 1);
+                MonitorEntry {
+                    id,
+                    display: proj.host(id),
+                    windows,
+                }
+            })
+            .collect(),
+        viewed,
+        enabled,
+    }
 }

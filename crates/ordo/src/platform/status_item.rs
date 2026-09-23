@@ -11,7 +11,7 @@
 //! A pick reaches the engine as the same `WorkspaceSwitchTo` that Cmd+Alt+digit
 //! mints: the menu is a second keyboard, not a second decision path.
 
-use std::cell::OnceCell;
+use std::cell::{Cell, OnceCell};
 use std::sync::{Arc, Mutex};
 
 use block2::RcBlock;
@@ -34,7 +34,9 @@ use objc2_foundation::{
 use ordo_core::{HotkeyAction, WorkspaceId};
 
 use crate::engine::Msg;
-use crate::menubar::MenuBarView;
+use crate::menubar::{MenuBarView, MonitorsView};
+use crate::platform::display;
+use crate::platform::monitor_map::MonitorMap;
 
 /// Image height; the status bar centers it vertically.
 const HEIGHT: f64 = 16.0;
@@ -90,7 +92,7 @@ pub fn install(tx: Sender<Msg>) -> MenuBar {
 struct Ui {
     item: Retained<NSStatusItem>,
     /// Owned here because the menu holds its delegate weakly.
-    _controller: Retained<Controller>,
+    controller: Retained<Controller>,
 }
 
 thread_local! {
@@ -114,6 +116,7 @@ fn redraw(mailbox: &Arc<Mailbox>) {
         let summary = NSString::from_str(&summary(&view));
         button.setToolTip(Some(&summary));
         button.setAccessibilityLabel(Some(&summary));
+        ui.controller.follow(&view);
     });
 }
 
@@ -127,10 +130,7 @@ impl Ui {
         menu.setAutoenablesItems(false);
         menu.setDelegate(Some(ProtocolObject::from_ref(&*controller)));
         item.setMenu(Some(&menu));
-        Ui {
-            item,
-            _controller: controller,
-        }
+        Ui { item, controller }
     }
 }
 
@@ -276,6 +276,9 @@ fn icon(view: &MenuBarView) -> Retained<NSImage> {
 
 struct Ivars {
     mailbox: Arc<Mailbox>,
+    /// Kept across rebuilds so a view change can slide the frame it drew.
+    map: OnceCell<Retained<MonitorMap>>,
+    open: Cell<bool>,
 }
 
 define_class!(
@@ -305,6 +308,16 @@ define_class!(
     unsafe impl NSObjectProtocol for Controller {}
 
     unsafe impl NSMenuDelegate for Controller {
+        #[unsafe(method(menuWillOpen:))]
+        fn menu_will_open(&self, _menu: &NSMenu) {
+            self.ivars().open.set(true);
+        }
+
+        #[unsafe(method(menuDidClose:))]
+        fn menu_did_close(&self, _menu: &NSMenu) {
+            self.ivars().open.set(false);
+        }
+
         #[unsafe(method(menuNeedsUpdate:))]
         fn menu_needs_update(&self, menu: &NSMenu) {
             let Some(view) = self.ivars().mailbox.latest.lock().unwrap().clone() else {
@@ -317,8 +330,27 @@ define_class!(
 
 impl Controller {
     fn new(mailbox: Arc<Mailbox>, mtm: MainThreadMarker) -> Retained<Self> {
-        let this = Self::alloc(mtm).set_ivars(Ivars { mailbox });
+        let this = Self::alloc(mtm).set_ivars(Ivars {
+            mailbox,
+            map: OnceCell::new(),
+            open: Cell::new(false),
+        });
         unsafe { msg_send![super(this), init] }
+    }
+
+    fn map(&self) -> &MonitorMap {
+        self.ivars().map.get_or_init(|| MonitorMap::new(self.mtm()))
+    }
+
+    /// A view that changed under an open menu: only the diagram follows it,
+    /// sliding, while the rows stay put under the pointer.
+    fn follow(&self, view: &MenuBarView) {
+        if !self.ivars().open.get() {
+            return;
+        }
+        if let (Some(monitors), Some(map)) = (&view.monitors, self.ivars().map.get()) {
+            map.show(monitors, &display::labels(self.mtm()), true);
+        }
     }
 
     fn fill(&self, menu: &NSMenu, view: &MenuBarView) {
@@ -375,20 +407,56 @@ impl Controller {
             }
             menu.addItem(&item);
         }
+        if let Some(monitors) = &view.monitors {
+            menu.addItem(&NSMenuItem::separatorItem(mtm));
+            fill_monitors(menu, self.map(), monitors, mtm);
+        }
         if !view.engaged {
             menu.addItem(&NSMenuItem::separatorItem(mtm));
-            let paused = unsafe {
-                NSMenuItem::initWithTitle_action_keyEquivalent(
-                    NSMenuItem::alloc(mtm),
-                    ns_string!("Paused — press ⌃⌥⌘O to resume"),
-                    None,
-                    ns_string!(""),
-                )
-            };
-            paused.setEnabled(false);
-            menu.addItem(&paused);
+            menu.addItem(&info_item("Paused — press ⌃⌥⌘O to resume", mtm));
         }
     }
+}
+
+/// The monitors diagram plus the one mode line the picture can't show.
+fn fill_monitors(menu: &NSMenu, map: &MonitorMap, view: &MonitorsView, mtm: MainThreadMarker) {
+    menu.addItem(&NSMenuItem::sectionHeaderWithTitle(
+        ns_string!("Monitors"),
+        mtm,
+    ));
+    map.show(view, &display::labels(mtm), false);
+    let item = NSMenuItem::new(mtm);
+    item.setView(Some(map));
+    menu.addItem(&item);
+
+    let toggle = info_item(
+        if view.enabled {
+            "Virtualization on"
+        } else {
+            "Virtualization off — all monitors shown"
+        },
+        mtm,
+    );
+    toggle.setKeyEquivalent(ns_string!("v"));
+    toggle.setKeyEquivalentModifierMask(
+        NSEventModifierFlags::Control
+            | NSEventModifierFlags::Option
+            | NSEventModifierFlags::Command,
+    );
+    menu.addItem(&toggle);
+}
+
+fn info_item(title: &str, mtm: MainThreadMarker) -> Retained<NSMenuItem> {
+    let item = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            &NSString::from_str(title),
+            None,
+            ns_string!(""),
+        )
+    };
+    item.setEnabled(false);
+    item
 }
 
 /// "Safari, Slack, Terminal +2", most recently used first.

@@ -86,3 +86,77 @@ fn display_uuid(cg_id: u32) -> Option<MonitorId> {
     unsafe { sys::CFRelease(uuid_ref) };
     Some(MonitorId(u128::from_be_bytes(bytes.0)))
 }
+
+/// What a person would call a display, for the menu bar.
+pub struct DisplayLabel {
+    /// AppKit's name for it — the one System Settings shows.
+    pub name: String,
+    /// The panels showing this display's pixels. They are never displays of
+    /// their own (see [`active_displays`]), which is exactly why the menu bar
+    /// must say they exist: a mirror is invisible to the projection.
+    pub mirrors: Vec<MirrorPanel>,
+}
+
+pub enum MirrorPanel {
+    BuiltIn,
+    External,
+}
+
+/// Labels for the active displays, keyed by the same UUID the model uses.
+/// AppKit's names, so main thread only.
+pub fn labels(mtm: objc2::MainThreadMarker) -> std::collections::HashMap<MonitorId, DisplayLabel> {
+    use objc2_app_kit::NSScreen;
+    use objc2_core_graphics::{CGDisplayIsBuiltin, CGGetOnlineDisplayList};
+    use objc2_foundation::{ns_string, NSNumber};
+
+    let mut out = std::collections::HashMap::new();
+    let mut by_cg: std::collections::HashMap<u32, MonitorId> = std::collections::HashMap::new();
+    for screen in NSScreen::screens(mtm).iter() {
+        let Some(cg_id) = screen
+            .deviceDescription()
+            .objectForKey(ns_string!("NSScreenNumber"))
+            .and_then(|n| n.downcast::<NSNumber>().ok())
+            .map(|n| n.as_u32())
+        else {
+            continue;
+        };
+        let Some(id) = display_uuid(cg_id) else {
+            continue;
+        };
+        by_cg.insert(cg_id, id);
+        out.insert(
+            id,
+            DisplayLabel {
+                name: screen.localizedName().to_string(),
+                mirrors: Vec::new(),
+            },
+        );
+    }
+
+    // Mirrors are online but, in a hardware mirror set, not active — the
+    // online list is the only one that still names them.
+    let mut count: u32 = 0;
+    if unsafe { CGGetOnlineDisplayList(0, std::ptr::null_mut(), &mut count) }.0 != 0 {
+        return out;
+    }
+    let mut ids = vec![0u32; count as usize];
+    if unsafe { CGGetOnlineDisplayList(count, ids.as_mut_ptr(), &mut count) }.0 != 0 {
+        return out;
+    }
+    ids.truncate(count as usize);
+    for cg_id in ids {
+        let master = CGDisplayMirrorsDisplay(cg_id);
+        if master == 0 {
+            continue;
+        }
+        let Some(label) = by_cg.get(&master).and_then(|id| out.get_mut(id)) else {
+            continue;
+        };
+        label.mirrors.push(if CGDisplayIsBuiltin(cg_id) {
+            MirrorPanel::BuiltIn
+        } else {
+            MirrorPanel::External
+        });
+    }
+    out
+}

@@ -20,6 +20,7 @@ pub mod display_watch;
 pub mod effector;
 pub mod emulated_backend;
 pub mod mission_control;
+pub mod monitor_map;
 pub mod mouse;
 pub mod native_backend;
 pub mod observer;

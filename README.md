@@ -47,7 +47,10 @@ The two rules that make it work:
 - **Menu bar item**: a mark per workspace — the current one a pill with its
   number, the others dots, solid where windows live and hollow where none do.
   Its menu lists every workspace by the apps on it, most recently used first;
-  pick one to switch there. Dimmed while Ordo is paused. Not shown with
+  pick one to switch there. Below them, a diagram of the virtual monitors —
+  a tile each, dotted with this workspace's windows, dashed while hidden —
+  under a frame for the physical displays that slides as the view changes.
+  Dimmed while Ordo is paused. Not shown with
   `--observe`. Preview the design without the daemon:
   `cargo run --example menubar_preview`.
 - **MRU window focus**: `Alt+Tab` (in workspace), `Alt+Shift+Tab` (+ monitor),

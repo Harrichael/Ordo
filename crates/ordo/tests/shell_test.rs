@@ -11,7 +11,7 @@ use std::rc::Rc;
 use ordo::clock::Clock;
 use ordo::engine::{Engine, Msg};
 use ordo::logger::Logger;
-use ordo::menubar::{MenuBarView, WorkspaceEntry};
+use ordo::menubar::{MenuBarView, MonitorEntry, MonitorsView, WorkspaceEntry};
 use ordo::ports::{Effector, NullEffector, WorldSource};
 use ordo::replay::replay;
 use ordo_core::{
@@ -772,61 +772,127 @@ fn a_view_change_on_one_display_runs_end_to_end_and_replays_clean() {
     let conn = Connection::open(&db).unwrap();
     let report = replay(&conn, run_id, None).unwrap();
     assert!(report.is_clean(), "{:?}", report.mismatches);
-    assert!(count(&conn, "SELECT COUNT(*) FROM effects WHERE kind = 'view_monitor'") >= 2);
+    assert!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM effects WHERE kind = 'view_monitor'"
+        ) >= 2
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[test]
-fn the_menu_bar_shows_every_workspace_and_follows_a_pick_from_its_menu() {
-    // Through the engine's real loop, which publishes the menu bar's view
-    // after every batch. The "user" reads each redraw and only then makes
-    // the next pick, so every view is a settled one: first the startup scene,
-    // then a pick from the menu (the same WorkspaceSwitchTo a chord mints)
-    // landing on workspace 2, then a rescue graying the whole thing out.
-    let os = fake_os(FocusPolicy::Lands);
+/// Run the engine's real loop, which publishes the menu bar's view after
+/// every batch, and collect each view. The "user" reads each redraw and only
+/// then sends the next message, so every view is a settled one.
+fn menu_bar_views(os: &Rc<RefCell<FakeOs>>, script: Vec<Msg>) -> Vec<MenuBarView> {
     let (tx, rx) = crossbeam_channel::unbounded();
-    let mut picks = vec![
-        Msg::Hotkey(HotkeyAction::WorkspaceSwitchTo(WorkspaceId(2))),
-        Msg::Rescue,
-        Msg::Shutdown,
-    ]
-    .into_iter();
+    let mut script = script.into_iter().chain([Msg::Shutdown]);
     let seen = Rc::new(RefCell::new(Vec::new()));
-    let engine = engine_on(&os, in_memory_logger("emulated")).on_state({
+    let engine = engine_on(os, in_memory_logger("emulated")).on_state({
         let seen = seen.clone();
         move |s| {
             seen.borrow_mut().push(MenuBarView::of(s));
-            if let Some(next) = picks.next() {
+            if let Some(next) = script.next() {
                 tx.send(next).unwrap();
             }
         }
     });
     engine.run(rx);
+    Rc::try_unwrap(seen).unwrap().into_inner()
+}
+
+fn monitors_view(
+    viewed: u8,
+    displays: &[u128],
+    hosts_and_windows: &[(Option<usize>, usize)],
+) -> MonitorsView {
+    MonitorsView {
+        displays: displays.iter().map(|d| MonitorId(*d)).collect(),
+        monitors: hosts_and_windows
+            .iter()
+            .enumerate()
+            .map(|(i, (display, windows))| MonitorEntry {
+                id: VirtualMonitorId(i as u8 + 1),
+                display: *display,
+                windows: *windows,
+            })
+            .collect(),
+        viewed: VirtualMonitorId(viewed),
+        enabled: true,
+    }
+}
+
+#[test]
+fn the_menu_bar_shows_every_workspace_and_follows_a_pick_from_its_menu() {
+    // First the startup scene, then a pick from the menu (the same
+    // WorkspaceSwitchTo a chord mints) landing on workspace 2, then a rescue
+    // graying the whole thing out. Two displays, a monitor on each; the
+    // monitors section counts the current workspace's windows on each.
+    let os = fake_os(FocusPolicy::Lands);
+    let seen = menu_bar_views(
+        &os,
+        vec![
+            Msg::Hotkey(HotkeyAction::WorkspaceSwitchTo(WorkspaceId(2))),
+            Msg::Rescue,
+        ],
+    );
 
     let entry = |n: u8, apps: &[i32]| WorkspaceEntry {
         id: WorkspaceId(n),
         apps: apps.iter().map(|p| Pid(*p)).collect(),
     };
     let workspaces = vec![entry(1, &[100]), entry(2, &[200]), entry(3, &[])];
+    let on_1 = monitors_view(1, &[1, 2], &[(Some(0), 2), (Some(1), 0)]);
+    let on_2 = monitors_view(1, &[1, 2], &[(Some(0), 0), (Some(1), 2)]);
     assert_eq!(
-        *seen.borrow(),
+        seen,
         vec![
             MenuBarView {
                 workspaces: workspaces.clone(),
                 current: Some(WorkspaceId(1)),
                 engaged: true,
+                monitors: Some(on_1),
             },
             MenuBarView {
                 workspaces: workspaces.clone(),
                 current: Some(WorkspaceId(2)),
                 engaged: true,
+                monitors: Some(on_2.clone()),
             },
             MenuBarView {
                 workspaces,
                 current: Some(WorkspaceId(2)),
                 engaged: false,
+                monitors: Some(on_2),
             },
         ]
     );
     assert_eq!(os.borrow().active, WorkspaceId(2));
+}
+
+#[test]
+fn the_menu_bar_shows_which_monitor_the_one_display_is_showing() {
+    // The laptop rig: one display, two virtual monitors. Monitor 2 is hidden
+    // with its one window on this workspace; Cmd+Alt+K brings it up and
+    // monitor 1's two windows go out of sight in its place.
+    let os = fake_os(FocusPolicy::Lands);
+    {
+        let mut o = os.borrow_mut();
+        o.displays = 1;
+        o.assignments.insert(WindowId(2), WorkspaceId(1));
+        for w in o.windows.iter_mut() {
+            if w.frame.x >= 1920.0 {
+                w.frame.x -= 1920.0;
+            }
+        }
+    }
+    let seen = menu_bar_views(&os, vec![Msg::Hotkey(HotkeyAction::ViewMonitorNext)]);
+    let monitors: Vec<_> = seen.into_iter().map(|v| v.monitors.unwrap()).collect();
+    assert_eq!(
+        monitors,
+        vec![
+            monitors_view(1, &[1], &[(Some(0), 2), (None, 1)]),
+            monitors_view(2, &[1], &[(None, 2), (Some(0), 1)]),
+        ]
+    );
 }
