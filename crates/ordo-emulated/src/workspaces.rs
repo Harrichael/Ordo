@@ -483,9 +483,10 @@ impl EmulatedWorkspaces {
         let frames = current_frames(d);
         let g = Geometry::read(d);
         self.note(boundary.detail(format!(
-            "parking {}, restoring {}",
+            "parking {}, restoring {}, rehosting {}",
             plan.park.len(),
-            plan.restore.len()
+            plan.restore.len(),
+            plan.rehost.len()
         )));
         let mut writes = Vec::new();
         for w in plan.park {
@@ -493,6 +494,9 @@ impl EmulatedWorkspaces {
         }
         for w in plan.restore {
             writes.extend(self.restore(w, &frames, &g));
+        }
+        for w in plan.rehost {
+            writes.extend(self.rehost(w, &frames, &g));
         }
         self.persist();
         self.move_windows(d, &writes);
@@ -1190,6 +1194,34 @@ impl EmulatedWorkspaces {
             .requested(want)
             .at_park(self.reads_parked(window, &f, g));
         self.note(t);
+        Some((pid, window, want))
+    }
+
+    /// Carry a window that stays on screen onto the display its monitor now
+    /// stands on: its `home` frame when that is on the new host, else its
+    /// frame carried over proportionally from the display it stands on —
+    /// `restore`'s rule, for a window that was never parked.
+    fn rehost(
+        &mut self,
+        window: WindowId,
+        frames: &HashMap<WindowId, (Pid, Rect)>,
+        g: &Geometry,
+    ) -> Option<(Pid, WindowId, Rect)> {
+        let (pid, f) = frames.get(&window).copied()?;
+        let host = self.host_rect(window, g)?;
+        if host.contains(f.center()) {
+            return None;
+        }
+        let home = self.home.get(&window).filter(|hm| host.contains(hm.center()));
+        let want = match (home, g.display_at(f.center())) {
+            (Some(hm), _) => Rect { x: hm.x, y: hm.y, ..f },
+            (None, Some(from)) => {
+                let t = f.translate_between(&from, &host);
+                Rect { x: t.x, y: t.y, ..f }
+            }
+            (None, None) => clamp_into(&f, &host),
+        };
+        self.note(ParkTrace::new(window, ParkTraceKind::Rehost).observed(f).requested(want));
         Some((pid, window, want))
     }
 
@@ -3002,5 +3034,54 @@ mod tests {
         assert_eq!(serde_json::from_str::<PersistedState>(&rejected).unwrap(), stale);
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Three monitors, docked on three displays, then the third unplugged:
+    /// monitor 3 is hidden and w3 parked, viewing 1+2. w1 and w4 share
+    /// monitor 1.
+    fn three_on_two() -> (FakeDesktop, EmulatedWorkspaces) {
+        let d = FakeDesktop::new(&[
+            (w(1), Pid(10), rect(100.0, 100.0)),
+            (w(2), Pid(20), rect(2000.0, 100.0)),
+            (w(3), Pid(30), rect(3500.0, 100.0)),
+            (w(4), Pid(40), rect(200.0, 200.0)),
+        ]);
+        d.set_displays(&[MAIN, SECOND, THIRD]);
+        let mut b = EmulatedWorkspaces::new(3);
+        b.note_scan(&d, &d.scan());
+        d.set_displays(&[MAIN, SECOND]);
+        rescan(&d, &mut b);
+        assert_eq!(b.monitors().count, 3);
+        assert!(in_park_corner(&d.frame(w(3)), &geo()));
+        (d, b)
+    }
+
+    const THIRD: Rect = Rect {
+        x: 3390.0,
+        y: 66.0,
+        w: 1470.0,
+        h: 956.0,
+    };
+
+    fn on(display: Rect, frame: Rect) -> bool {
+        display.contains(frame.center())
+    }
+
+    /// Two displays showing 2+3 put monitor 2 on the LEFT display. Its
+    /// windows must go with it: left where they stood, monitors 2 and 3
+    /// shared the right display, and the core then re-filed w2 onto monitor
+    /// 3 because that is what its display stood for.
+    #[test]
+    fn sliding_the_view_carries_a_monitor_that_stays_on_screen_to_its_new_display() {
+        let (d, mut b) = three_on_two();
+        b.view_monitor(&d, vm(3)).unwrap();
+        assert!(on(MAIN, d.frame(w(2))), "monitor 2 moved left: {:?}", d.frame(w(2)));
+        assert!(on(SECOND, d.frame(w(3))), "monitor 3 came up on the right");
+        assert!(in_park_corner(&d.frame(w(1)), &geo()));
+
+        b.view_monitor(&d, vm(1)).unwrap();
+        assert_eq!(d.frame(w(2)), rect(2000.0, 100.0), "home again, exactly");
+        assert_eq!(d.frame(w(1)), rect(100.0, 100.0));
+        assert!(in_park_corner(&d.frame(w(3)), &geo()));
     }
 }

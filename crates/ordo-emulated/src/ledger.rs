@@ -8,9 +8,10 @@
 //! hosted by a display under the current [`Projection`] — and this ledger holds
 //! both declarations per window plus the layout ones (visible workspace,
 //! anchor monitor, virtualization on/off). Every change to any of them, and
-//! every change to the display count, is planned the same way: diff the set
-//! of on-screen windows before and after, park what left it, restore what
-//! entered it. The platform wrapper applies that plan through the Desktop
+//! every change to the display count, is planned the same way: diff where
+//! the on-screen windows stand before and after, park what left the screen,
+//! restore what entered it, and carry across what stayed on screen while its
+//! monitor changed display. The platform wrapper applies that plan through the Desktop
 //! port; the decisions live here.
 //!
 //! Assignments are DECLARATIONS: only commands (and the named adoption policy
@@ -23,16 +24,18 @@ use std::collections::{BTreeMap, BTreeSet};
 use ordo_core::{project, Pid, Projection, VirtualMonitorId, VirtualMonitors, WindowId, WorkspaceId};
 
 /// What a change requires: hide the windows that left the screen, reveal the
-/// ones that entered it.
+/// ones that entered it, and move the ones still on screen whose monitor now
+/// stands on another display (a view sliding under two displays).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SwitchPlan {
     pub park: Vec<WindowId>,
     pub restore: Vec<WindowId>,
+    pub rehost: Vec<WindowId>,
 }
 
 impl SwitchPlan {
     pub fn is_empty(&self) -> bool {
-        self.park.is_empty() && self.restore.is_empty()
+        self.park.is_empty() && self.restore.is_empty() && self.rehost.is_empty()
     }
 }
 
@@ -161,24 +164,33 @@ impl Ledger {
             .is_some_and(|c| c.ws == self.current && proj.is_hosted(c.monitor))
     }
 
-    fn visible_set(&self, proj: &Projection) -> BTreeSet<WindowId> {
+    /// Every on-screen window, with the display (by position) it stands on.
+    fn on_screen(&self) -> BTreeMap<WindowId, usize> {
+        let proj = self.projection();
         self.assign
-            .keys()
-            .filter(|id| self.visible(**id, proj))
-            .copied()
+            .iter()
+            .filter(|(_, c)| c.ws == self.current)
+            .filter_map(|(id, c)| Some((*id, proj.host(c.monitor)?)))
             .collect()
     }
 
     /// The one planner. Apply any change to the declarations or the display
-    /// count, then say what left the screen and what entered it. Every
-    /// mutation goes through here so no path can decide hiding differently.
+    /// count, then say what left the screen, what entered it, and what
+    /// changed display on it. Every mutation goes through here so no path can
+    /// decide hiding differently.
     pub fn retarget(&mut self, f: impl FnOnce(&mut Ledger)) -> SwitchPlan {
-        let before = self.visible_set(&self.projection());
+        let before = self.on_screen();
         f(self);
-        let after = self.visible_set(&self.projection());
+        let after = self.on_screen();
+        let (b, a): (BTreeSet<_>, BTreeSet<_>) = (before.keys().collect(), after.keys().collect());
         SwitchPlan {
-            park: before.difference(&after).copied().collect(),
-            restore: after.difference(&before).copied().collect(),
+            park: b.difference(&a).map(|w| **w).collect(),
+            restore: a.difference(&b).map(|w| **w).collect(),
+            rehost: after
+                .iter()
+                .filter(|(w, d)| before.get(w).is_some_and(|was| was != *d))
+                .map(|(w, _)| *w)
+                .collect(),
         }
     }
 
