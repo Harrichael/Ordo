@@ -783,13 +783,13 @@ fn a_queued_burst_is_logged_with_its_presses_and_their_wait() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Hints queued behind a busy engine are one look at the world: a run of them
-/// becomes a single snapshot, so a hotkey waiting behind them waits for one.
-/// Creation hints are kept, one per app, because only they license corralling
-/// the new window. A hotkey still fences: the look before it and the look
-/// after it both happen, so it acts on fresh focus.
+/// Hints queued behind a busy engine are one look at the world, taken before
+/// the hotkeys queued with them: a snapshot reads the present wherever its
+/// hint sat, so a hint landing between two presses must not keep them from
+/// folding into one switch. Creation hints are kept, one per app, because only
+/// they license corralling the new window.
 #[test]
-fn queued_rescans_collapse_but_keep_their_creation_hints() {
+fn queued_rescans_become_one_look_ahead_of_the_presses_they_would_have_split() {
     let dir = std::env::temp_dir().join(format!("ordo-collapse-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let db = dir.join("collapse.db");
@@ -809,11 +809,10 @@ fn queued_rescans_collapse_but_keep_their_creation_hints() {
         let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
         for m in [
             hint(Some(7), focus()),
-            hint(Some(8), focus()),
-            hint(Some(7), focus()),
             Msg::hotkey(HotkeyAction::WorkspaceNext),
+            hint(Some(8), focus()),
             hint(Some(7), AxHintKind::WindowCreated),
-            hint(Some(7), focus()),
+            Msg::hotkey(HotkeyAction::WorkspaceNext),
             hint(Some(7), AxHintKind::WindowCreated),
             hint(Some(8), AxHintKind::WindowCreated),
             Msg::Shutdown,
@@ -824,12 +823,17 @@ fn queued_rescans_collapse_but_keep_their_creation_hints() {
         run_id
     };
     let conn = Connection::open(&db).unwrap();
-    let hints: Vec<(Option<i32>, bool)> = conn
-        .prepare("SELECT payload FROM events WHERE kind = 'world_observed' ORDER BY seq")
+    let steps: Vec<(String, String)> = conn
+        .prepare("SELECT kind, payload FROM events WHERE kind IN ('world_observed', 'hotkey') ORDER BY seq")
         .unwrap()
-        .query_map([], |r| r.get::<_, String>(0))
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
         .unwrap()
-        .filter_map(|p| match serde_json::from_str(&p.unwrap()).unwrap() {
+        .map(Result::unwrap)
+        .collect();
+    let hints_before_the_press: Vec<(Option<i32>, bool)> = steps
+        .iter()
+        .take_while(|(kind, _)| kind != "hotkey")
+        .filter_map(|(_, p)| match serde_json::from_str(p).unwrap() {
             Event::WorldObserved {
                 trigger: RescanTrigger::AxHint { pid, kind },
                 ..
@@ -837,8 +841,9 @@ fn queued_rescans_collapse_but_keep_their_creation_hints() {
             _ => None,
         })
         .collect();
-    assert_eq!(hints, [(Some(7), false), (Some(7), true), (Some(8), true)]);
-    assert_eq!(os.borrow().active, WorkspaceId(2));
+    assert_eq!(hints_before_the_press, [(Some(7), true), (Some(8), true)]);
+    assert_eq!(steps.iter().filter(|(kind, _)| kind == "hotkey").count(), 1, "the two presses folded");
+    assert_eq!(os.borrow().active, WorkspaceId(3));
     let report = replay(&conn, run_id, None).unwrap();
     assert!(report.is_clean(), "{:?}", report.mismatches);
     let _ = std::fs::remove_dir_all(&dir);

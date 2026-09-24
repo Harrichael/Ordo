@@ -68,28 +68,35 @@ impl Msg {
     }
 }
 
-/// Rescans queued back to back are one look at the world, not several: a
-/// snapshot is taken when processed, not when hinted, so the extras re-read
-/// what the first just saw — and a hotkey queued behind them waits for each.
-/// Measured, those echoes (mostly focus notifications from Ordo's own
-/// previous switch) were most of a burst press's wait. Creation hints survive,
-/// one per app, because only they authorize corralling a new window; every
-/// other trigger means just "go look".
+/// Between two real fences, every queued rescan is one look at the world, and
+/// it goes FIRST. A rescan's place in the queue says nothing: its snapshot is
+/// taken when processed, not when hinted, so it reads the present wherever it
+/// sits. Left in place, the echoes of Ordo's own switches (focus
+/// notifications, mostly) landed between queued presses, fenced each from the
+/// next, and turned a burst the user had already moved past into a run of
+/// full switches — the worst press measured waited behind three. Looking once
+/// up front keeps what the rescans were for: every hotkey still acts on a
+/// fresh look. Creation hints survive, one per app, because only they
+/// authorize corralling a new window; every other trigger means just "go
+/// look". Gestures and the mode messages stay fences: their place is intent.
 fn collapse_rescans(batch: Vec<Msg>) -> Vec<Msg> {
     let mut out = Vec::with_capacity(batch.len());
-    let mut run: Vec<RescanTrigger> = Vec::new();
+    let mut rescans: Vec<RescanTrigger> = Vec::new();
+    // Hotkeys, and telemetry, which fences nothing either (see `run`).
+    let mut after: Vec<Msg> = Vec::new();
     for m in batch {
         match m {
-            Msg::Rescan(trigger) => run.push(trigger),
-            // Telemetry fences nothing here either (see `run`).
-            Msg::RestackStats(_) => out.push(m),
-            other => {
-                flush_rescans(&mut run, &mut out);
-                out.push(other);
+            Msg::Rescan(trigger) => rescans.push(trigger),
+            Msg::Hotkey(..) | Msg::RestackStats(_) => after.push(m),
+            fence => {
+                flush_rescans(&mut rescans, &mut out);
+                out.append(&mut after);
+                out.push(fence);
             }
         }
     }
-    flush_rescans(&mut run, &mut out);
+    flush_rescans(&mut rescans, &mut out);
+    out.append(&mut after);
     out
 }
 
@@ -215,9 +222,10 @@ impl Engine {
     /// before processing — so that hotkeys which piled up while the engine was
     /// busy are seen TOGETHER and coalesced (`coalesce_hotkeys`) instead of
     /// replayed one by one: a queued backlog is one user gesture, not a
-    /// script. Non-hotkey messages fence the coalescing and keep their order
-    /// — a gesture included, since "hotkey, click, hotkey" is not one burst.
-    /// Rescans queued back to back collapse first (see [`collapse_rescans`]).
+    /// script. Gestures and the mode messages fence the coalescing and keep
+    /// their order, since "hotkey, click, hotkey" is not one burst. Rescans do
+    /// not: the batch's rescans become one look ahead of its hotkeys (see
+    /// [`collapse_rescans`]).
     pub fn run(mut self, rx: Receiver<Msg>) {
         self.observe(RescanTrigger::Startup);
         self.publish();
