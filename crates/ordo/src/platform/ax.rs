@@ -334,6 +334,43 @@ pub fn set_app_hidden(pid: Pid, hidden: bool) {
     }
 }
 
+/// The frames of these windows of one app, read from the app itself — the
+/// only source for a hidden app, whose windows the window server's list
+/// drops. One AXWindows walk; windows not found are left out.
+pub fn window_frames(pid: Pid, windows: &[WindowId]) -> Vec<(WindowId, Rect)> {
+    let el = unsafe { AXUIElement::new_application(pid.0) };
+    unsafe { el.set_messaging_timeout(MESSAGING_TIMEOUT_SECS) };
+    let Some(raw) = (unsafe { copy_attr(&el, "AXWindows") }) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    unsafe {
+        for i in 0..super::cf::array_len(raw) {
+            let win = super::cf::array_get(raw, i) as *const AXUIElement;
+            let Some(id) = window_id(win).filter(|id| windows.contains(id)) else {
+                continue;
+            };
+            let (Some(pos), Some(size)) = (
+                copy_point(&*win, "AXPosition", AXValueType::CGPoint),
+                copy_size(&*win, "AXSize"),
+            ) else {
+                continue;
+            };
+            out.push((
+                id,
+                Rect {
+                    x: pos.x,
+                    y: pos.y,
+                    w: size.width,
+                    h: size.height,
+                },
+            ));
+        }
+        sys::CFRelease(raw);
+    }
+    out
+}
+
 /// How long ONE un-hide may spend holding its parked windows at the corner
 /// before it gives up and lets the next enforcement pass clean up.
 ///

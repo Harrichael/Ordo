@@ -1413,11 +1413,17 @@ impl EmulatedWorkspaces {
                 shows.push(Unhide { pid, hold });
             } else if Some(pid) != focused_app {
                 d.hide_app(pid);
+                let (read, off) = off_after_hide(d, pid, &hold);
                 notes.push(
                     ParkTrace::app(pid, ParkTraceKind::AppHidden)
                         .ws(current, current)
-                        .detail(format!("hidden; {} window(s) parked", hold.len())),
+                        .detail(format!(
+                            "hidden; {} window(s) parked, {read} read back, {} off their spot",
+                            hold.len(),
+                            off.len()
+                        )),
                 );
+                notes.extend(off.into_iter().map(|t| t.ws(current, current)));
             }
         }
         // One call for every un-hide of this pass: they overlap in time rather
@@ -1443,6 +1449,29 @@ impl EmulatedWorkspaces {
             self.note(t);
         }
     }
+}
+
+/// The app's parked windows as they stand the moment its hide returns, each one
+/// off its spot traced. Positions compare exactly because a park lands
+/// exactly (see [`park_frame`]).
+fn off_after_hide(d: &dyn Desktop, pid: Pid, hold: &[(WindowId, Point)]) -> (usize, Vec<ParkTrace>) {
+    if hold.is_empty() {
+        return (0, Vec::new());
+    }
+    let ids: Vec<WindowId> = hold.iter().map(|(w, _)| *w).collect();
+    let frames = d.window_frames(pid, &ids);
+    let off = frames
+        .iter()
+        .filter_map(|(w, f)| {
+            let (_, at) = hold.iter().find(|(h, _)| h == w)?;
+            (f.x != at.x || f.y != at.y).then(|| {
+                ParkTrace::new(*w, ParkTraceKind::OffAfterHide)
+                    .observed(*f)
+                    .requested(Rect { x: at.x, y: at.y, ..*f })
+            })
+        })
+        .collect();
+    (frames.len(), off)
 }
 
 fn current_frames(d: &dyn Desktop) -> HashMap<WindowId, (Pid, Rect)> {
@@ -1728,6 +1757,9 @@ mod tests {
         /// measured in production (124pt), which no constant-box predicate
         /// survived.
         pull: std::cell::Cell<f64>,
+        /// A hide drags the app's windows parked off the left edge back to
+        /// it, keeping their y — what AppKit was caught doing, sometimes.
+        yank_on_hide: std::cell::Cell<bool>,
         /// Apps hidden the Cmd+H way. Their windows stay in `windows`, because
         /// an AX scan really does still see a hidden app's windows — that is
         /// what lets the model restore them later, and why the port's death
@@ -1752,6 +1784,7 @@ mod tests {
                 frozen: std::cell::Cell::new(false),
                 cg_down: std::cell::Cell::new(false),
                 pull: std::cell::Cell::new(28.0),
+                yank_on_hide: std::cell::Cell::new(false),
                 hidden: std::cell::RefCell::new(HashSet::new()),
                 displays: std::cell::RefCell::new(vec![MAIN, SECOND]),
                 focused: std::cell::Cell::new(None),
@@ -1900,6 +1933,22 @@ mod tests {
 
         fn hide_app(&self, pid: Pid) {
             self.hidden.borrow_mut().insert(pid);
+            if self.yank_on_hide.get() {
+                let edge = self.displays.borrow().iter().map(|d| d.x).fold(f64::INFINITY, f64::min);
+                for (p, f) in self.windows.borrow_mut().values_mut() {
+                    if *p == pid && f.x < edge {
+                        f.x = edge;
+                    }
+                }
+            }
+        }
+
+        fn window_frames(&self, pid: Pid, windows: &[WindowId]) -> Vec<(WindowId, Rect)> {
+            let ws = self.windows.borrow();
+            windows
+                .iter()
+                .filter_map(|w| ws.get(w).filter(|(p, _)| *p == pid).map(|(_, f)| (*w, *f)))
+                .collect()
         }
 
         /// The un-hide, modelled as the measurements found it — because the
@@ -2039,6 +2088,35 @@ mod tests {
     /// — the app unhide that reveals a straddling app's OTHER windows. That
     /// unhide is the prime suspect for the flash on arriving at a workspace, so
     /// it has to be attributable to a moment.
+    /// AppKit was caught pulling a hidden app's parked windows to the left
+    /// edge. Reading them back as the hide returns tells a pull made by the
+    /// hide itself from one that comes later, so the trace says which.
+    #[test]
+    fn a_hide_that_pulls_parked_windows_back_is_traced_as_it_returns() {
+        let d = FakeDesktop::new(&[
+            (w(1), Pid(10), rect(100.0, 100.0)),
+            (w(2), Pid(20), rect(300.0, 200.0)),
+        ]);
+        let mut b = EmulatedWorkspaces::new(3);
+        b.note_scan(&d, &d.scan());
+        b.assign_window_to_workspace(w(2), ws(2)).unwrap();
+        d.yank_on_hide.set(true);
+        b.take_trace();
+
+        b.switch_workspace(&d, ws(2));
+
+        let trace = b.take_trace();
+        let off: Vec<_> = trace.iter().filter(|t| t.kind == ParkTraceKind::OffAfterHide).collect();
+        assert_eq!(off.len(), 1);
+        assert_eq!(off[0].window, w(1));
+        assert_eq!(off[0].observed.map(|f| f.x), Some(MAIN.x));
+        let hidden = trace
+            .iter()
+            .find(|t| t.kind == ParkTraceKind::AppHidden && t.pid == Some(Pid(10)))
+            .expect("the hide is traced");
+        assert!(hidden.detail.as_deref().unwrap().ends_with("1 off their spot"));
+    }
+
     #[test]
     fn a_switch_is_legible_end_to_end_including_the_app_unhide() {
         // One app owning windows on two workspaces: the straddling case, where

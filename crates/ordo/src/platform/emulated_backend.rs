@@ -37,6 +37,10 @@ impl Desktop for AxDesktop {
         ax::set_app_hidden(pid, true);
     }
 
+    fn window_frames(&self, pid: Pid, windows: &[WindowId]) -> Vec<(WindowId, Rect)> {
+        ax::window_frames(pid, windows)
+    }
+
     fn show_apps(&self, apps: &[Unhide]) -> Vec<HoldStat> {
         let holds: Vec<(Pid, &[(WindowId, Point)])> =
             apps.iter().map(|u| (u.pid, u.hold.as_slice())).collect();

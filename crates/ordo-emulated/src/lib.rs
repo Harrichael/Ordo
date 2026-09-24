@@ -75,10 +75,16 @@ pub trait Desktop {
     /// each app's window list should walk it once for both.
     fn move_windows(&self, moves: &[(Pid, WindowId, Point)]);
 
-    /// Hide an app, the Cmd+H way. Fire-and-forget on purpose: nothing
-    /// contests a hide — the windows are already where the model wants them
-    /// and vanishing gives the app no reason to move them.
+    /// Hide an app, the Cmd+H way. Fire-and-forget: the hide itself needs no
+    /// confirming. It is not always quiet, though — its windows parked at the
+    /// corner have been found pulled to the display's left edge soon after,
+    /// which is why [`Desktop::window_frames`] is asked right behind it.
     fn hide_app(&self, pid: Pid);
+
+    /// Where these windows of one app are, asked of the app itself: the
+    /// window server's list can't answer for a hidden app, whose windows drop
+    /// out of it. Windows the app doesn't report are left out.
+    fn window_frames(&self, pid: Pid, windows: &[WindowId]) -> Vec<(WindowId, Rect)>;
 
     /// Un-hide these apps, HOLDING each one's listed windows at the given
     /// origin until the desktop agrees they are there.

@@ -63,6 +63,10 @@ pub enum ParkTraceKind {
     AppShown,
     /// Dock dimming hid an app: all its windows live on hidden workspaces.
     AppHidden,
+    /// Read right after its app was hidden, a parked window was already off
+    /// its park spot. Says whether the hide itself moves parked windows, or
+    /// they move later (then the next scan's `Reassert` is the first sign).
+    OffAfterHide,
 }
 
 /// What holding an app's parked windows through its un-hide cost.
