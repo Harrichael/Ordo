@@ -63,6 +63,11 @@ pub enum Effect {
         from: VirtualMonitorId,
         into: VirtualMonitorId,
     },
+    /// One more monitor after the last, the anchor kept where the screen
+    /// needs it (see [`crate::anchor_after_add`]).
+    AddMonitor {
+        op: OpId,
+    },
     /// The core computes target geometry itself (pure math over monitor
     /// frames); the shell only performs the AX write.
     SetWindowFrame {
@@ -132,8 +137,8 @@ pub enum Expectation {
     },
     Viewing(VirtualMonitorId),
     VirtualMonitorsEnabled(bool),
-    /// A merge landed: this many monitors remain.
-    MonitorsMerged {
+    /// A merge or an add landed: this many monitors now.
+    MonitorCount {
         count: u8,
     },
 }

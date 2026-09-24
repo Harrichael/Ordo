@@ -320,6 +320,7 @@ enum Command {
         from: VirtualMonitorId,
         into: VirtualMonitorId,
     },
+    AddMonitor,
 }
 
 fn handle_hotkey(s: &mut State, action: HotkeyAction, now_ns: u64, fx: &mut Vec<Effect>) {
@@ -460,6 +461,11 @@ fn resolve(s: &State, action: HotkeyAction) -> Option<Command> {
             let exists = |m: VirtualMonitorId| (1..=v.count).contains(&m.0);
             (spare && from != into && exists(from) && exists(into))
                 .then_some(Command::Merge { from, into })
+        }
+
+        HotkeyAction::AddMonitor => {
+            let v = s.virtual_monitors?;
+            (v.count < u8::MAX).then_some(Command::AddMonitor)
         }
     }
 }
@@ -820,7 +826,7 @@ fn execute(s: &mut State, cmd: Command, now_ns: u64, fx: &mut Vec<Effect>) -> Fo
             fx.push(Effect::MergeMonitors { op, from, into });
             s.pending.push(PendingOp {
                 op,
-                expect: Expectation::MonitorsMerged { count: v.count - 1 },
+                expect: Expectation::MonitorCount { count: v.count - 1 },
                 issued_ns: now_ns,
             });
             // What a merge reveals comes up through app un-hiding, which
@@ -846,6 +852,23 @@ fn execute(s: &mut State, cmd: Command, now_ns: u64, fx: &mut Vec<Effect>) -> Fo
                     fx.push(Effect::RestackWindows { order });
                 }
             }
+            fx.push(Effect::RequestRescan {
+                reason: RescanTrigger::PostEffect { op },
+            });
+            s.focus_intent()
+        }
+
+        // Nothing on screen changes, so nothing to restack: the new monitor
+        // is empty and the anchor moves only within the viewport.
+        Command::AddMonitor => {
+            let v = s.virtual_monitors.expect("resolved against a virtual layer");
+            let op = s.mint_op();
+            fx.push(Effect::AddMonitor { op });
+            s.pending.push(PendingOp {
+                op,
+                expect: Expectation::MonitorCount { count: v.count + 1 },
+                issued_ns: now_ns,
+            });
             fx.push(Effect::RequestRescan {
                 reason: RescanTrigger::PostEffect { op },
             });
@@ -1633,7 +1656,7 @@ fn expectation_satisfied(e: &Expectation, s: &State) -> bool {
         Expectation::VirtualMonitorsEnabled(e) => {
             s.virtual_monitors.is_some_and(|v| v.enabled == *e)
         }
-        Expectation::MonitorsMerged { count } => {
+        Expectation::MonitorCount { count } => {
             s.virtual_monitors.is_some_and(|v| v.count == *count)
         }
     }

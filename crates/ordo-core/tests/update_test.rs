@@ -2894,6 +2894,41 @@ fn a_merge_from_the_menu_folds_one_monitor_into_another_while_one_is_spare() {
 }
 
 #[test]
+fn adding_a_monitor_from_the_menu_is_our_own_echo_when_the_backend_reports_it() {
+    // Two monitors on two displays, the anchor on the right one. The menu's
+    // plus asks the backend for a third; its word — three monitors, the
+    // anchor moved to 1 so the viewport stays where it was — is the echo of
+    // our own command, not an external change to follow.
+    let view = |count, viewed| VirtualMonitors {
+        count,
+        viewed: vm(viewed),
+        enabled: true,
+    };
+    let windows = || {
+        vec![
+            win(1, 100, 1, rect(100.0, 100.0)),
+            on_monitor(win(2, 200, 1, rect(2000.0, 100.0)), 2),
+        ]
+    };
+    let two = observed_view(view(2, 2), vec![mon_a(1), mon_b(1)], windows(), Some(2), RescanTrigger::Periodic);
+    let s = update(&State::new(), &two).state;
+
+    let added = update(&s, &hotkey(HotkeyAction::AddMonitor));
+    assert!(added.effects.iter().any(|e| matches!(e, Effect::AddMonitor { .. })));
+
+    let three = observed_view(view(3, 1), vec![mon_a(1), mon_b(1)], windows(), Some(2), RescanTrigger::Periodic);
+    let landed = update(&added.state, &three);
+    assert_eq!(landed.state.virtual_monitors, Some(view(3, 1)));
+    assert!(landed.state.pending.is_empty(), "{:?}", landed.state.pending);
+    assert!(
+        !landed.notes.iter().any(|n| matches!(n, Note::External { .. })),
+        "{:?}",
+        landed.notes
+    );
+    assert!(!landed.effects.iter().any(|e| matches!(e, Effect::ViewMonitor { .. })));
+}
+
+#[test]
 fn toggling_virtualization_on_views_the_focused_windows_monitor() {
     let s = undocked(&[1]);
     // Off: everything collapses onto the display; no view change needed.

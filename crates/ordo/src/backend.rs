@@ -118,6 +118,12 @@ pub trait WorkspaceBackend {
         Err(BackendError("this backend has no virtual monitors".into()))
     }
 
+    /// One more, empty monitor after the last, the screen left as it was (see
+    /// `ordo_core::anchor_after_add`).
+    fn add_monitor(&mut self) -> Result<()> {
+        Err(BackendError("this backend has no virtual monitors".into()))
+    }
+
     /// Rewrite the window's virtual-monitor declaration WITHOUT touching its
     /// frame — the monitor twin of `assign_window_to_workspace`.
     fn assign_window_to_monitor(&mut self, window: WindowId, target: VirtualMonitorId) -> Result<()> {

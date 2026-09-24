@@ -97,12 +97,50 @@ pub fn after_merge(m: VirtualMonitorId, from: VirtualMonitorId, into: VirtualMon
     close(if m == from { into } else { m })
 }
 
+/// The anchor once a monitor is added after the last: the one that keeps
+/// every display showing what it showed. The viewport starts at the anchor
+/// unless pinned against the end, and a new last monitor unpins it — so a
+/// pinned anchor moves to the viewport's first monitor, the start it had.
+/// Shared by the core and the backend, as `after_merge` is.
+pub fn anchor_after_add(count: u8, viewed: VirtualMonitorId, enabled: bool, physical: usize) -> VirtualMonitorId {
+    let count = count.max(1);
+    if !enabled || physical == 0 || physical > count as usize {
+        return viewed;
+    }
+    VirtualMonitorId(viewed.0.clamp(1, count).min(count + 1 - physical as u8))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn vm(n: u8) -> VirtualMonitorId {
         VirtualMonitorId(n)
+    }
+
+    /// Adding a monitor is never a view change: across every rig, anchor and
+    /// mode, each existing monitor stays on the display it was on.
+    #[test]
+    fn adding_a_monitor_leaves_every_display_showing_what_it_showed() {
+        for count in 1..=5u8 {
+            for physical in 0..=count as usize {
+                for viewed in 1..=count {
+                    for enabled in [true, false] {
+                        let before = project(count, vm(viewed), enabled, physical);
+                        let anchor = anchor_after_add(count, vm(viewed), enabled, physical);
+                        let after = project(count + 1, anchor, enabled, physical);
+                        for m in 1..=count {
+                            assert_eq!(
+                                after.host(vm(m)),
+                                before.host(vm(m)),
+                                "count {count}, physical {physical}, viewed {viewed}, enabled {enabled}: monitor {m}"
+                            );
+                        }
+                        assert!(after.is_hosted(anchor) || physical == 0);
+                    }
+                }
+            }
+        }
     }
 
     #[test]

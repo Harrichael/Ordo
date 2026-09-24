@@ -8,7 +8,9 @@
 //!
 //! While some monitor is spare (more monitors than displays), a tile can be
 //! dragged onto another to merge the two; the drop asks first, in place of
-//! the tiles, because a merge renumbers monitors on every workspace.
+//! the tiles, because a merge renumbers monitors on every workspace. The plus
+//! after the last tile adds a monitor without asking: it is empty and moves
+//! nothing, so there is nothing to confirm.
 
 use std::cell::{Cell, OnceCell, RefCell};
 
@@ -24,7 +26,7 @@ use objc2_foundation::{
     MainThreadMarker, NSAttributedString, NSDictionary, NSPoint, NSRect, NSSize, NSString,
 };
 
-use ordo_core::VirtualMonitorId;
+use ordo_core::HotkeyAction;
 
 use crate::menubar::{MonitorEntry, MonitorsView};
 
@@ -49,6 +51,7 @@ const BUTTON_W: f64 = 72.0;
 const BUTTON_H: f64 = 20.0;
 const BUTTON_GAP: f64 = 8.0;
 const BUTTON_R: f64 = 6.0;
+const ADD_W: f64 = 28.0;
 
 /// A tile in the hand: which one, where the pointer holds it, and where the
 /// pointer is now.
@@ -63,11 +66,14 @@ struct Drag {
 pub struct MapIvars {
     view: RefCell<Option<MonitorsView>>,
     frame: OnceCell<Retained<DisplayFrame>>,
+    engaged: Cell<bool>,
     mergeable: Cell<bool>,
     drag: Cell<Option<Drag>>,
+    /// The plus is held down.
+    adding: Cell<bool>,
     /// A drop awaiting its answer, as tile indices (from, into).
     confirm: Cell<Option<(usize, usize)>>,
-    on_merge: Box<dyn Fn(VirtualMonitorId, VirtualMonitorId)>,
+    on_command: Box<dyn Fn(HotkeyAction)>,
 }
 
 define_class!(
@@ -108,6 +114,9 @@ define_class!(
                 }
                 draw_tile(r, m.id.0, m.windows, m.display.is_some(), m.id == view.viewed);
             }
+            if self.ivars().engaged.get() && drag.is_none() {
+                draw_add(add_rect(n), self.ivars().adding.get());
+            }
             if let Some(d) = drag {
                 let m = &view.monitors[d.from];
                 let r = NSRect::new(
@@ -122,11 +131,19 @@ define_class!(
         #[unsafe(method(mouseDown:))]
         fn mouse_down(&self, event: &NSEvent) {
             let ivars = self.ivars();
-            if ivars.confirm.get().is_some() || !ivars.mergeable.get() {
+            if ivars.confirm.get().is_some() {
                 return;
             }
             let p = self.local(event);
             let n = ivars.view.borrow().as_ref().map_or(0, |v| v.monitors.len());
+            if ivars.engaged.get() && contains(add_rect(n), p) {
+                ivars.adding.set(true);
+                self.redraw();
+                return;
+            }
+            if !ivars.mergeable.get() {
+                return;
+            }
             if let Some(i) = tile_at(n, p) {
                 let o = tile_rect(i).origin;
                 ivars.drag.set(Some(Drag {
@@ -163,10 +180,18 @@ define_class!(
                 }
                 return;
             }
+            let n = self.ivars().view.borrow().as_ref().map_or(0, |v| v.monitors.len());
+            if self.ivars().adding.take() {
+                self.redraw();
+                if contains(add_rect(n), p) {
+                    (self.ivars().on_command)(HotkeyAction::AddMonitor);
+                    self.close_menu();
+                }
+                return;
+            }
             let Some(d) = self.ivars().drag.take() else {
                 return;
             };
-            let n = self.ivars().view.borrow().as_ref().map_or(0, |v| v.monitors.len());
             match tile_at(n, p).filter(|t| d.moved && *t != d.from) {
                 Some(into) => self.ask(d.from, into),
                 None => self.redraw(),
@@ -209,18 +234,18 @@ define_class!(
 );
 
 impl MonitorMap {
-    /// `on_merge` is handed (from, into) once a drop is confirmed.
-    pub fn new(
-        mtm: MainThreadMarker,
-        on_merge: Box<dyn Fn(VirtualMonitorId, VirtualMonitorId)>,
-    ) -> Retained<Self> {
+    /// `on_command` is handed what the diagram asks for: a confirmed merge,
+    /// or a monitor added.
+    pub fn new(mtm: MainThreadMarker, on_command: Box<dyn Fn(HotkeyAction)>) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(MapIvars {
             view: RefCell::new(None),
             frame: OnceCell::new(),
+            engaged: Cell::new(false),
             mergeable: Cell::new(false),
             drag: Cell::new(None),
+            adding: Cell::new(false),
             confirm: Cell::new(None),
-            on_merge,
+            on_command,
         });
         let this: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: NSRect::ZERO] };
         // Stretched to the menu's width, so the merge prompt has room even
@@ -238,7 +263,8 @@ impl MonitorMap {
 
     /// Show `view`, sliding the display frame from where it stood when
     /// `animate` — the menu is open and the user just watched it change.
-    /// `engaged`: Ordo acts on commands, so a merge could be carried out.
+    /// `engaged`: Ordo acts on commands, so a merge or an add would be
+    /// carried out.
     pub fn show(&self, view: &MonitorsView, engaged: bool, animate: bool) {
         let n = view.monitors.len();
         let ivars = self.ivars();
@@ -249,19 +275,24 @@ impl MonitorMap {
             ivars.drag.set(None);
             ivars.confirm.set(None);
         }
+        ivars.adding.set(false);
+        ivars.engaged.set(engaged);
         let mergeable = engaged && n > view.displays.len().max(1);
         ivars.mergeable.set(mergeable);
-        self.setToolTip(
-            mergeable
-                .then(|| NSString::from_str("Drag a monitor onto another to merge them"))
-                .as_deref(),
-        );
+        let tip = match (engaged, mergeable) {
+            (_, true) => Some("Drag a monitor onto another to merge them; + adds a monitor"),
+            (true, false) => Some("+ adds a monitor"),
+            (false, _) => None,
+        };
+        self.setToolTip(tip.map(NSString::from_str).as_deref());
         let frame_h = TILE_H + 2.0 * FRAME_PAD;
+        let plus = if engaged { TILE_GAP + ADD_W } else { 0.0 };
         self.setFrameSize(NSSize::new(
             2.0 * MARGIN_X
                 + 2.0 * FRAME_PAD
                 + n as f64 * TILE_W
-                + n.saturating_sub(1) as f64 * TILE_GAP,
+                + n.saturating_sub(1) as f64 * TILE_GAP
+                + plus,
             TOP + frame_h + BOTTOM,
         ));
 
@@ -337,8 +368,14 @@ impl MonitorMap {
             .map(|v| (v.monitors[from].id, v.monitors[into].id));
         self.ivars().confirm.set(None);
         if let Some((from, into)) = ids {
-            (self.ivars().on_merge)(from, into);
+            (self.ivars().on_command)(HotkeyAction::MergeMonitors { from, into });
         }
+        self.close_menu();
+    }
+
+    /// After a merge or an add the tiles no longer match the monitors, and an
+    /// open menu doesn't take a new width from its item's view.
+    fn close_menu(&self) {
         // SAFETY: the item is in the menu that is showing this view.
         if let Some(menu) = self.enclosingMenuItem().and_then(|item| unsafe { item.menu() }) {
             menu.cancelTracking();
@@ -468,6 +505,35 @@ fn tile_rect(i: usize) -> NSRect {
         ),
         NSSize::new(TILE_W, TILE_H),
     )
+}
+
+/// Where the plus sits: after the last tile, narrower than one, so it reads
+/// as a control rather than a monitor.
+fn add_rect(n: usize) -> NSRect {
+    let after = tile_rect(n).origin.x;
+    NSRect::new(NSPoint::new(after, TOP + FRAME_PAD), NSSize::new(ADD_W, TILE_H))
+}
+
+fn draw_add(r: NSRect, pressed: bool) {
+    let path = rounded(inset(r, 0.5), TILE_R);
+    if pressed {
+        NSColor::labelColor().colorWithAlphaComponent(0.12).setFill();
+        path.fill();
+    }
+    let dash: [f64; 2] = [3.0, 2.0];
+    unsafe { path.setLineDash_count_phase(dash.as_ptr(), 2, 0.0) };
+    NSColor::secondaryLabelColor().setStroke();
+    path.setLineWidth(1.0);
+    path.stroke();
+    text(
+        "+",
+        &NSFont::systemFontOfSize_weight(16.0, unsafe { NSFontWeightSemibold }),
+        &NSColor::secondaryLabelColor(),
+    )
+    .drawInRect(NSRect::new(
+        NSPoint::new(r.origin.x, r.origin.y + (r.size.height - 20.0) / 2.0),
+        NSSize::new(r.size.width, 20.0),
+    ));
 }
 
 fn draw_tile(r: NSRect, number: u8, windows: usize, shown: bool, viewed: bool) {

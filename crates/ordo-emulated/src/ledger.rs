@@ -22,7 +22,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use ordo_core::{
-    after_merge, project, Pid, Projection, VirtualMonitorId, VirtualMonitors, WindowId, WorkspaceId,
+    after_merge, anchor_after_add, project, Pid, Projection, VirtualMonitorId, VirtualMonitors, WindowId, WorkspaceId,
 };
 
 /// What a change requires: hide the windows that left the screen, reveal the
@@ -325,6 +325,19 @@ impl Ledger {
             }
             l.monitors.viewed = after_merge(l.monitors.viewed, from, into);
             l.monitors.count = n - 1;
+        }))
+    }
+
+    /// One more monitor after the last, empty on every workspace; the anchor
+    /// moves only as far as keeps the screen still (see [`anchor_after_add`]).
+    /// `None` once the count can't grow.
+    pub fn add_monitor(&mut self) -> Option<SwitchPlan> {
+        let n = self.monitors.count;
+        let count = n.checked_add(1)?;
+        Some(self.retarget(|l| {
+            let m = l.monitors;
+            l.monitors.viewed = anchor_after_add(n, m.viewed, m.enabled, l.physical);
+            l.monitors.count = count;
         }))
     }
 

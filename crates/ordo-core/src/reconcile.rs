@@ -329,9 +329,10 @@ pub(crate) fn explains(e: &Expectation, d: &Delta) -> bool {
         (Expectation::VirtualMonitorsEnabled(e), Delta::VirtualMonitorsToggled { enabled }) => {
             enabled == e
         }
-        // A merge renumbers monitors wholesale, the anchor with them.
+        // A merge renumbers monitors wholesale, the anchor with them; an add
+        // may move the anchor within the viewport.
         (
-            Expectation::MonitorsMerged { .. },
+            Expectation::MonitorCount { .. },
             Delta::WindowMonitorAssigned { .. } | Delta::ViewedMonitorChanged { .. },
         ) => true,
         _ => false,

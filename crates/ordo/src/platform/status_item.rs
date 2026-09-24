@@ -514,8 +514,8 @@ impl Controller {
             let tx = self.ivars().mailbox.tx.clone();
             MonitorMap::new(
                 self.mtm(),
-                Box::new(move |from, into| {
-                    let _ = tx.send(Msg::hotkey(HotkeyAction::MergeMonitors { from, into }));
+                Box::new(move |action| {
+                    let _ = tx.send(Msg::hotkey(action));
                 }),
             )
         })

@@ -51,7 +51,7 @@ pub use ids::{
     MonitorId, OpId, Pid, Point, Rect, VirtualMonitorId, WindowId, WorkspaceId, FRAME_EPSILON,
 };
 pub use mru::FocusHistory;
-pub use project::{after_merge, project, Projection};
+pub use project::{after_merge, anchor_after_add, project, Projection};
 pub use reconcile::Delta;
 pub use state::{
     FocusIntent, Mode, MonitorRecord, PendingOp, State, VirtualMonitors, WindowRecord,

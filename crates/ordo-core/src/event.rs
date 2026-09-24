@@ -135,6 +135,10 @@ pub enum HotkeyAction {
         from: VirtualMonitorId,
         into: VirtualMonitorId,
     },
+    /// From the menu bar: one more virtual monitor, empty, after the last on
+    /// every workspace. Nothing on screen changes (see
+    /// [`crate::anchor_after_add`]); it is room to move windows into.
+    AddMonitor,
 }
 
 /// Why a rescan ran. Purely diagnostic except for `AxHint(WindowCreated)`,

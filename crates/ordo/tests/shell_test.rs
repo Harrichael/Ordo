@@ -16,7 +16,7 @@ use ordo::menubar::{MenuBarView, MonitorEntry, MonitorsView, WorkspaceEntry};
 use ordo::ports::{Effector, NullEffector, WorldSource};
 use ordo::replay::replay;
 use ordo_core::{
-    after_merge, AxHintKind, Effect, Event, FocusIntent, Gesture, HotkeyAction, MonitorId, MonitorSnap, MonitorWs, OpOutcome, Pid,
+    after_merge, anchor_after_add, AxHintKind, Effect, Event, FocusIntent, Gesture, HotkeyAction, MonitorId, MonitorSnap, MonitorWs, OpOutcome, Pid,
     Rect, RescanTrigger, VirtualMonitorId, VirtualMonitors, VirtualMonitorsWord, WindowId,
     WindowSnap, WorkspaceId, WorkspaceSnap, WorldSnapshot,
 };
@@ -164,6 +164,10 @@ impl Effector for FakeEffector {
                 }
                 os.view.viewed = after_merge(os.view.viewed, *from, *into);
                 os.view.count -= 1;
+            }
+            Effect::AddMonitor { .. } => {
+                os.view.viewed = anchor_after_add(os.view.count, os.view.viewed, os.view.enabled, os.displays);
+                os.view.count += 1;
             }
             Effect::FocusWindow { window, .. } => match os.policy {
                 FocusPolicy::Lands => os.focused = Some(*window),
@@ -1017,3 +1021,18 @@ fn the_menu_bar_shows_which_monitor_the_one_display_is_showing() {
     );
 }
 
+/// The menu's plus, end to end: a third monitor appears in the diagram,
+/// empty and off screen, and the two displays keep showing what they showed.
+#[test]
+fn the_menus_plus_adds_an_empty_monitor_beside_the_displays() {
+    let os = fake_os(FocusPolicy::Lands);
+    let seen = menu_bar_views(&os, vec![Msg::hotkey(HotkeyAction::AddMonitor)]);
+    let (before, after) = (
+        seen.first().unwrap().monitors.clone().unwrap(),
+        seen.last().unwrap().monitors.clone().unwrap(),
+    );
+    assert_eq!(before.monitors.len(), 2);
+    assert_eq!(after.monitors[..2], before.monitors[..]);
+    let new = &after.monitors[2];
+    assert_eq!((new.id, new.display, new.windows, new.all_windows), (VirtualMonitorId(3), None, 0, 0));
+}

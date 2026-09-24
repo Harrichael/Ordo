@@ -573,6 +573,23 @@ impl EmulatedWorkspaces {
         Ok(())
     }
 
+    /// One more, empty monitor. The plan should be empty — the screen stays
+    /// as it was — but it runs like any other, so a mistake would still leave
+    /// the screen matching the ledger.
+    pub fn add_monitor(&mut self, d: &dyn Desktop) -> Result<(), MonitorOutOfRange> {
+        let count = self.ledger.monitors().count;
+        let plan = self
+            .ledger
+            .add_monitor()
+            .ok_or(MonitorOutOfRange(VirtualMonitorId(count)))?;
+        let current = self.ledger.current();
+        let boundary = ParkTrace::new(WindowId(0), ParkTraceKind::View)
+            .ws(current, current)
+            .detail(format!("monitor {} added", count as u16 + 1));
+        self.apply_plan(d, plan, boundary);
+        Ok(())
+    }
+
     pub fn move_window_to_workspace(
         &mut self,
         d: &dyn Desktop,
@@ -3279,5 +3296,22 @@ mod tests {
         assert!(on(SECOND, d.frame(w(3))), "revealed on the right");
         assert!(in_park_corner(&d.frame(w4), &geo()), "workspace 2 stays hidden");
         assert!(b.merge_monitors(&d, vm(2), vm(1)).is_err());
+    }
+
+    /// Viewing monitor 3 of three on two displays pins the viewport against
+    /// the end. A fourth monitor unpins it; the anchor steps back to 2 so the
+    /// displays keep showing 2 and 3, and not a window moves.
+    #[test]
+    fn adding_a_monitor_moves_no_window() {
+        let (d, mut b) = three_on_two();
+        b.view_monitor(&d, vm(3)).unwrap();
+        let before: Vec<Rect> = (1..=4).map(|n| d.frame(w(n))).collect();
+
+        b.add_monitor(&d).unwrap();
+
+        assert_eq!(b.monitors().count, 4);
+        assert_eq!(b.monitors().viewed, vm(2));
+        let after: Vec<Rect> = (1..=4).map(|n| d.frame(w(n))).collect();
+        assert_eq!(after, before);
     }
 }

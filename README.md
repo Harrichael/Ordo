@@ -55,7 +55,8 @@ The two rules that make it work:
   under a frame for the physical displays that slides as the view changes.
   While there are more monitors than displays, drag one tile onto another to
   merge them: after a confirm, the first monitor's windows join the second on
-  every workspace, and the monitors after it renumber down by one.
+  every workspace, and the monitors after it renumber down by one. The `+`
+  after the last tile adds an empty monitor; nothing on screen moves.
   Dimmed while Ordo is paused. Not shown with
   `--observe`. Preview the design without the daemon:
   `cargo run --example menubar_preview`.

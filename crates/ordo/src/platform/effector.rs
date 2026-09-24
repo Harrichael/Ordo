@@ -94,6 +94,9 @@ impl Effector for MacEffector {
             Effect::MergeMonitors { from, into, .. } => Some(result_outcome(
                 self.backend.borrow_mut().merge_monitors(*from, *into),
             )),
+            Effect::AddMonitor { .. } => {
+                Some(result_outcome(self.backend.borrow_mut().add_monitor()))
+            }
             Effect::WarpMouse { to } => {
                 mouse::warp_to(*to);
                 None
