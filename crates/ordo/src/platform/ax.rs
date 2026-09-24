@@ -135,11 +135,21 @@ fn read_window(win: *const AXUIElement, app: Pid, bundle_id: Option<String>) -> 
 }
 
 pub fn focused_window() -> Option<WindowId> {
-    // Find the front app by asking each app's live `AXFrontmost` attribute —
-    // NOT NSWorkspace.frontmostApplication, which is a cache that refreshes
-    // only when a run loop pumps (the engine thread never pumps one, so it
-    // would report the frontmost app from boot forever). The system-wide
-    // element's AXFocusedApplication would be cleaner but returns
+    let pid = frontmost_app()?;
+    let el = unsafe { AXUIElement::new_application(pid.0) };
+    unsafe { el.set_messaging_timeout(MESSAGING_TIMEOUT_SECS) };
+    let focused = unsafe { copy_attr(&el, "AXFocusedWindow") }?;
+    let id = window_id(focused as *const AXUIElement);
+    unsafe { sys::CFRelease(focused) };
+    id
+}
+
+pub fn frontmost_app() -> Option<Pid> {
+    // Ask each app's live `AXFrontmost` attribute — NOT
+    // NSWorkspace.frontmostApplication, which is a cache that refreshes only
+    // when a run loop pumps (the engine thread never pumps one, so it would
+    // report the frontmost app from boot forever). The system-wide element's
+    // AXFocusedApplication would be cleaner but returns
     // kAXErrorCannotComplete here (observed on Tahoe).
     let apps = NSWorkspace::sharedWorkspace().runningApplications();
     for app in apps.iter() {
@@ -157,13 +167,9 @@ pub fn focused_window() -> Option<WindowId> {
         };
         let is_front = unsafe { &*(front as *const CFBoolean) }.value();
         unsafe { sys::CFRelease(front) };
-        if !is_front {
-            continue;
+        if is_front {
+            return Some(Pid(pid));
         }
-        let focused = unsafe { copy_attr(&el, "AXFocusedWindow") }?;
-        let id = window_id(focused as *const AXUIElement);
-        unsafe { sys::CFRelease(focused) };
-        return id;
     }
     None
 }

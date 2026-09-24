@@ -301,6 +301,18 @@ fn focus_targets(effects: &[Effect]) -> Vec<WindowId> {
         .collect()
 }
 
+/// The op a switch was issued under — not always the first minted, since a
+/// switch hands out focus before it.
+fn switch_op(effects: &[Effect]) -> OpId {
+    effects
+        .iter()
+        .find_map(|e| match e {
+            Effect::SwitchWorkspace { op, .. } => Some(*op),
+            _ => None,
+        })
+        .expect("a switch was issued")
+}
+
 fn count_switches(effects: &[Effect]) -> usize {
     effects
         .iter()
@@ -562,10 +574,45 @@ fn workspace_next_switches_and_prev_clamps_at_the_edge() {
         .effects
         .iter()
         .any(|e| matches!(e, Effect::SwitchWorkspace { target, .. } if *target == ws(2))));
-    assert_eq!(step.state.pending.len(), 1);
+    assert!(step
+        .state
+        .pending
+        .iter()
+        .any(|p| p.expect == Expectation::AllMonitorsOn(ws(2))));
 
     let clamped = update(&s, &hotkey(HotkeyAction::WorkspacePrev));
     assert!(clamped.effects.is_empty(), "already at workspace 1");
+}
+
+#[test]
+fn switching_to_an_empty_workspace_gives_focus_to_the_desktop_and_holds_it() {
+    // The sliver on workspace 7: switching away from Chrome to an empty
+    // workspace left Chrome key, the backend spares the focused app when it
+    // hides apps, and Chrome's windows parked for other workspaces lined the
+    // screen's left edge. The desktop takes focus instead, granted before
+    // the switch so the hiding that follows finds nobody to spare; when the
+    // app takes focus back, the desktop is re-granted rather than the app
+    // followed or anything grabbed.
+    let s = booted(&[1]);
+    let away = update(&s, &hotkey(HotkeyAction::WorkspaceNext)); // ws2 is empty
+    let on_a = |e: &Effect| matches!(e, Effect::FocusDesktop { display, .. } if *display == mid(1));
+    let desktop_at = away.effects.iter().position(on_a).expect("the desktop is granted");
+    let switch_at = away
+        .effects
+        .iter()
+        .position(|e| matches!(e, Effect::SwitchWorkspace { .. }))
+        .expect("the switch is issued");
+    assert!(desktop_at < switch_at, "{:?}", away.effects);
+    assert_eq!(away.state.focus_intent(), FocusIntent::Desktop);
+
+    let world = |focused| observed(vec![mon_a(2), mon_b(2)], std_windows(), focused, RescanTrigger::Periodic);
+    let landed = update(&away.state, &world(None));
+    assert!(landed.effects.is_empty(), "{:?}", landed.effects);
+
+    let churn = update(&landed.state, &world(Some(1)));
+    assert!(focus_targets(&churn.effects).is_empty());
+    assert_eq!(count_switches(&churn.effects), 0, "never followed back");
+    assert!(churn.effects.iter().any(on_a), "{:?}", churn.effects);
 }
 
 #[test]
@@ -1029,18 +1076,20 @@ fn closing_a_window_never_follows_focus_to_another_workspace() {
 
 #[test]
 fn confirmed_switch_is_attributed_to_ourselves() {
+    // To the empty workspace 2, whose desktop takes focus.
     let s = booted(&[1]);
-    let step = update(&s, &hotkey(HotkeyAction::WorkspaceNext)); // op 1
+    let step = update(&s, &hotkey(HotkeyAction::WorkspaceNext));
+    let op = switch_op(&step.effects);
     let obs = update(
         &step.state,
         &observed(
             vec![mon_a(2), mon_b(2)],
             std_windows(),
-            Some(1),
-            RescanTrigger::PostEffect { op: OpId(1) },
+            None,
+            RescanTrigger::PostEffect { op },
         ),
     );
-    assert!(obs.notes.contains(&Note::SelfConfirmed { op: OpId(1) }));
+    assert!(obs.notes.contains(&Note::SelfConfirmed { op }));
     assert!(!obs.notes.iter().any(|n| matches!(n, Note::External { .. })));
     assert!(obs.effects.is_empty());
     assert!(obs.state.pending.is_empty());
@@ -1301,7 +1350,8 @@ fn a_grant_the_app_answers_slowly_is_confirmed_not_re_issued() {
 #[test]
 fn unconfirmed_ops_expire_as_lost() {
     let s = booted(&[1]);
-    let mut step = update(&s, &hotkey(HotkeyAction::WorkspaceNext)); // op 1
+    let mut step = update(&s, &hotkey(HotkeyAction::WorkspaceNext));
+    let op = switch_op(&step.effects);
     let mut lost = false;
     // Long enough for the expectation's TTL to run out at TICK_MS per event.
     for _ in 0..5 {
@@ -1310,11 +1360,11 @@ fn unconfirmed_ops_expire_as_lost() {
             &observed(
                 vec![mon_a(1), mon_b(1)],
                 std_windows(),
-                Some(1),
+                None,
                 RescanTrigger::Periodic,
             ),
         );
-        lost |= step.notes.contains(&Note::OpLost { op: OpId(1) });
+        lost |= step.notes.contains(&Note::OpLost { op });
     }
     assert!(lost);
     assert!(step.state.pending.is_empty());
@@ -1324,19 +1374,20 @@ fn unconfirmed_ops_expire_as_lost() {
 fn executor_failure_drops_the_pending_op() {
     let s = booted(&[1]);
     let step = update(&s, &hotkey(HotkeyAction::WorkspaceNext));
+    let op = switch_op(&step.effects);
     let failed = update(
         &step.state,
         &Event::EffectResult {
             at: ts(),
-            op: OpId(1),
+            op,
             outcome: OpOutcome::Failed {
                 detail: "gesture failed".into(),
             },
         },
     );
-    assert!(failed.state.pending.is_empty());
+    assert!(!failed.state.pending.iter().any(|p| p.op == op));
     assert!(failed.notes.contains(&Note::OpFailed {
-        op: OpId(1),
+        op,
         detail: "gesture failed".into(),
     }));
 }
@@ -2036,20 +2087,22 @@ fn a_fling_after_a_birth_on_an_empty_workspace_is_reasserted_not_followed() {
     let s = booted(&[1]);
     let away = update(&s, &hotkey(HotkeyAction::WorkspaceNext)); // ws2 is empty
     assert!(focus_targets(&away.effects).is_empty());
-    assert_eq!(away.state.focus_intent(), FocusIntent::Deferred);
+    assert_eq!(away.state.focus_intent(), FocusIntent::Desktop);
 
-    // Parked: focus still sits on hidden w1 with nothing here to pull it to.
+    // Parked: the desktop has focus, and nothing here to pull it anywhere.
     let parked = update(
         &away.state,
         &observed(
             vec![mon_a(2), mon_b(2)],
             std_windows(),
-            Some(1),
-            RescanTrigger::PostEffect { op: OpId(1) },
+            None,
+            RescanTrigger::PostEffect {
+                op: switch_op(&away.effects),
+            },
         ),
     );
     assert_eq!(count_switches(&parked.effects), 0);
-    assert!(focus_targets(&parked.effects).is_empty());
+    assert!(parked.effects.is_empty());
 
     let mut wins = std_windows();
     wins.push(win(9, 300, 2, rect(100.0, 100.0)));

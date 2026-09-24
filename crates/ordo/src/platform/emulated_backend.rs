@@ -68,6 +68,10 @@ impl Desktop for AxDesktop {
         ax::focused_window()
     }
 
+    fn frontmost_app(&self) -> Option<Pid> {
+        ax::frontmost_app()
+    }
+
     fn main_display(&self) -> Rect {
         let displays = display::active_displays();
         displays

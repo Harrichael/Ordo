@@ -43,7 +43,8 @@ The two rules that make it work:
 - **Workspace switching**: `Cmd+Left` / `Cmd+Right` to the adjacent workspace,
   or `Cmd+Alt+1`…`Cmd+Alt+9` to jump straight to one. The arrows are swallowed
   while Ordo is engaged; the digits are Alt-qualified so apps keep their
-  `Cmd`-digit tab switching.
+  `Cmd`-digit tab switching. An empty workspace gets the desktop as focus, so
+  the app you left can be hidden along with the rest.
 - **Menu bar item**: a mark per workspace — the current one a pill with its
   number, the others dots, solid where windows live and hollow where none do.
   When there are more virtual monitors than displays, a small screen per

@@ -103,6 +103,9 @@ pub trait Desktop {
     fn show_apps(&self, apps: &[Unhide]) -> Vec<HoldStat>;
 
     fn focused_window(&self) -> Option<WindowId>;
+    /// The active app, whether or not a window of it is key — Finder holding
+    /// the desktop has none.
+    fn frontmost_app(&self) -> Option<Pid>;
     /// The main display's frame — where a re-homed window must land, because
     /// that is where the user is looking.
     fn main_display(&self) -> Rect;

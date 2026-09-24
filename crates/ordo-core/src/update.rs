@@ -517,6 +517,22 @@ fn execute(s: &mut State, cmd: Command, now_ns: u64, fx: &mut Vec<Effect>) -> Fo
                     });
                 }
             }
+            // An empty workspace is still a place to be: the desktop takes
+            // focus, as on an empty monitor — the anchor's display, the one
+            // a desktop declaration holds and new windows are corralled onto.
+            // Left with the app it had, that app could never be hidden, and
+            // its windows parked for other workspaces would line the screen's
+            // edge.
+            let desktop = match head {
+                Some(_) => None,
+                None => s
+                    .virtual_monitors
+                    .and_then(|v| s.host_of(v.viewed))
+                    .or_else(|| s.focused_monitor()),
+            };
+            if let Some(display) = desktop {
+                push_desktop(s, display, now_ns, fx);
+            }
             if let Some(vm) = view {
                 push_view(s, vm, now_ns, fx);
             }
@@ -533,9 +549,11 @@ fn execute(s: &mut State, cmd: Command, now_ns: u64, fx: &mut Vec<Effect>) -> Fo
             fx.push(Effect::RequestRescan {
                 reason: RescanTrigger::PostEffect { op },
             });
-            // An empty destination has nothing that could hold focus; whatever
-            // the OS keeps key is its business until something is born here.
-            head.map_or(FocusIntent::Deferred, FocusIntent::Window)
+            match (head, desktop) {
+                (Some(fw), _) => FocusIntent::Window(fw),
+                (None, Some(_)) => FocusIntent::Desktop,
+                (None, None) => FocusIntent::Deferred,
+            }
         }
 
         Command::Carry { window, target } => {

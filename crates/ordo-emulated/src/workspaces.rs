@@ -1334,10 +1334,13 @@ impl EmulatedWorkspaces {
     /// `showhidden` pref, "hidden" renders as a translucent icon — the
     /// closest macOS gets to a per-workspace Dock.
     ///
-    /// The app owning the focused window is never hidden: hiding the active
-    /// app makes macOS fling focus somewhere arbitrary. Core-side, switches
-    /// hand focus to the destination before this runs, so the exemption
-    /// almost never bites; when it does, the app just stays undimmed.
+    /// The front app is never hidden: hiding the active app makes macOS fling
+    /// focus somewhere arbitrary. That is the front app, not the owner of the
+    /// key window — Finder holding the desktop has no key window, and hiding
+    /// it threw the desktop's focus away. Core-side, switches hand focus to
+    /// the destination (a window, or on an empty workspace the desktop)
+    /// before this runs, so the exemption almost never bites; when it does,
+    /// the app just stays undimmed.
     ///
     /// The un-hide carries the park origins of the app's windows declared
     /// elsewhere: revealing an app drags exactly those back on screen unless
@@ -1357,9 +1360,7 @@ impl EmulatedWorkspaces {
                 *here_by_app.entry(*pid).or_insert(false) |= self.ledger.visible(*window, &proj);
             }
         }
-        let focused_app = d
-            .focused_window()
-            .and_then(|w| frames.get(&w).map(|(p, _)| *p));
+        let focused_app = d.frontmost_app();
         // Each app's windows that are NOT on screen: the ones an unhide
         // reveals along with the wanted one, so also the ones it has to be
         // told to hold — and where. The park REQUEST is the anchor when there
@@ -1720,6 +1721,9 @@ mod tests {
         /// or replugs, re-homing as macOS does.
         displays: std::cell::RefCell<Vec<Rect>>,
         focused: std::cell::Cell<Option<WindowId>>,
+        /// An active app with no key window (Finder on the desktop); else the
+        /// front app is the focused window's.
+        front: std::cell::Cell<Option<Pid>>,
     }
 
     impl FakeDesktop {
@@ -1734,6 +1738,7 @@ mod tests {
                 hidden: std::cell::RefCell::new(HashSet::new()),
                 displays: std::cell::RefCell::new(vec![MAIN, SECOND]),
                 focused: std::cell::Cell::new(None),
+                front: std::cell::Cell::new(None),
             }
         }
 
@@ -1955,6 +1960,13 @@ mod tests {
 
         fn focused_window(&self) -> Option<WindowId> {
             self.focused.get()
+        }
+
+        fn frontmost_app(&self) -> Option<Pid> {
+            self.front.get().or_else(|| {
+                let w = self.focused.get()?;
+                self.windows.borrow().get(&w).map(|(p, _)| *p)
+            })
         }
 
         fn main_display(&self) -> Rect {
@@ -2953,6 +2965,24 @@ mod tests {
             .any(|t| t.kind == ParkTraceKind::Rehost && t.window == w(2)));
         // Belief and screen agree, so the core sees no promise to re-host.
         assert!(b.believed_frames(&d, &frames_of(&d)).is_empty());
+    }
+
+    /// A switch to an empty workspace hands focus to the desktop: Finder is
+    /// then the front app with no window key. Hiding spares the front app, so
+    /// Finder stays; spared by key window instead, it was hidden and the
+    /// desktop's focus thrown somewhere arbitrary.
+    #[test]
+    fn the_front_app_is_never_hidden_even_with_no_window_key() {
+        let d = FakeDesktop::new(&[
+            (w(1), Pid(10), rect(100.0, 100.0)),
+            (w(3), Pid(30), rect(300.0, 300.0)),
+        ]);
+        let mut b = EmulatedWorkspaces::new(3);
+        rescan(&d, &mut b);
+        d.front.set(Some(Pid(30)));
+        b.switch_workspace(&d, ws(2));
+        assert!(d.is_hidden(Pid(10)));
+        assert!(!d.is_hidden(Pid(30)), "the front app is spared");
     }
 
     /// Unplugging piles windows onto the laptop: two staggered windows on
