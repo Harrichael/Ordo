@@ -194,6 +194,9 @@ pub struct EmulatedWorkspaces {
     /// and the core, seeing the windows where the laptop had them, would
     /// carry them over proportionally itself.
     homecoming: HashMap<WindowId, Rect>,
+    /// The display set changed during a scan that saw no windows (a locked
+    /// screen): the next scan that does see them is still the replug's pass.
+    replug_unseen: bool,
     /// Diagnostic record of what this model did to windows' frames, drained by
     /// the shell each snapshot. See [`crate::trace`] for why it must exist:
     /// every other channel sees the substituted belief, so without this the
@@ -219,6 +222,7 @@ impl EmulatedWorkspaces {
             suspended: false,
             learn_monitors: false,
             homecoming: HashMap::new(),
+            replug_unseen: false,
             trace: Vec::new(),
         }
     }
@@ -289,11 +293,13 @@ impl EmulatedWorkspaces {
         let mut dirty = self.note_displays(d, &g);
         let replugged = dirty && known;
         if windows.is_empty() {
+            self.replug_unseen |= replugged;
             if dirty {
                 self.persist();
             }
             return;
         }
+        let replugged = replugged || std::mem::take(&mut self.replug_unseen);
         let before = self.ledger.window_claims();
         let absent: Vec<WindowId> = self
             .ledger
@@ -836,8 +842,12 @@ impl EmulatedWorkspaces {
     pub fn enforce_placement(&mut self, d: &dyn Desktop, frames: &HashMap<WindowId, (Pid, Rect)>) {
         let g = Geometry::read(d);
         // Displays asleep: the projection would host nothing and every window
-        // would read as hidden. Not a world to assert anything against.
-        if g.displays.is_empty() {
+        // would read as hidden. Not a world to assert anything against. Nor is
+        // a scan that saw no windows at all — a locked screen reports displays
+        // but no app's windows — and it must not use up a display change
+        // either: plugged in while locked, the change is noticed blind, and
+        // the windows it moves are only seen once the screen unlocks.
+        if g.displays.is_empty() || frames.is_empty() {
             return;
         }
         let systemic = self.last_geometry.as_ref().is_some_and(|prev| *prev != g);
@@ -1247,10 +1257,12 @@ impl EmulatedWorkspaces {
         frames: &HashMap<WindowId, (Pid, Rect)>,
         g: &Geometry,
     ) -> Option<(Pid, WindowId, Rect)> {
+        // Unseen is not restored: forgetting it was parked would leave it at
+        // the corner with nothing left to say it needs bringing back.
+        let (pid, f) = frames.get(&window)?;
         let was_parked = self.parked.remove(&window);
         self.enforce_attempts.remove(&window);
         self.pending_repark.remove(&window);
-        let (pid, f) = frames.get(&window)?;
         // Restoring is only meaningful for a window that needs it: bookkept
         // parked, or physically at the corner. A window already standing
         // visible (a carried resident, a corrective toward the current
@@ -3174,6 +3186,36 @@ mod tests {
         assert_eq!(d.frame(w(3)), rect(300.0, 300.0), "hidden while undocked, back home");
         assert_eq!(b.home[&w(1)], rect(100.0, 100.0));
         assert_eq!(b.home[&w(3)], rect(300.0, 300.0));
+    }
+
+    /// Undocked while viewing monitor 2, so the laptop shows monitor 2 and
+    /// monitor 1 waits parked. The monitors go in while the screen is locked:
+    /// the displays change during scans that see no windows at all. That
+    /// blindness is not an empty desktop — once the windows are seen again,
+    /// monitor 1 comes up on the laptop and monitor 2 goes back to its
+    /// display, not left for a switch away and back to replay.
+    #[test]
+    fn replugging_while_blind_brings_both_monitors_back_once_seen() {
+        let d = FakeDesktop::new(&[
+            (w(1), Pid(10), rect(100.0, 100.0)),
+            (w(2), Pid(20), rect(2000.0, 100.0)),
+        ]);
+        let mut b = EmulatedWorkspaces::new(3);
+        rescan(&d, &mut b);
+        d.focused.set(Some(w(2)));
+        d.set_displays(&[MAIN]);
+        rescan(&d, &mut b);
+        assert_eq!(b.monitors().viewed, vm(2));
+        assert!(in_park_corner(&d.frame(w(1)), &geo()), "monitor 1 waits parked");
+
+        d.set_displays(&[MAIN, SECOND]);
+        let blind = HashMap::new();
+        b.note_scan(&d, &blind);
+        b.enforce_placement(&d, &blind);
+        rescan(&d, &mut b);
+
+        assert!(on(MAIN, d.frame(w(1))), "monitor 1 revealed: {:?}", d.frame(w(1)));
+        assert!(on(SECOND, d.frame(w(2))), "monitor 2 home: {:?}", d.frame(w(2)));
     }
 
     #[test]
