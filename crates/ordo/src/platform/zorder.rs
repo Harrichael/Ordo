@@ -385,6 +385,7 @@ pub fn reassert_stack(
             aborted: aborted.get(),
             ghost_pass: false,
             refocused,
+            start_order: present,
             raises: Vec::new(),
         });
     }
@@ -497,6 +498,7 @@ pub fn reassert_stack(
         aborted: aborted.get(),
         ghost_pass: false, // the worker marks its ghost-watch reruns
         refocused,
+        start_order: present,
         raises,
     })
 }

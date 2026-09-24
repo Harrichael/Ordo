@@ -67,6 +67,11 @@ pub enum ParkTraceKind {
     /// its park spot. Says whether the hide itself moves parked windows, or
     /// they move later (then the next scan's `Reassert` is the first sign).
     OffAfterHide,
+    /// The stacking order of the ledger's on-screen windows, front to back,
+    /// at a named moment of a switch. A switch's hides and un-hides reorder
+    /// windows as a side effect, and nothing else records the order they
+    /// leave behind for the stacking worker to repair.
+    Stack,
 }
 
 /// What holding an app's parked windows through its un-hide cost.

@@ -511,6 +511,7 @@ impl EmulatedWorkspaces {
             plan.restore.len(),
             plan.rehost.len()
         )));
+        self.note_stack(d, "before");
         let mut writes = Vec::new();
         for w in plan.park {
             writes.extend(self.park(w, None, &frames, &g));
@@ -524,6 +525,22 @@ impl EmulatedWorkspaces {
         self.persist();
         self.move_windows(d, &writes);
         self.apply_app_visibility(d, &frames, &g);
+        self.note_stack(d, "after un-hides");
+    }
+
+    fn note_stack(&mut self, d: &dyn Desktop, moment: &str) {
+        let ids: Vec<String> = d
+            .stack()
+            .into_iter()
+            .filter(|w| self.ledger.claim(*w).is_some())
+            .map(|w| w.0.to_string())
+            .collect();
+        let current = self.ledger.current();
+        self.note(
+            ParkTrace::new(WindowId(0), ParkTraceKind::Stack)
+                .ws(current, current)
+                .detail(format!("{moment}: {}", ids.join(" "))),
+        );
     }
 
     pub fn switch_workspace(&mut self, d: &dyn Desktop, target: WorkspaceId) {
@@ -1986,6 +2003,19 @@ mod tests {
             Some(self.hidden.borrow().contains(&pid))
         }
 
+        fn stack(&self) -> Vec<WindowId> {
+            let hidden = self.hidden.borrow();
+            let mut ids: Vec<WindowId> = self
+                .windows
+                .borrow()
+                .iter()
+                .filter(|(_, (p, _))| !hidden.contains(p))
+                .map(|(w, _)| *w)
+                .collect();
+            ids.sort_by_key(|w| w.0);
+            ids
+        }
+
         fn window_frames(&self, pid: Pid, windows: &[WindowId]) -> Vec<(WindowId, Rect)> {
             let ws = self.windows.borrow();
             windows
@@ -2158,6 +2188,31 @@ mod tests {
             .find(|t| t.kind == ParkTraceKind::AppHidden && t.pid == Some(Pid(10)))
             .expect("the hide is traced");
         assert!(hidden.detail.as_deref().unwrap().ends_with("1 off their spot"));
+    }
+
+    /// Hides and un-hides reorder windows behind the stacking worker's back,
+    /// so a switch records the order it started from and the one its
+    /// un-hides left — a hidden app's windows drop out of the second.
+    #[test]
+    fn a_switch_traces_the_stack_before_it_and_after_its_unhides() {
+        let d = FakeDesktop::new(&[
+            (w(1), Pid(10), rect(100.0, 100.0)),
+            (w(2), Pid(20), rect(300.0, 200.0)),
+        ]);
+        let mut b = EmulatedWorkspaces::new(3);
+        b.note_scan(&d, &d.scan());
+        b.assign_window_to_workspace(w(2), ws(2)).unwrap();
+        b.take_trace();
+
+        b.switch_workspace(&d, ws(2));
+
+        let stacks: Vec<_> = b
+            .take_trace()
+            .into_iter()
+            .filter(|t| t.kind == ParkTraceKind::Stack)
+            .filter_map(|t| t.detail)
+            .collect();
+        assert_eq!(stacks, ["before: 1 2", "after un-hides: 2"]);
     }
 
     /// A parked window found off its park says whether its app was still

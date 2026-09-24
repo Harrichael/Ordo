@@ -16,7 +16,7 @@ use crate::backend::{
     BackendError, BackendTopology, Capabilities, MonitorWorkspace, Result, WorkspaceBackend,
 };
 
-use super::{ax, display};
+use super::{ax, display, zorder};
 
 /// The AX/CG implementation of the emulated crate's `Desktop` port.
 struct AxDesktop;
@@ -39,6 +39,10 @@ impl Desktop for AxDesktop {
 
     fn app_hidden(&self, pid: Pid) -> Option<bool> {
         ax::app_hidden(pid)
+    }
+
+    fn stack(&self) -> Vec<WindowId> {
+        zorder::stack_front_to_back()
     }
 
     fn window_frames(&self, pid: Pid, windows: &[WindowId]) -> Vec<(WindowId, Rect)> {

@@ -33,7 +33,7 @@
 use rusqlite::{Connection, Transaction};
 
 /// The schema version this build writes and understands.
-pub const CURRENT_VERSION: i32 = 5;
+pub const CURRENT_VERSION: i32 = 6;
 
 type Migration = fn(&Transaction) -> rusqlite::Result<()>;
 
@@ -43,6 +43,7 @@ const MIGRATIONS: &[Migration] = &[
     m3_hotkey_batches,
     m4_snapshots,
     m5_restack_refocused,
+    m6_restack_start_order,
 ];
 
 /// Read the version of an existing log, refusing one written by a newer Ordo.
@@ -175,6 +176,10 @@ CREATE TABLE snapshots (
 
 fn m5_restack_refocused(tx: &Transaction) -> rusqlite::Result<()> {
     tx.execute_batch("ALTER TABLE restacks ADD COLUMN refocused INTEGER NOT NULL DEFAULT 0;")
+}
+
+fn m6_restack_start_order(tx: &Transaction) -> rusqlite::Result<()> {
+    tx.execute_batch("ALTER TABLE restacks ADD COLUMN start_order TEXT NOT NULL DEFAULT '';")
 }
 
 /// Version 1: the schema as it first shipped. Frozen — see the module rules.
@@ -474,6 +479,7 @@ CREATE INDEX events_by_kind ON events(run_id, kind);
         assert!(columns(&conn, "restacks").contains(&"ghost_pass".to_string()));
         assert!(columns(&conn, "raises").contains(&"via_event".to_string()));
         assert!(columns(&conn, "restacks").contains(&"refocused".to_string()));
+        assert!(columns(&conn, "restacks").contains(&"start_order".to_string()));
     }
 
     #[test]

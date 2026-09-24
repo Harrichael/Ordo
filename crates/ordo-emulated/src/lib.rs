@@ -90,6 +90,10 @@ pub trait Desktop {
     /// it doesn't answer.
     fn app_hidden(&self, pid: Pid) -> Option<bool>;
 
+    /// On-screen windows front to back, per the window server. A hidden
+    /// app's windows are not in it.
+    fn stack(&self) -> Vec<WindowId>;
+
     /// Un-hide these apps, HOLDING each one's listed windows at the given
     /// origin until the desktop agrees they are there.
     ///

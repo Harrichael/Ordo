@@ -114,6 +114,9 @@ pub struct RestackStats {
     /// elsewhere: after the un-hides resurfaced, and at the final read-back.
     /// How often a switch's own focus request was stolen.
     pub refocused: u32,
+    /// The desired windows as they stood, front to back, once the un-hides
+    /// had resurfaced them: the order this reassert set out to repair.
+    pub start_order: Vec<WindowId>,
     pub raises: Vec<RaiseStat>,
 }
 
