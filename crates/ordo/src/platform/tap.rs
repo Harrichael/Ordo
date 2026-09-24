@@ -179,7 +179,7 @@ unsafe extern "C-unwind" fn callback(
         }
         Some(chord) if ctx.intercepting.load(Ordering::Relaxed) => match chord {
             Chord::Hotkey(action) => {
-                let _ = ctx.tx.send(Msg::Hotkey(action));
+                let _ = ctx.tx.send(Msg::hotkey(action));
                 std::ptr::null_mut()
             }
             Chord::RescueCandidate => {

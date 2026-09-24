@@ -7,6 +7,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use ordo::clock::Clock;
 use ordo::engine::{Engine, Msg};
@@ -669,7 +670,7 @@ fn a_gesture_keeps_its_place_between_hotkeys_and_replays_clean() {
         let run_id = logger.run_id();
         let engine = engine_on(&os, logger);
         let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
-        tx.send(Msg::Hotkey(HotkeyAction::WorkspaceNext)).unwrap();
+        tx.send(Msg::hotkey(HotkeyAction::WorkspaceNext)).unwrap();
         tx.send(Msg::Gesture(Gesture::MouseDown {
             at: ordo_core::Point {
                 x: 960.0,
@@ -677,7 +678,7 @@ fn a_gesture_keeps_its_place_between_hotkeys_and_replays_clean() {
             },
         }))
         .unwrap();
-        tx.send(Msg::Hotkey(HotkeyAction::WorkspaceNext)).unwrap();
+        tx.send(Msg::hotkey(HotkeyAction::WorkspaceNext)).unwrap();
         tx.send(Msg::Shutdown).unwrap();
         engine.run(rx);
         run_id
@@ -711,6 +712,53 @@ fn a_gesture_keeps_its_place_between_hotkeys_and_replays_clean() {
     );
     let report = replay(&conn, run_id, None).unwrap();
     assert!(report.is_clean(), "{:?}", report.mismatches);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Presses that queue behind the engine are one burst: they fold into a single
+/// switch, and the log keeps what the core event can't — how many there were
+/// and how long they waited — since the core stamps hotkeys at dequeue.
+#[test]
+fn a_queued_burst_is_logged_with_its_presses_and_their_wait() {
+    let dir = std::env::temp_dir().join(format!("ordo-burst-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = dir.join("burst.db");
+    let _ = std::fs::remove_file(&db);
+    let os = fake_os(FocusPolicy::Lands);
+    {
+        let logger = Logger::open(&db, "test", "emulated", 1_000).unwrap();
+        let engine = engine_on(&os, logger);
+        let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
+        let now = Instant::now();
+        for ago in [300, 100] {
+            tx.send(Msg::Hotkey(
+                HotkeyAction::WorkspaceNext,
+                now - Duration::from_millis(ago),
+            ))
+            .unwrap();
+        }
+        tx.send(Msg::Shutdown).unwrap();
+        engine.run(rx);
+    }
+    assert_eq!(os.borrow().active, WorkspaceId(3));
+    let conn = Connection::open(&db).unwrap();
+    let (seq, presses, pumped, oldest, newest): (Option<i64>, i64, i64, i64, i64) = conn
+        .query_row(
+            "SELECT seq, presses, pumped, oldest_wait_ms, newest_wait_ms FROM hotkey_batches",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .unwrap();
+    assert_eq!((presses, pumped), (2, 1));
+    assert!(oldest >= 300 && newest >= 100 && newest < oldest);
+    let kind: String = conn
+        .query_row(
+            "SELECT kind FROM events WHERE seq = ?1",
+            [seq.expect("a batch that pumped names its event")],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(kind, "hotkey");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -843,7 +891,7 @@ fn the_menu_bar_shows_every_workspace_and_follows_a_pick_from_its_menu() {
     let seen = menu_bar_views(
         &os,
         vec![
-            Msg::Hotkey(HotkeyAction::WorkspaceSwitchTo(WorkspaceId(2))),
+            Msg::hotkey(HotkeyAction::WorkspaceSwitchTo(WorkspaceId(2))),
             Msg::Rescue,
         ],
     );
@@ -897,7 +945,7 @@ fn the_menu_bar_shows_which_monitor_the_one_display_is_showing() {
             }
         }
     }
-    let seen = menu_bar_views(&os, vec![Msg::Hotkey(HotkeyAction::ViewMonitorNext)]);
+    let seen = menu_bar_views(&os, vec![Msg::hotkey(HotkeyAction::ViewMonitorNext)]);
     let monitors: Vec<_> = seen.into_iter().map(|v| v.monitors.unwrap()).collect();
     assert_eq!(
         monitors,
@@ -907,3 +955,4 @@ fn the_menu_bar_shows_which_monitor_the_one_display_is_showing() {
         ]
     );
 }
+

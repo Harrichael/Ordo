@@ -15,6 +15,7 @@
 //! testable cascade rather than a race across threads.
 
 use std::collections::VecDeque;
+use std::time::Instant;
 
 use crossbeam_channel::Receiver;
 use ordo_core::{
@@ -22,7 +23,7 @@ use ordo_core::{
 };
 
 use crate::clock::Clock;
-use crate::logger::Logger;
+use crate::logger::{HotkeyBatch, Logger};
 use crate::ports::{Effector, RestackStats, WorldSource};
 
 /// What the outside world sends the engine. Producers (the tap thread, the
@@ -30,7 +31,10 @@ use crate::ports::{Effector, RestackStats, WorldSource};
 /// the engine stamps time and turns each into a core [`Event`]. Keeping the
 /// clock on this side is what lets producers stay clock-free.
 pub enum Msg {
-    Hotkey(HotkeyAction),
+    /// Carries the moment of the press, which only telemetry reads: the core
+    /// event is stamped at dequeue like every other, so replay never depends
+    /// on it. Build with [`Msg::hotkey`].
+    Hotkey(HotkeyAction, Instant),
     /// A focus-moving user gesture the tap witnessed and passed through (a
     /// click, Cmd+Tab). Not a hotkey: nothing is executed for it, but it is
     /// intent, and its place in the order relative to hotkeys and snapshots
@@ -55,6 +59,12 @@ pub enum Msg {
     /// event tap) hold sender clones that outlive shutdown, so channel-close
     /// alone can't end the loop.
     Shutdown,
+}
+
+impl Msg {
+    pub fn hotkey(action: HotkeyAction) -> Msg {
+        Msg::Hotkey(action, Instant::now())
+    }
 }
 
 /// A single external event can only spawn so many internal follow-ups before
@@ -159,10 +169,10 @@ impl Engine {
             while let Ok(m) = rx.try_recv() {
                 batch.push(m);
             }
-            let mut hotkeys: Vec<HotkeyAction> = Vec::new();
+            let mut hotkeys: Vec<(HotkeyAction, Instant)> = Vec::new();
             for m in batch {
                 match m {
-                    Msg::Hotkey(action) => hotkeys.push(action),
+                    Msg::Hotkey(action, pressed) => hotkeys.push((action, pressed)),
                     // Deliberately NOT a coalescing fence: worker stats land
                     // mid-burst by construction (each burst switch aborts its
                     // predecessor's reassert, which reports back during the
@@ -209,7 +219,7 @@ impl Engine {
                             }
                             Msg::SaveState => self.effector.persist_workspaces(),
                             Msg::Shutdown => break 'recv,
-                            Msg::Hotkey(_) | Msg::RestackStats(_) => {
+                            Msg::Hotkey(..) | Msg::RestackStats(_) => {
                                 unreachable!("handled above")
                             }
                         }
@@ -222,14 +232,36 @@ impl Engine {
         let _ = self.logger.close(self.clock.now().wall_ms);
     }
 
-    fn flush_hotkeys(&mut self, hotkeys: &mut Vec<HotkeyAction>) {
-        for action in coalesce_hotkeys(&self.state, hotkeys) {
+    fn flush_hotkeys(&mut self, hotkeys: &mut Vec<(HotkeyAction, Instant)>) {
+        let (Some(oldest), Some(newest)) = (
+            hotkeys.iter().map(|h| h.1).min(),
+            hotkeys.iter().map(|h| h.1).max(),
+        ) else {
+            return;
+        };
+        let presses = hotkeys.len();
+        let actions: Vec<HotkeyAction> = hotkeys.drain(..).map(|h| h.0).collect();
+        let oldest_wait = oldest.elapsed();
+        let newest_wait = newest.elapsed();
+        let first_seq = self.logger.next_seq();
+        let coalesced = coalesce_hotkeys(&self.state, &actions);
+        let pumped = coalesced.len();
+        for action in coalesced {
             self.pump(Event::Hotkey {
                 at: self.clock.now(),
                 action,
             });
         }
-        hotkeys.clear();
+        let _ = self.logger.log_hotkey_batch(
+            &HotkeyBatch {
+                first_seq: (pumped > 0).then_some(first_seq),
+                presses,
+                pumped,
+                oldest_wait,
+                newest_wait,
+            },
+            self.clock.now().wall_ms,
+        );
     }
 
     /// Fully react to one external event, including any internal rescans and

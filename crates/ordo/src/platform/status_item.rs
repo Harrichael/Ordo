@@ -472,7 +472,7 @@ define_class!(
                 .ivars()
                 .mailbox
                 .tx
-                .send(Msg::Hotkey(HotkeyAction::WorkspaceSwitchTo(WorkspaceId(n))));
+                .send(Msg::hotkey(HotkeyAction::WorkspaceSwitchTo(WorkspaceId(n))));
         }
     }
 
@@ -515,7 +515,7 @@ impl Controller {
             MonitorMap::new(
                 self.mtm(),
                 Box::new(move |from, into| {
-                    let _ = tx.send(Msg::Hotkey(HotkeyAction::MergeMonitors { from, into }));
+                    let _ = tx.send(Msg::hotkey(HotkeyAction::MergeMonitors { from, into }));
                 }),
             )
         })

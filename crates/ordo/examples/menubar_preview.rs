@@ -59,7 +59,7 @@ fn main() {
     menubar.show(view);
     std::thread::spawn(move || {
         while let Ok(msg) = rx.recv() {
-            if let Msg::Hotkey(HotkeyAction::WorkspaceSwitchTo(ws)) = msg {
+            if let Msg::Hotkey(HotkeyAction::WorkspaceSwitchTo(ws), _) = msg {
                 println!("picked workspace {}", ws.0);
             }
         }

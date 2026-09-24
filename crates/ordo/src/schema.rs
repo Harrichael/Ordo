@@ -33,11 +33,11 @@
 use rusqlite::{Connection, Transaction};
 
 /// The schema version this build writes and understands.
-pub const CURRENT_VERSION: i32 = 2;
+pub const CURRENT_VERSION: i32 = 3;
 
 type Migration = fn(&Transaction) -> rusqlite::Result<()>;
 
-const MIGRATIONS: &[Migration] = &[m1_baseline, m2_restack_telemetry];
+const MIGRATIONS: &[Migration] = &[m1_baseline, m2_restack_telemetry, m3_hotkey_batches];
 
 /// Read the version of an existing log, refusing one written by a newer Ordo.
 ///
@@ -130,6 +130,22 @@ fn m2_restack_telemetry(tx: &Transaction) -> rusqlite::Result<()> {
         }
     }
     Ok(())
+}
+
+fn m3_hotkey_batches(tx: &Transaction) -> rusqlite::Result<()> {
+    tx.execute_batch(
+        r#"
+CREATE TABLE hotkey_batches (
+    run_id         INTEGER NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+    wall_ms        INTEGER NOT NULL,
+    seq            INTEGER,
+    presses        INTEGER NOT NULL,
+    pumped         INTEGER NOT NULL,
+    oldest_wait_ms INTEGER NOT NULL,
+    newest_wait_ms INTEGER NOT NULL
+);
+"#,
+    )
 }
 
 /// Version 1: the schema as it first shipped. Frozen — see the module rules.
@@ -420,6 +436,7 @@ CREATE INDEX events_by_kind ON events(run_id, kind);
             "park_trace",
             "restacks",
             "raises",
+            "hotkey_batches",
         ] {
             assert!(!columns(&conn, table).is_empty(), "{table} missing");
         }

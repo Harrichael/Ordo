@@ -16,9 +16,11 @@
 //! payload rather than a side table: it keeps replay a single read, and a
 //! personal-scale DB does not need the denormalization.
 //!
-//! One side channel is telemetry, not record: `restacks`/`raises` hold the
+//! Some side channels are telemetry, not record, there to answer a future
+//! statistics question rather than to replay: `restacks`/`raises` hold the
 //! z-order reassert's timing breakdown (see [`crate::ports::RestackStats`]),
-//! there to answer a future statistics question, not to replay.
+//! and `hotkey_batches` holds how long presses queued behind the engine and
+//! how many a burst folded away (see [`HotkeyBatch`]).
 
 use std::path::{Path, PathBuf};
 
@@ -37,6 +39,19 @@ const CHECKPOINT_EVERY: u64 = 200;
 /// Runs older than this are pruned on startup. Long enough to investigate a
 /// bug you noticed a week and a half ago; short enough to bound disk use.
 const RETENTION_DAYS: i64 = 14;
+
+/// One batch of queued hotkeys, as the engine dequeued it. The core's hotkey
+/// events are stamped at dequeue, so this is the only record of time spent
+/// waiting behind the engine's previous work.
+pub struct HotkeyBatch {
+    /// The first hotkey event the batch pumped; None when it folded to
+    /// nothing (a bounce that returned to where it started).
+    pub first_seq: Option<u64>,
+    pub presses: usize,
+    pub pumped: usize,
+    pub oldest_wait: std::time::Duration,
+    pub newest_wait: std::time::Duration,
+}
 
 pub struct Logger {
     conn: Connection,
@@ -107,6 +122,11 @@ impl Logger {
 
     pub fn run_id(&self) -> i64 {
         self.run_id
+    }
+
+    /// The sequence number the next logged step will get.
+    pub fn next_seq(&self) -> u64 {
+        self.seq
     }
 
     /// Record one engine step. Returns the event's sequence number so the
@@ -263,6 +283,24 @@ impl Logger {
             )?;
         }
         tx.commit()
+    }
+
+    pub fn log_hotkey_batch(&mut self, b: &HotkeyBatch, now_wall_ms: i64) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO hotkey_batches (run_id, wall_ms, seq, presses, pumped,
+                 oldest_wait_ms, newest_wait_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                self.run_id,
+                now_wall_ms,
+                b.first_seq.map(|s| s as i64),
+                b.presses as i64,
+                b.pumped as i64,
+                b.oldest_wait.as_millis() as i64,
+                b.newest_wait.as_millis() as i64,
+            ],
+        )?;
+        Ok(())
     }
 
     pub fn close(&mut self, now_wall_ms: i64) -> rusqlite::Result<()> {
