@@ -308,6 +308,8 @@ fn win(id: u32, pid: i32, x: f64) -> WindowSnap {
             h: 300.0,
         },
         subrole: None,
+        layer: None,
+        parent: None,
     }
 }
 

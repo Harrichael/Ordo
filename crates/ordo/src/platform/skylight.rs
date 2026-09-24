@@ -250,7 +250,7 @@ fn resolve_monitor(
 
 /// Build a CFArray of CFNumbers (window ids) with proper CF callbacks, so
 /// SkyLight retains them for the duration of its call.
-unsafe fn make_number_array(windows: &[WindowId]) -> Option<sys::CFArrayRef> {
+pub(crate) unsafe fn make_number_array(windows: &[WindowId]) -> Option<sys::CFArrayRef> {
     let mut numbers: Vec<*const c_void> = Vec::with_capacity(windows.len());
     for w in windows {
         let id = w.0 as i64;

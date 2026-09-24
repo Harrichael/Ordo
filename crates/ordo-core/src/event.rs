@@ -216,6 +216,16 @@ pub struct WindowSnap {
     /// still replay.
     #[serde(default)]
     pub subrole: Option<String>,
+    /// The window server's layer for it (0 for normal windows; panels and
+    /// notification-style windows sit higher), and the window it is a child
+    /// of, if any — a child moves with its parent, as a find bar or a hover
+    /// card does. Observations the core does not act on yet, logged so how
+    /// popups are handled is chosen from what apps actually do. Defaulted for
+    /// the same reason as `subrole`.
+    #[serde(default)]
+    pub layer: Option<i32>,
+    #[serde(default)]
+    pub parent: Option<WindowId>,
 }
 
 /// The workspace layer, as the backend tells it. Absence means UNKNOWN, never

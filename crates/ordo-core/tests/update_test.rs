@@ -140,6 +140,8 @@ fn win(id: u32, pid: i32, workspace: u8, frame: Rect) -> Win {
             title: format!("w{id}"),
             frame,
             subrole: None,
+            layer: None,
+            parent: None,
         },
         workspace: ws(workspace),
         monitor: None,

@@ -256,3 +256,62 @@ extern "C" {
     pub static kCFBooleanTrue: CFTypeRef;
     pub static kCFBooleanFalse: CFTypeRef;
 }
+
+pub type QueryWindowsFn = unsafe extern "C" fn(CgsConnectionId, CFArrayRef, c_int) -> CFTypeRef;
+pub type CopyWindowsFn = unsafe extern "C" fn(CFTypeRef) -> CFTypeRef;
+pub type AdvanceFn = unsafe extern "C" fn(CFTypeRef) -> bool;
+pub type IteratorIdFn = unsafe extern "C" fn(CFTypeRef) -> u32;
+
+/// The window-query iterator: per window, what the public CG list does not
+/// carry — the window it is a CHILD of, which it moves with (a find bar, a
+/// hover card). yabai's reading of these symbols.
+///
+/// Resolved at run time rather than linked, unlike everything above: a
+/// linked symbol that a macOS update removes stops Ordo from launching at
+/// all, while a resolved one that goes missing costs only this observation.
+#[derive(Clone, Copy)]
+pub struct WindowQuery {
+    pub query_windows: QueryWindowsFn,
+    pub copy_windows: CopyWindowsFn,
+    pub advance: AdvanceFn,
+    pub window_id: IteratorIdFn,
+    pub parent_id: IteratorIdFn,
+}
+
+extern "C" {
+    fn dlsym(handle: *mut c_void, symbol: *const std::os::raw::c_char) -> *mut c_void;
+}
+
+/// `RTLD_DEFAULT` on Darwin: search every image already loaded, SkyLight
+/// among them (this crate links it).
+const RTLD_DEFAULT: *mut c_void = -2isize as *mut c_void;
+
+impl WindowQuery {
+    pub fn resolve() -> Option<WindowQuery> {
+        unsafe fn sym(name: &std::ffi::CStr) -> Option<*mut c_void> {
+            let p = dlsym(RTLD_DEFAULT, name.as_ptr());
+            (!p.is_null()).then_some(p)
+        }
+        // SAFETY: each symbol is transmuted to the signature yabai declares
+        // for it; a null lookup has already returned None.
+        unsafe {
+            Some(WindowQuery {
+                query_windows: std::mem::transmute::<*mut c_void, QueryWindowsFn>(sym(
+                    c"SLSWindowQueryWindows",
+                )?),
+                copy_windows: std::mem::transmute::<*mut c_void, CopyWindowsFn>(sym(
+                    c"SLSWindowQueryResultCopyWindows",
+                )?),
+                advance: std::mem::transmute::<*mut c_void, AdvanceFn>(sym(
+                    c"SLSWindowIteratorAdvance",
+                )?),
+                window_id: std::mem::transmute::<*mut c_void, IteratorIdFn>(sym(
+                    c"SLSWindowIteratorGetWindowID",
+                )?),
+                parent_id: std::mem::transmute::<*mut c_void, IteratorIdFn>(sym(
+                    c"SLSWindowIteratorGetParentID",
+                )?),
+            })
+        }
+    }
+}

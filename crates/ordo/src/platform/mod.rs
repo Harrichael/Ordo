@@ -86,6 +86,10 @@ pub struct MacWorldSource {
     /// Drained by the engine after each `snapshot()`.
     trace: Vec<ParkTrace>,
     stats: Option<SnapshotStats>,
+    /// Each window's layer and parent, asked once, when it is first seen: they
+    /// are fixed at creation, and the asking costs a few milliseconds a
+    /// snapshot that re-asking every window would pay forever.
+    facts: HashMap<WindowId, zorder::ServerFacts>,
 }
 
 impl MacWorldSource {
@@ -101,6 +105,7 @@ impl MacWorldSource {
             last_raw: HashMap::new(),
             trace: Vec::new(),
             stats: None,
+            facts: HashMap::new(),
         }
     }
 }
@@ -186,6 +191,17 @@ impl WorldSource for MacWorldSource {
             })
             .collect();
 
+        let unseen: Vec<WindowId> = scan
+            .windows
+            .iter()
+            .map(|w| w.id)
+            .filter(|w| !self.facts.contains_key(w))
+            .collect();
+        if !unseen.is_empty() {
+            self.facts.extend(zorder::server_facts(&unseen));
+        }
+        self.facts.retain(|w, _| frames.contains_key(w));
+        let facts = &self.facts;
         let windows = scan
             .windows
             .iter()
@@ -196,6 +212,8 @@ impl WorldSource for MacWorldSource {
                 title: w.title.clone(),
                 frame: believed.get(&w.id).copied().unwrap_or(w.frame),
                 subrole: w.subrole.clone(),
+                layer: facts.get(&w.id).and_then(|f| f.layer),
+                parent: facts.get(&w.id).and_then(|f| f.parent),
             })
             .collect();
 

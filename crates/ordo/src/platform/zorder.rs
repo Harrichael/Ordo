@@ -17,6 +17,7 @@
 //! window, so callers should hand focus to the intended top window *before*
 //! restacking — the raises then slot in under it.
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use ordo_core::{Rect, WindowId};
@@ -87,6 +88,65 @@ pub fn all_windows() -> Option<Vec<WindowId>> {
     } else {
         Some(out)
     }
+}
+
+/// What the window server knows about a window that the apps don't say: its
+/// layer (0 for normal windows; panels and notification-style windows sit
+/// higher) and the window it is a child of, if any.
+pub struct ServerFacts {
+    pub layer: Option<i32>,
+    pub parent: Option<WindowId>,
+}
+
+/// [`ServerFacts`] for these windows: one list read for the layers, one
+/// window query for the parents. A window the server doesn't know, or a query
+/// that isn't available on this macOS, just leaves its fact unknown.
+pub fn server_facts(windows: &[WindowId]) -> HashMap<WindowId, ServerFacts> {
+    let mut out: HashMap<WindowId, ServerFacts> = HashMap::new();
+    unsafe {
+        let arr = CGWindowListCopyWindowInfo(EXCLUDE_DESKTOP, 0);
+        if !arr.is_null() {
+            for i in 0..cf::array_len(arr) {
+                let d = cf::array_get(arr, i) as sys::CFDictionaryRef;
+                let Some(wid) = cf::number_i64(cf::dict_get(d, "kCGWindowNumber")) else {
+                    continue;
+                };
+                let w = WindowId(wid as u32);
+                if windows.contains(&w) {
+                    let layer = cf::number_i64(cf::dict_get(d, "kCGWindowLayer")).map(|l| l as i32);
+                    out.insert(w, ServerFacts { layer, parent: None });
+                }
+            }
+            sys::CFRelease(arr);
+        }
+    }
+    static QUERY: std::sync::OnceLock<Option<sys::WindowQuery>> = std::sync::OnceLock::new();
+    let (Some(q), false) = (*QUERY.get_or_init(sys::WindowQuery::resolve), windows.is_empty()) else {
+        return out;
+    };
+    unsafe {
+        let Some(ids) = super::skylight::make_number_array(windows) else {
+            return out;
+        };
+        let query = (q.query_windows)(sys::SLSMainConnectionID(), ids, 0);
+        sys::CFRelease(ids);
+        if query.is_null() {
+            return out;
+        }
+        let iter = (q.copy_windows)(query);
+        if !iter.is_null() {
+            while (q.advance)(iter) {
+                let w = WindowId((q.window_id)(iter));
+                let parent = (q.parent_id)(iter);
+                if let Some(f) = out.get_mut(&w) {
+                    f.parent = (parent != 0).then_some(WindowId(parent));
+                }
+            }
+            sys::CFRelease(iter);
+        }
+        sys::CFRelease(query);
+    }
+    out
 }
 
 /// Where the WINDOW SERVER says one window is — `None` while it doesn't know
