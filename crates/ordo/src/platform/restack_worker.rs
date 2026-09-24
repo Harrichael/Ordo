@@ -45,10 +45,13 @@ struct Shared {
     /// Bumped by every submit; a running reassert compares its own generation
     /// against this to learn it has been superseded.
     generation: AtomicU64,
-    /// The latest desired order, replacing (never queueing behind) the last.
-    slot: Mutex<Option<(u64, Vec<WindowId>)>>,
+    /// The latest desired order and whether its top is to be made key,
+    /// replacing (never queueing behind) the last.
+    slot: Mutex<Option<Job>>,
     wake: Condvar,
 }
+
+type Job = (u64, Vec<WindowId>, bool);
 
 #[derive(Clone)]
 pub struct RestackHandle {
@@ -56,10 +59,10 @@ pub struct RestackHandle {
 }
 
 impl RestackHandle {
-    pub fn submit(&self, order: Vec<WindowId>) {
+    pub fn submit(&self, order: Vec<WindowId>, focus_top: bool) {
         let generation = self.shared.generation.fetch_add(1, Ordering::SeqCst) + 1;
         let mut slot = self.shared.slot.lock().unwrap();
-        *slot = Some((generation, order));
+        *slot = Some((generation, order, focus_top));
         self.shared.wake.notify_one();
     }
 }
@@ -78,7 +81,7 @@ pub fn spawn(tx: Sender<Msg>, signals: Arc<RaiseSignals>) -> RestackHandle {
         shared: shared.clone(),
     };
     std::thread::spawn(move || loop {
-        let (generation, order) = {
+        let (generation, order, focus_top) = {
             let mut slot = shared.slot.lock().unwrap();
             loop {
                 if let Some(job) = slot.take() {
@@ -88,7 +91,7 @@ pub fn spawn(tx: Sender<Msg>, signals: Arc<RaiseSignals>) -> RestackHandle {
             }
         };
         let cancel = || shared.generation.load(Ordering::SeqCst) != generation;
-        let stats = super::zorder::reassert_stack(&order, &cancel, Some(&signals));
+        let stats = super::zorder::reassert_stack(&order, focus_top, &cancel, Some(&signals));
         let watch = stats
             .as_ref()
             .is_some_and(|s| s.converged && !s.aborted && !s.raises.is_empty());
@@ -116,7 +119,7 @@ pub fn spawn(tx: Sender<Msg>, signals: Arc<RaiseSignals>) -> RestackHandle {
                     // The rerun is the read-back: it exits converged with
                     // zero raises when the order in fact still holds.
                     if let Some(mut stats) =
-                        super::zorder::reassert_stack(&order, &cancel, Some(&signals))
+                        super::zorder::reassert_stack(&order, focus_top, &cancel, Some(&signals))
                     {
                         stats.ghost_pass = true;
                         if tx.send(Msg::RestackStats(stats)).is_err() {

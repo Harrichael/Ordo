@@ -101,6 +101,15 @@ pub enum Effect {
     /// (the shell self-verifies against async apps).
     RestackWindows {
         order: Vec<WindowId>,
+        /// The stack's top is the window to be key: the shell makes it so
+        /// before ordering the rest, when it isn't already. Revealing a
+        /// workspace un-hides apps, and an un-hide can hand focus to the app
+        /// it revealed, undoing the focus request that preceded it; the one
+        /// building the stack owns its top. False when the top is just the
+        /// most recent visible window and focus lies elsewhere (the desktop
+        /// of an empty monitor). `serde(default)` so older logs still load.
+        #[serde(default)]
+        focus_top: bool,
     },
     /// Ask the shell to enumerate and deliver a fresh `WorldObserved`. Emitted
     /// after every mutation so ops get confirmed promptly instead of waiting

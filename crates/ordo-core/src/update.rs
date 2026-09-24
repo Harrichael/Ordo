@@ -533,8 +533,13 @@ fn execute(s: &mut State, cmd: Command, now_ns: u64, fx: &mut Vec<Effect>) -> Fo
                 expect: Expectation::AllMonitorsOn(target),
                 issued_ns: now_ns,
             });
-            if stack.len() >= 2 {
-                fx.push(Effect::RestackWindows { order: stack });
+            // Even a lone window goes to the stacking worker: it owns the top,
+            // and takes focus back if an un-hide in this switch stole it.
+            if !stack.is_empty() {
+                fx.push(Effect::RestackWindows {
+                    order: stack,
+                    focus_top: true,
+                });
             }
             fx.push(Effect::RequestRescan {
                 reason: RescanTrigger::PostEffect { op },
@@ -584,7 +589,10 @@ fn execute(s: &mut State, cmd: Command, now_ns: u64, fx: &mut Vec<Effect>) -> Fo
             let mut order = vec![window];
             order.extend(mru_stack(s, target).into_iter().filter(|w| *w != window));
             if order.len() >= 2 {
-                fx.push(Effect::RestackWindows { order });
+                fx.push(Effect::RestackWindows {
+                    order,
+                    focus_top: true,
+                });
             }
             fx.push(Effect::RequestRescan {
                 reason: RescanTrigger::PostEffect { op: switch_op },
@@ -616,7 +624,10 @@ fn execute(s: &mut State, cmd: Command, now_ns: u64, fx: &mut Vec<Effect>) -> Fo
                     let mut order = vec![target];
                     order.extend(visible_stack(s, ws, &proj).into_iter().filter(|w| *w != target));
                     if order.len() >= 2 {
-                        fx.push(Effect::RestackWindows { order });
+                        fx.push(Effect::RestackWindows {
+                            order,
+                            focus_top: true,
+                        });
                     }
                 }
             }
@@ -646,7 +657,8 @@ fn execute(s: &mut State, cmd: Command, now_ns: u64, fx: &mut Vec<Effect>) -> Fo
             // was demoted above, so the MRU order now ends with `from`.
             let order = visible_stack(s, workspace, &proj);
             if order.len() >= 2 {
-                fx.push(Effect::RestackWindows { order });
+                let focus_top = order.first() == Some(&to);
+                fx.push(Effect::RestackWindows { order, focus_top });
             }
             s.pending.push(PendingOp {
                 op,
@@ -706,7 +718,10 @@ fn execute(s: &mut State, cmd: Command, now_ns: u64, fx: &mut Vec<Effect>) -> Fo
                     let mut order = vec![window];
                     order.extend(visible_stack(s, ws, &proj).into_iter().filter(|w| *w != window));
                     if order.len() >= 2 {
-                        fx.push(Effect::RestackWindows { order });
+                        fx.push(Effect::RestackWindows {
+                            order,
+                            focus_top: true,
+                        });
                     }
                 }
             }
@@ -759,7 +774,10 @@ fn execute(s: &mut State, cmd: Command, now_ns: u64, fx: &mut Vec<Effect>) -> Fo
             let mut order: Vec<WindowId> = head.into_iter().collect();
             order.extend(visible_stack(s, ws, &proj).into_iter().filter(|w| Some(*w) != head));
             if order.len() >= 2 {
-                fx.push(Effect::RestackWindows { order });
+                fx.push(Effect::RestackWindows {
+                    order,
+                    focus_top: head.is_some(),
+                });
             }
             fx.push(Effect::RequestRescan {
                 reason: RescanTrigger::PostEffect { op },
@@ -795,7 +813,8 @@ fn execute(s: &mut State, cmd: Command, now_ns: u64, fx: &mut Vec<Effect>) -> Fo
             if let Some(ws) = s.current_workspace() {
                 let order = visible_stack(s, ws, &s.projection_with(Some(viewed), Some(enabled)));
                 if order.len() >= 2 {
-                    fx.push(Effect::RestackWindows { order });
+                    let focus_top = order.first().copied() == s.declared_focus();
+                    fx.push(Effect::RestackWindows { order, focus_top });
                 }
             }
             fx.push(Effect::RequestRescan {
@@ -833,7 +852,8 @@ fn execute(s: &mut State, cmd: Command, now_ns: u64, fx: &mut Vec<Effect>) -> Fo
                     })
                     .collect();
                 if order.len() >= 2 {
-                    fx.push(Effect::RestackWindows { order });
+                    let focus_top = order.first().copied() == s.declared_focus();
+                    fx.push(Effect::RestackWindows { order, focus_top });
                 }
             }
             fx.push(Effect::RequestRescan {
@@ -1443,7 +1463,10 @@ fn enforce_focus(
             s.declare_focus(FocusIntent::Window(rec.id));
             let order = visible_stack(s, target, &proj);
             if order.len() >= 2 {
-                fx.push(Effect::RestackWindows { order });
+                fx.push(Effect::RestackWindows {
+                    order,
+                    focus_top: true,
+                });
             }
             notes.push(Note::FollowedFocus {
                 window: rec.id,

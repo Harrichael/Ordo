@@ -677,7 +677,7 @@ fn switching_restacks_the_destination_by_mru() {
         .effects
         .iter()
         .find_map(|e| match e {
-            Effect::RestackWindows { order } => Some(order.clone()),
+            Effect::RestackWindows { order, .. } => Some(order.clone()),
             _ => None,
         })
         .expect("restack effect");
@@ -728,7 +728,7 @@ fn round_trip_through_empty_workspace_refocuses_the_same_window() {
         .effects
         .iter()
         .find_map(|e| match e {
-            Effect::RestackWindows { order } => Some(order.clone()),
+            Effect::RestackWindows { order, .. } => Some(order.clone()),
             _ => None,
         })
         .expect("restack effect");
@@ -1467,7 +1467,7 @@ fn demote_banishes_the_focused_window_and_moves_on() {
         .effects
         .iter()
         .position(
-            |e| matches!(e, Effect::RestackWindows { order } if order.last() == Some(&wid(1))),
+            |e| matches!(e, Effect::RestackWindows { order, .. } if order.last() == Some(&wid(1))),
         )
         .expect("restack effect with w1 at the back");
     let focus_pos = step
@@ -1711,7 +1711,7 @@ fn a_carry_rides_on_top_of_the_destination_and_survives_a_fling_to_a_sibling() {
         .effects
         .iter()
         .find_map(|e| match e {
-            Effect::RestackWindows { order } => Some(order.clone()),
+            Effect::RestackWindows { order, .. } => Some(order.clone()),
             _ => None,
         })
         .expect("restack effect");
@@ -2821,6 +2821,13 @@ fn moving_onto_an_empty_monitor_gives_focus_to_its_desktop_and_holds_it_there() 
         .iter()
         .any(|e| matches!(e, Effect::FocusDesktop { display, .. } if *display == mid(1))));
     assert_eq!(slide.state.focus_intent(), FocusIntent::Desktop);
+    assert!(
+        !slide
+            .effects
+            .iter()
+            .any(|e| matches!(e, Effect::RestackWindows { focus_top: true, .. })),
+        "the stacking worker is never told to focus a window over the desktop"
+    );
 
     // The view lands and the desktop has focus: nothing more to do.
     let landed = update(&slide.state, &world(2, None));
@@ -2837,6 +2844,34 @@ fn moving_onto_an_empty_monitor_gives_focus_to_its_desktop_and_holds_it_there() 
         .effects
         .iter()
         .any(|e| matches!(e, Effect::FocusDesktop { display, .. } if *display == mid(1))));
+}
+
+/// A switch's un-hides can hand focus to whichever app they reveal, undoing
+/// the focus request that went first. So the stacking worker, which builds
+/// the stack after them, is told its top is the window to focus — even when
+/// the destination shows a single window and there is nothing else to order.
+#[test]
+fn a_switch_hands_its_focus_target_to_the_stacking_worker_even_alone() {
+    let mut wins = std_windows();
+    wins[1].workspace = ws(2); // w2 is workspace 2's only window
+    let mut s = update(
+        &State::new(),
+        &observed(vec![mon_a(1), mon_b(1)], wins.clone(), None, RescanTrigger::Startup),
+    )
+    .state;
+    s = update(
+        &s,
+        &observed(vec![mon_a(1), mon_b(1)], wins, Some(1), RescanTrigger::Periodic),
+    )
+    .state;
+
+    let step = update(&s, &hotkey(HotkeyAction::WorkspaceNext));
+
+    assert_eq!(focus_targets(&step.effects), vec![wid(2)]);
+    assert!(step.effects.iter().any(|e| matches!(
+        e,
+        Effect::RestackWindows { order, focus_top: true } if *order == vec![wid(2)]
+    )));
 }
 
 #[test]

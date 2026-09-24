@@ -293,8 +293,17 @@ pub fn stack_front_to_back() -> Vec<WindowId> {
 /// then the top window ping-pongs each round trip" bug. Intent is the
 /// authority; the actual key window, whichever it transiently is, sits in no
 /// gate's scope and settles on top by itself.
+///
+/// With `focus_top`, the designated top is also made key here, once the
+/// un-hides have resurfaced and again if the final read-back finds focus
+/// elsewhere. The caller's own focus request went out before the switch's
+/// un-hides, and an un-hide can hand focus to the app it revealed (measured:
+/// 10 of 24 switches on a two-display rig); waiting for a handoff that was
+/// stolen burned the gate timeouts and left focus wrong for 1.6s. Raises land
+/// below the key window, so the top is made key before the rest are ordered.
 pub fn reassert_stack(
     desired: &[WindowId],
+    focus_top: bool,
     cancel: &dyn Fn() -> bool,
     signals: Option<&RaiseSignals>,
 ) -> Option<RestackStats> {
@@ -308,7 +317,7 @@ pub fn reassert_stack(
 
     let t_total = Instant::now();
     let (&top, rest) = desired.split_first()?;
-    if rest.is_empty() {
+    if rest.is_empty() && !focus_top {
         return None;
     }
 
@@ -351,13 +360,33 @@ pub fn reassert_stack(
     // what's actually there.
     let present = observed(desired);
     let missing = (desired.len() - present.len()) as u32;
+    let mut refocused = 0u32;
+    let take_focus = |refocused: &mut u32| {
+        if focus_top && !cancel() && ax::focused_window() != Some(top) && ax::focus(top) {
+            *refocused += 1;
+        }
+    };
+    take_focus(&mut refocused);
     let mut want: Vec<WindowId> = rest
         .iter()
         .copied()
         .filter(|w| present.contains(w))
         .collect();
     if want.is_empty() {
-        return None;
+        return (refocused > 0).then(|| RestackStats {
+            total_ms: t_total.elapsed().as_millis() as u64,
+            presence_wait_ms,
+            handoff_wait_ms: 0,
+            desired: desired.len() as u32,
+            missing,
+            skipped_suffix: 0,
+            second_pass: false,
+            converged: true,
+            aborted: aborted.get(),
+            ghost_pass: false,
+            refocused,
+            raises: Vec::new(),
+        });
     }
 
     // While a window we must order HOLDS key status, nothing can be raised
@@ -451,6 +480,10 @@ pub fn reassert_stack(
             skipped_suffix = keep as u32;
         }
     }
+    // The read-back covers the key window too: an activation that landed
+    // late, after the order was built, is taken back here rather than left
+    // for the core's focus expectation to time out.
+    take_focus(&mut refocused);
 
     Some(RestackStats {
         total_ms: t_total.elapsed().as_millis() as u64,
@@ -463,6 +496,7 @@ pub fn reassert_stack(
         converged: observed(&scope) == scope,
         aborted: aborted.get(),
         ghost_pass: false, // the worker marks its ghost-watch reruns
+        refocused,
         raises,
     })
 }

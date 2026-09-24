@@ -110,6 +110,10 @@ pub struct RestackStats {
     /// frequency is the measure of how often the old "wrong until the 2s
     /// rescan" window actually fired.
     pub ghost_pass: bool,
+    /// Times this reassert made its designated top key because focus was
+    /// elsewhere: after the un-hides resurfaced, and at the final read-back.
+    /// How often a switch's own focus request was stolen.
+    pub refocused: u32,
     pub raises: Vec<RaiseStat>,
 }
 

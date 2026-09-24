@@ -245,8 +245,8 @@ impl Logger {
         tx.execute(
             "INSERT INTO restacks (run_id, wall_ms, total_ms, presence_wait_ms,
                  handoff_wait_ms, desired, missing, skipped_suffix, second_pass, converged,
-                 aborted, ghost_pass)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                 aborted, ghost_pass, refocused)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 self.run_id,
                 now_wall_ms,
@@ -260,6 +260,7 @@ impl Logger {
                 s.converged,
                 s.aborted,
                 s.ghost_pass,
+                s.refocused,
             ],
         )?;
         let restack_id = tx.last_insert_rowid();
