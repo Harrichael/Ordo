@@ -491,24 +491,11 @@ fn execute(s: &mut State, cmd: Command, now_ns: u64, fx: &mut Vec<Effect>) -> Fo
             // the first, which made the ordering unsatisfiable and flipped
             // the top window every round trip.
             //
-            // Monitor selection is global, so a switch leaves the anchor alone
-            // — except when that would land the user on a blank screen: a
-            // destination whose windows all sit on hidden monitors. Then the
-            // view follows the focus the switch hands out, as it does
-            // everywhere else, to the destination's overall MRU head.
-            let mut stack = mru_stack(s, target);
-            let mut view: Option<VirtualMonitorId> = None;
-            if stack.is_empty() && s.virtual_monitors.is_some() {
-                let anywhere = s
-                    .focus_history
-                    .iter()
-                    .find(|w| s.windows.get(w).is_some_and(|r| r.workspace == target));
-                if let Some(w) = anywhere {
-                    let vm = s.windows[&w].vmonitor;
-                    view = Some(vm);
-                    stack = visible_stack(s, target, &s.projection_with(Some(vm), None));
-                }
-            }
+            // Monitor selection is global, so a switch never moves the view —
+            // not even onto a destination whose windows all sit on hidden
+            // monitors. The user chose the monitor they are on; that
+            // destination is empty here, and is treated as any empty one.
+            let stack = mru_stack(s, target);
             let head = stack.first().copied();
             if let Some(fw) = head {
                 let op = s.mint_op();
@@ -523,8 +510,8 @@ fn execute(s: &mut State, cmd: Command, now_ns: u64, fx: &mut Vec<Effect>) -> Fo
                     });
                 }
             }
-            // An empty workspace is still a place to be: the desktop takes
-            // focus, as on an empty monitor — the anchor's display, the one
+            // An empty workspace (here) is still a place to be: the desktop
+            // takes focus, as on an empty monitor — the anchor's display, the one
             // a desktop declaration holds and new windows are corralled onto.
             // Left with the app it had, that app could never be hidden, and
             // its windows parked for other workspaces would line the screen's
@@ -538,9 +525,6 @@ fn execute(s: &mut State, cmd: Command, now_ns: u64, fx: &mut Vec<Effect>) -> Fo
             };
             if let Some(display) = desktop {
                 push_desktop(s, display, now_ns, fx);
-            }
-            if let Some(vm) = view {
-                push_view(s, vm, now_ns, fx);
             }
             let op = s.mint_op();
             fx.push(Effect::SwitchWorkspace { op, target });

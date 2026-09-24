@@ -2978,8 +2978,10 @@ fn toggling_virtualization_on_views_the_focused_windows_monitor() {
 }
 
 #[test]
-fn a_switch_onto_a_workspace_hidden_by_its_monitor_views_the_mru_heads_monitor() {
-    // w2 lives on workspace 2 AND monitor 2; the anchor is monitor 1.
+fn a_switch_never_moves_the_view_even_onto_a_workspace_empty_here() {
+    // w2 lives on workspace 2 AND monitor 2; the anchor is monitor 1. The
+    // user chose monitor 1, so workspace 2 is empty here: the desktop of
+    // monitor 1's display takes focus, and the view stays.
     let mut wins = undocked_windows();
     wins[1].workspace = ws(2);
     let s = update(
@@ -2995,9 +2997,13 @@ fn a_switch_onto_a_workspace_hidden_by_its_monitor_views_the_mru_heads_monitor()
     .state;
     let step = update(&s, &hotkey(HotkeyAction::WorkspaceNext));
     assert_eq!(count_switches(&step.effects), 1);
-    assert_eq!(focus_targets(&step.effects), vec![wid(2)], "not a blank screen");
-    assert_eq!(view_targets(&step.effects), vec![vm(2)]);
-    assert_eq!(step.state.focus_intent(), FocusIntent::Window(wid(2)));
+    assert!(focus_targets(&step.effects).is_empty());
+    assert!(view_targets(&step.effects).is_empty());
+    assert!(step
+        .effects
+        .iter()
+        .any(|e| matches!(e, Effect::FocusDesktop { display, .. } if *display == mid(1))));
+    assert_eq!(step.state.focus_intent(), FocusIntent::Desktop);
 
     // With something visible on the destination the anchor stays global.
     wins.push(win(9, 300, 2, rect(200.0, 200.0))); // workspace 2, monitor 1
