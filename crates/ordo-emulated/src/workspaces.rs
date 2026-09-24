@@ -189,6 +189,11 @@ pub struct EmulatedWorkspaces {
     /// `PersistedState::monitors_assigned`); the next sighted scan learns
     /// them from where the windows stand, once.
     learn_monitors: bool,
+    /// Docked frames written on the pass the full rig came back, stood in for
+    /// in belief for that pass only: its snapshot was read before the writes,
+    /// and the core, seeing the windows where the laptop had them, would
+    /// carry them over proportionally itself.
+    homecoming: HashMap<WindowId, Rect>,
     /// Diagnostic record of what this model did to windows' frames, drained by
     /// the shell each snapshot. See [`crate::trace`] for why it must exist:
     /// every other channel sees the substituted belief, so without this the
@@ -213,6 +218,7 @@ impl EmulatedWorkspaces {
             boot_time: statefile::boot_time_sec(),
             suspended: false,
             learn_monitors: false,
+            homecoming: HashMap::new(),
             trace: Vec::new(),
         }
     }
@@ -276,7 +282,10 @@ impl EmulatedWorkspaces {
     /// everything is kept.
     pub fn note_scan(&mut self, d: &dyn Desktop, windows: &[(WindowId, Pid)]) {
         let g = Geometry::read(d);
+        self.homecoming.clear();
+        let known = self.ledger.physical() > 0;
         let mut dirty = self.note_displays(d, &g);
+        let replugged = dirty && known;
         if windows.is_empty() {
             if dirty {
                 self.persist();
@@ -326,7 +335,12 @@ impl EmulatedWorkspaces {
             dirty = true;
         }
         dirty |= self.ledger.window_claims() != before;
-        dirty |= self.refresh_home(&frames, &g);
+        // Right after the display set changes, windows stand wherever macOS
+        // re-homed them, which is nobody's placement: recorded as home, it
+        // replaced the very frames the full rig is about to need.
+        if !replugged {
+            dirty |= self.refresh_home(&frames, &g);
+        }
         if dirty {
             self.persist();
         }
@@ -720,17 +734,19 @@ impl EmulatedWorkspaces {
         d: &dyn Desktop,
         frames: &HashMap<WindowId, (Pid, Rect)>,
     ) -> HashMap<WindowId, Rect> {
-        if self.saved.is_empty() {
+        if self.saved.is_empty() && self.homecoming.is_empty() {
             return HashMap::new();
         }
         let g = Geometry::read(d);
-        frames
+        let mut believed: HashMap<WindowId, Rect> = frames
             .iter()
             .filter_map(|(w, (_, f))| {
                 let saved = self.saved.get(w)?;
                 self.reads_parked(*w, f, &g).then_some((*w, *saved))
             })
-            .collect()
+            .collect();
+        believed.extend(self.homecoming.iter().map(|(w, f)| (*w, *f)));
+        believed
     }
 
     /// Is this window's observed frame the park frame Ordo asked it to
@@ -804,6 +820,15 @@ impl EmulatedWorkspaces {
         if g.displays.is_empty() {
             return;
         }
+        let systemic = self.last_geometry.as_ref().is_some_and(|prev| *prev != g);
+        self.last_geometry = Some(g.clone());
+        if systemic {
+            self.enforce_attempts.clear();
+            if self.full_rig(&g) {
+                let writes = self.come_home(frames, &g);
+                self.move_windows(d, &writes);
+            }
+        }
         let current = self.ledger.current();
         let proj = self.ledger.projection();
         let claims = self.ledger.window_claims();
@@ -820,11 +845,6 @@ impl EmulatedWorkspaces {
         // This runs on every snapshot; don't pay for a quiet desktop.
         if hidden.is_empty() && stranded.is_empty() {
             return;
-        }
-        let systemic = self.last_geometry.as_ref().is_some_and(|prev| *prev != g);
-        self.last_geometry = Some(g.clone());
-        if systemic {
-            self.enforce_attempts.clear();
         }
         let mut writes = Vec::new();
         let mut newly_parked = false;
@@ -945,6 +965,45 @@ impl EmulatedWorkspaces {
         if newly_parked || restored {
             self.apply_app_visibility(d, frames, &g);
         }
+    }
+
+    /// The full rig is back: every window on screen returns to its docked
+    /// frame. macOS piled them onto the laptop, and what is left of that pile
+    /// is not anyone's placement.
+    fn come_home(
+        &mut self,
+        frames: &HashMap<WindowId, (Pid, Rect)>,
+        g: &Geometry,
+    ) -> Vec<(Pid, WindowId, Rect)> {
+        let proj = self.ledger.projection();
+        let mut writes = Vec::new();
+        for (w, (pid, f)) in frames {
+            let on_screen = self.ledger.visible(*w, &proj)
+                && !self.parked.contains(w)
+                && !self.reads_parked(*w, f, g);
+            if !on_screen {
+                continue;
+            }
+            let Some(host) = self.host_rect(*w, g) else {
+                continue;
+            };
+            let Some(hm) = self.home.get(w).copied().filter(|hm| host.contains(hm.center())) else {
+                continue;
+            };
+            if same_position(f, &hm) {
+                continue;
+            }
+            let want = Rect { x: hm.x, y: hm.y, ..*f };
+            self.note(
+                ParkTrace::new(*w, ParkTraceKind::Rehost)
+                    .observed(*f)
+                    .requested(want)
+                    .detail("the full rig is back; to its docked frame"),
+            );
+            self.homecoming.insert(*w, want);
+            writes.push((*pid, *w, want));
+        }
+        writes
     }
 
     pub fn rescue_window(&mut self, d: &dyn Desktop, window: WindowId) {
@@ -1137,14 +1196,11 @@ impl EmulatedWorkspaces {
     /// benefit; the window keeps its own size, and the next park records what
     /// the window really is.
     ///
-    /// The display gap is the rig changing while the window was hidden. In
-    /// order of preference: the promise itself, when it already lies on the
-    /// host; the window's `home` frame, when the host is the display it was
-    /// docked on (the rig came back — land exactly where it was); the promise
-    /// carried over proportionally from the display it was made on; and, when
-    /// that display is gone too, the promise clamped into the host. A carried
-    /// or clamped target replaces the promise, so what the core is told and
-    /// what the write asks for stay one frame.
+    /// The display gap is the rig changing while the window was hidden. With
+    /// the full rig present, the window's `home` frame on its host comes first
+    /// — land exactly where it was docked, whatever the laptop made of the
+    /// promise. Otherwise: the promise itself, when it already lies on the
+    /// host; then [`Self::carry_over`].
     fn restore(
         &mut self,
         window: WindowId,
@@ -1178,23 +1234,28 @@ impl EmulatedWorkspaces {
                 rehome_into(&s, host.unwrap_or(g.main)),
             ),
             Some(s) => match host {
-                Some(h) if h.contains(s.center()) => (ParkTraceKind::Restore, s),
-                Some(h) => {
+                // With the full rig present the docked frame is where the user
+                // put the window. A promise made on the laptop is only what
+                // macOS left of it, and it can fit the host too: the laptop
+                // and the main display share an origin.
+                Some(h) if self.full_rig(g) => {
                     let home = self
                         .home
                         .get(&window)
-                        .filter(|hm| h.contains(hm.center()));
-                    let want = match (home, g.display_at(s.center())) {
-                        (Some(hm), _) => Rect { x: hm.x, y: hm.y, ..s },
-                        (None, Some(from)) => {
-                            let t = s.translate_between(&from, &h);
-                            Rect { x: t.x, y: t.y, ..s }
+                        .copied()
+                        .filter(|hm| h.contains(hm.center()) && !same_position(hm, &s));
+                    match home {
+                        Some(hm) => {
+                            let want = Rect { x: hm.x, y: hm.y, ..s };
+                            self.saved.insert(window, want);
+                            (ParkTraceKind::Rehost, want)
                         }
-                        (None, None) => clamp_into(&s, &h),
-                    };
-                    self.saved.insert(window, want);
-                    (ParkTraceKind::Rehost, want)
+                        None if h.contains(s.center()) => (ParkTraceKind::Restore, s),
+                        None => self.carry_over(window, s, h, g),
+                    }
                 }
+                Some(h) if h.contains(s.center()) => (ParkTraceKind::Restore, s),
+                Some(h) => self.carry_over(window, s, h, g),
                 None => (ParkTraceKind::Restore, s),
             },
             // Parked with no promise (its real frame was never trustworthily
@@ -1241,6 +1302,31 @@ impl EmulatedWorkspaces {
         };
         self.note(ParkTrace::new(window, ParkTraceKind::Rehost).observed(f).requested(want));
         Some((pid, window, want))
+    }
+
+    /// A promise made on another display than its host: to the window's
+    /// `home` when that is on the host, else carried over proportionally from
+    /// the display it was made on, else clamped in. The target replaces the
+    /// promise, so what the core is told and what the write asks for stay one
+    /// frame.
+    fn carry_over(
+        &mut self,
+        window: WindowId,
+        s: Rect,
+        host: Rect,
+        g: &Geometry,
+    ) -> (ParkTraceKind, Rect) {
+        let home = self.home.get(&window).filter(|hm| host.contains(hm.center()));
+        let want = match (home, g.display_at(s.center())) {
+            (Some(hm), _) => Rect { x: hm.x, y: hm.y, ..s },
+            (None, Some(from)) => {
+                let t = s.translate_between(&from, &host);
+                Rect { x: t.x, y: t.y, ..s }
+            }
+            (None, None) => clamp_into(&s, &host),
+        };
+        self.saved.insert(window, want);
+        (ParkTraceKind::Rehost, want)
     }
 
     /// Dock dimming: hide (Cmd+H-style) every app whose known windows are all
@@ -2867,6 +2953,45 @@ mod tests {
             .any(|t| t.kind == ParkTraceKind::Rehost && t.window == w(2)));
         // Belief and screen agree, so the core sees no promise to re-host.
         assert!(b.believed_frames(&d, &frames_of(&d)).is_empty());
+    }
+
+    /// Unplugging piles windows onto the laptop: two staggered windows on
+    /// the main display end up at the same spot, one hiding the other. The
+    /// laptop shares the main display's origin, so the pile also fits the
+    /// main display — and both the window left on screen and the one hidden
+    /// while undocked went back to the pile, not to where they were docked.
+    /// The first scan after the replug must not record the pile as home
+    /// either, and the core, reading that scan, must see the windows home.
+    #[test]
+    fn replugging_unpiles_the_windows_macos_stacked_on_the_laptop() {
+        let pile = rect(0.0, 33.0);
+        let d = FakeDesktop::new(&[
+            (w(1), Pid(10), rect(100.0, 100.0)),
+            (w(2), Pid(20), rect(2000.0, 100.0)),
+            (w(3), Pid(10), rect(300.0, 300.0)),
+        ]);
+        let mut b = EmulatedWorkspaces::new(3);
+        rescan(&d, &mut b);
+
+        d.set_displays(&[MAIN]);
+        d.place(w(1), pile);
+        d.place(w(3), pile);
+        rescan(&d, &mut b);
+        b.move_window_to_workspace(&d, w(3), ws(2)).unwrap();
+
+        d.set_displays(&[MAIN, SECOND]);
+        let stale = frames_of(&d);
+        b.note_scan(&d, &d.scan());
+        b.enforce_placement(&d, &stale);
+        assert_eq!(d.frame(w(1)), rect(100.0, 100.0), "left on screen, back home");
+        assert_eq!(b.believed_frames(&d, &stale)[&w(1)], rect(100.0, 100.0));
+        assert_eq!(d.frame(w(2)), rect(2000.0, 100.0));
+
+        rescan(&d, &mut b);
+        b.move_window_to_workspace(&d, w(3), ws(1)).unwrap();
+        assert_eq!(d.frame(w(3)), rect(300.0, 300.0), "hidden while undocked, back home");
+        assert_eq!(b.home[&w(1)], rect(100.0, 100.0));
+        assert_eq!(b.home[&w(3)], rect(300.0, 300.0));
     }
 
     #[test]
