@@ -19,7 +19,8 @@ use std::time::Instant;
 
 use crossbeam_channel::Receiver;
 use ordo_core::{
-    coalesce_hotkeys, update, Effect, Event, Gesture, HotkeyAction, OpId, RescanTrigger, State,
+    coalesce_hotkeys, update, AxHintKind, Effect, Event, Gesture, HotkeyAction, OpId,
+    RescanTrigger, State,
 };
 
 use crate::clock::Clock;
@@ -64,6 +65,54 @@ pub enum Msg {
 impl Msg {
     pub fn hotkey(action: HotkeyAction) -> Msg {
         Msg::Hotkey(action, Instant::now())
+    }
+}
+
+/// Rescans queued back to back are one look at the world, not several: a
+/// snapshot is taken when processed, not when hinted, so the extras re-read
+/// what the first just saw — and a hotkey queued behind them waits for each.
+/// Measured, those echoes (mostly focus notifications from Ordo's own
+/// previous switch) were most of a burst press's wait. Creation hints survive,
+/// one per app, because only they authorize corralling a new window; every
+/// other trigger means just "go look".
+fn collapse_rescans(batch: Vec<Msg>) -> Vec<Msg> {
+    let mut out = Vec::with_capacity(batch.len());
+    let mut run: Vec<RescanTrigger> = Vec::new();
+    for m in batch {
+        match m {
+            Msg::Rescan(trigger) => run.push(trigger),
+            // Telemetry fences nothing here either (see `run`).
+            Msg::RestackStats(_) => out.push(m),
+            other => {
+                flush_rescans(&mut run, &mut out);
+                out.push(other);
+            }
+        }
+    }
+    flush_rescans(&mut run, &mut out);
+    out
+}
+
+fn flush_rescans(run: &mut Vec<RescanTrigger>, out: &mut Vec<Msg>) {
+    let mut births: Vec<RescanTrigger> = Vec::new();
+    let mut last = None;
+    for trigger in run.drain(..) {
+        match trigger {
+            RescanTrigger::AxHint {
+                kind: AxHintKind::WindowCreated,
+                ..
+            } => {
+                if !births.contains(&trigger) {
+                    births.push(trigger);
+                }
+            }
+            _ => last = Some(trigger),
+        }
+    }
+    if births.is_empty() {
+        out.extend(last.map(Msg::Rescan));
+    } else {
+        out.extend(births.into_iter().map(Msg::Rescan));
     }
 }
 
@@ -161,6 +210,7 @@ impl Engine {
     /// replayed one by one: a queued backlog is one user gesture, not a
     /// script. Non-hotkey messages fence the coalescing and keep their order
     /// — a gesture included, since "hotkey, click, hotkey" is not one burst.
+    /// Rescans queued back to back collapse first (see [`collapse_rescans`]).
     pub fn run(mut self, rx: Receiver<Msg>) {
         self.observe(RescanTrigger::Startup);
         self.publish();
@@ -169,6 +219,7 @@ impl Engine {
             while let Ok(m) = rx.try_recv() {
                 batch.push(m);
             }
+            let batch = collapse_rescans(batch);
             let mut hotkeys: Vec<(HotkeyAction, Instant)> = Vec::new();
             for m in batch {
                 match m {

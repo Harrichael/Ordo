@@ -16,7 +16,7 @@ use ordo::menubar::{MenuBarView, MonitorEntry, MonitorsView, WorkspaceEntry};
 use ordo::ports::{Effector, NullEffector, WorldSource};
 use ordo::replay::replay;
 use ordo_core::{
-    after_merge, Effect, FocusIntent, Gesture, HotkeyAction, MonitorId, MonitorSnap, MonitorWs, OpOutcome, Pid,
+    after_merge, AxHintKind, Effect, Event, FocusIntent, Gesture, HotkeyAction, MonitorId, MonitorSnap, MonitorWs, OpOutcome, Pid,
     Rect, RescanTrigger, VirtualMonitorId, VirtualMonitors, VirtualMonitorsWord, WindowId,
     WindowSnap, WorkspaceId, WorkspaceSnap, WorldSnapshot,
 };
@@ -759,6 +759,67 @@ fn a_queued_burst_is_logged_with_its_presses_and_their_wait() {
         )
         .unwrap();
     assert_eq!(kind, "hotkey");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Hints queued behind a busy engine are one look at the world: a run of them
+/// becomes a single snapshot, so a hotkey waiting behind them waits for one.
+/// Creation hints are kept, one per app, because only they license corralling
+/// the new window. A hotkey still fences: the look before it and the look
+/// after it both happen, so it acts on fresh focus.
+#[test]
+fn queued_rescans_collapse_but_keep_their_creation_hints() {
+    let dir = std::env::temp_dir().join(format!("ordo-collapse-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = dir.join("collapse.db");
+    let _ = std::fs::remove_file(&db);
+    let os = fake_os(FocusPolicy::Lands);
+    let hint = |pid: Option<i32>, kind: AxHintKind| {
+        Msg::Rescan(RescanTrigger::AxHint {
+            pid: pid.map(Pid),
+            kind,
+        })
+    };
+    let focus = || AxHintKind::Other("AXFocusedWindowChanged".into());
+    let run_id = {
+        let logger = Logger::open(&db, "test", "emulated", 1_000).unwrap();
+        let run_id = logger.run_id();
+        let engine = engine_on(&os, logger);
+        let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
+        for m in [
+            hint(Some(7), focus()),
+            hint(Some(8), focus()),
+            hint(Some(7), focus()),
+            Msg::hotkey(HotkeyAction::WorkspaceNext),
+            hint(Some(7), AxHintKind::WindowCreated),
+            hint(Some(7), focus()),
+            hint(Some(7), AxHintKind::WindowCreated),
+            hint(Some(8), AxHintKind::WindowCreated),
+            Msg::Shutdown,
+        ] {
+            tx.send(m).unwrap();
+        }
+        engine.run(rx);
+        run_id
+    };
+    let conn = Connection::open(&db).unwrap();
+    let hints: Vec<(Option<i32>, bool)> = conn
+        .prepare("SELECT payload FROM events WHERE kind = 'world_observed' ORDER BY seq")
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .filter_map(|p| match serde_json::from_str(&p.unwrap()).unwrap() {
+            Event::WorldObserved {
+                trigger: RescanTrigger::AxHint { pid, kind },
+                ..
+            } => Some((pid.map(|p| p.0), kind == AxHintKind::WindowCreated)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(hints, [(Some(7), false), (Some(7), true), (Some(8), true)]);
+    assert_eq!(os.borrow().active, WorkspaceId(2));
+    let report = replay(&conn, run_id, None).unwrap();
+    assert!(report.is_clean(), "{:?}", report.mismatches);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
