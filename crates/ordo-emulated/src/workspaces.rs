@@ -280,7 +280,9 @@ impl EmulatedWorkspaces {
     /// window is forgotten only when the window server's full list confirms
     /// it no longer exists; a failed CG read is not evidence either, and
     /// everything is kept.
-    pub fn note_scan(&mut self, d: &dyn Desktop, windows: &[(WindowId, Pid)]) {
+    /// `windows` is the scan's own read — every window with its app and frame
+    /// — so nothing here walks the apps again.
+    pub fn note_scan(&mut self, d: &dyn Desktop, windows: &HashMap<WindowId, (Pid, Rect)>) {
         let g = Geometry::read(d);
         self.homecoming.clear();
         let known = self.ledger.physical() > 0;
@@ -293,12 +295,11 @@ impl EmulatedWorkspaces {
             return;
         }
         let before = self.ledger.window_claims();
-        let scanned: HashSet<WindowId> = windows.iter().map(|(w, _)| *w).collect();
         let absent: Vec<WindowId> = self
             .ledger
             .window_ws()
             .keys()
-            .filter(|w| !scanned.contains(w))
+            .filter(|w| !windows.contains_key(w))
             .copied()
             .collect();
         if !absent.is_empty() {
@@ -315,7 +316,7 @@ impl EmulatedWorkspaces {
         // A new window is adopted onto the monitor its display stands for —
         // it is visibly there — and onto the anchor where the display stands
         // for several (collapsed) or none.
-        let frames = current_frames(d);
+        let frames = windows;
         let proj = self.ledger.projection();
         let viewed = self.ledger.monitors().viewed;
         let adopt = |id: WindowId| {
@@ -327,10 +328,12 @@ impl EmulatedWorkspaces {
         };
         // A recycled id's saved frame belongs to a dead stranger; the new
         // window must not inherit a teleport to it.
-        let recycled = self.ledger.note_seen(windows, adopt);
+        let mut seen: Vec<(WindowId, Pid)> = windows.iter().map(|(w, (p, _))| (*w, *p)).collect();
+        seen.sort_by_key(|(w, _)| w.0);
+        let recycled = self.ledger.note_seen(&seen, adopt);
         self.drop_park_bookkeeping(&recycled);
         if self.learn_monitors {
-            self.learn_monitors_from_placement(&frames, &g);
+            self.learn_monitors_from_placement(frames, &g);
             self.learn_monitors = false;
             dirty = true;
         }
@@ -339,7 +342,7 @@ impl EmulatedWorkspaces {
         // re-homed them, which is nobody's placement: recorded as home, it
         // replaced the very frames the full rig is about to need.
         if !replugged {
-            dirty |= self.refresh_home(&frames, &g);
+            dirty |= self.refresh_home(frames, &g);
         }
         if dirty {
             self.persist();
@@ -1885,12 +1888,16 @@ mod tests {
         }
 
         /// A scan of this desktop, as the shell would deliver it.
-        fn scan(&self) -> Vec<(WindowId, Pid)> {
-            self.windows
-                .borrow()
-                .iter()
-                .map(|(w, (p, _))| (*w, *p))
-                .collect()
+        fn scan(&self) -> HashMap<WindowId, (Pid, Rect)> {
+            self.windows.borrow().clone().into_iter().collect()
+        }
+
+        /// A scan that saw only these windows, under these apps — what an
+        /// app blowing its AX timeout, or an id recycled by another app,
+        /// hands the model.
+        fn scan_only(&self, seen: &[(WindowId, Pid)]) -> HashMap<WindowId, (Pid, Rect)> {
+            let ws = self.windows.borrow();
+            seen.iter().map(|(w, p)| (*w, (*p, ws[w].1))).collect()
         }
     }
 
@@ -2524,7 +2531,7 @@ mod tests {
         b.note_scan(&d, &d.scan());
         b.move_window_to_workspace(&d, w(1), ws(3)).unwrap(); // parked
 
-        b.note_scan(&d, &[(w(2), Pid(20))]); // partial: w1 missing, alive
+        b.note_scan(&d, &d.scan_only(&[(w(2), Pid(20))])); // partial: w1 missing, alive
         assert_eq!(b.window_ws()[&w(1)], ws(3), "declaration kept");
         assert_eq!(b.saved[&w(1)], rect(100.0, 100.0), "promise kept");
 
@@ -2535,12 +2542,12 @@ mod tests {
         // A failed CG read is not evidence either.
         d.cg_down.set(true);
         d.close(w(1));
-        b.note_scan(&d, &[(w(2), Pid(20))]);
+        b.note_scan(&d, &d.scan_only(&[(w(2), Pid(20))]));
         assert_eq!(b.window_ws()[&w(1)], ws(3), "no evidence, no forgetting");
 
         // CG back up and the window really is gone: forgotten everywhere.
         d.cg_down.set(false);
-        b.note_scan(&d, &[(w(2), Pid(20))]);
+        b.note_scan(&d, &d.scan_only(&[(w(2), Pid(20))]));
         assert!(!b.window_ws().contains_key(&w(1)));
         assert!(!b.saved.contains_key(&w(1)));
         assert!(!b.parked.contains(&w(1)));
@@ -2558,7 +2565,7 @@ mod tests {
 
         // The id comes back in the same scan under a different app: it is a
         // NEW window on the current workspace, with no inherited teleport.
-        b.note_scan(&d, &[(w(1), Pid(99)), (w(2), Pid(20))]);
+        b.note_scan(&d, &d.scan_only(&[(w(1), Pid(99)), (w(2), Pid(20))]));
         assert_eq!(b.window_ws()[&w(1)], ws(1));
         assert!(!b.saved.contains_key(&w(1)));
         assert!(!b.parked.contains(&w(1)));

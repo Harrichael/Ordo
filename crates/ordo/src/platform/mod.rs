@@ -39,6 +39,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use ordo_core::{
     MonitorId, MonitorSnap, MonitorWs, Pid, Rect, WindowId, WindowSnap, WorkspaceSnap,
@@ -48,7 +49,7 @@ use ordo_core::{
 use ordo_emulated::{ParkTrace, ParkTraceKind};
 
 use crate::backend::WorkspaceBackend;
-use crate::ports::WorldSource;
+use crate::ports::{SnapshotStats, WorldSource};
 
 pub type SharedBackend = Rc<RefCell<dyn WorkspaceBackend>>;
 
@@ -84,6 +85,7 @@ pub struct MacWorldSource {
     last_raw: HashMap<WindowId, Rect>,
     /// Drained by the engine after each `snapshot()`.
     trace: Vec<ParkTrace>,
+    stats: Option<SnapshotStats>,
 }
 
 impl MacWorldSource {
@@ -98,6 +100,7 @@ impl MacWorldSource {
             settle,
             last_raw: HashMap::new(),
             trace: Vec::new(),
+            stats: None,
         }
     }
 }
@@ -116,6 +119,7 @@ impl WorldSource for MacWorldSource {
                 workspaces: WorkspaceSnap::default(),
             };
         }
+        let started = Instant::now();
         let displays = display::active_displays();
         let known: Vec<(MonitorId, Rect, bool)> = displays
             .iter()
@@ -123,20 +127,19 @@ impl WorldSource for MacWorldSource {
             .collect();
 
         let scan = ax::scan();
-        let scanned: Vec<(WindowId, Pid)> = scan.windows.iter().map(|w| (w.id, w.app)).collect();
-
-        let topo = self
-            .backend
-            .borrow_mut()
-            .topology(&scanned, &known)
-            .unwrap_or_default();
-
         let frames: HashMap<WindowId, (Pid, Rect)> = scan
             .windows
             .iter()
             .map(|w| (w.id, (w.app, w.frame)))
             .collect();
 
+        let topo = self
+            .backend
+            .borrow_mut()
+            .topology(&frames, &known)
+            .unwrap_or_default();
+
+        let enforce_started = Instant::now();
         if self.intercepting.load(Ordering::Relaxed) {
             // The corrective write lands after this snapshot was read, so the
             // snapshot still shows the phantom; the next rescan absorbs the
@@ -144,6 +147,7 @@ impl WorldSource for MacWorldSource {
             // standing-invariant check.
             self.backend.borrow_mut().enforce_placement(&frames);
         }
+        let enforce = enforce_started.elapsed();
 
         // Mechanism artifacts (park slivers) never reach the core: the
         // backend substitutes the promise each one encodes.
@@ -217,6 +221,14 @@ impl WorldSource for MacWorldSource {
             virtual_monitors: topo.virtual_monitors.clone(),
         };
 
+        self.stats = Some(SnapshotStats {
+            total: started.elapsed(),
+            walk: scan.walk.elapsed,
+            enforce,
+            apps: scan.walk.apps,
+            windows: scan.windows.len(),
+            slowest: scan.walk.slowest,
+        });
         WorldSnapshot {
             monitors,
             windows,
@@ -227,5 +239,9 @@ impl WorldSource for MacWorldSource {
 
     fn take_park_trace(&mut self) -> Vec<ParkTrace> {
         std::mem::take(&mut self.trace)
+    }
+
+    fn take_snapshot_stats(&mut self) -> Option<SnapshotStats> {
+        self.stats.take()
     }
 }

@@ -7,6 +7,8 @@
 //! for why every private switching call failed on Tahoe, and
 //! `examples/kbd_switch_probe.rs` for how this mechanism was validated.
 
+use std::collections::HashMap;
+
 use ordo_core::{MonitorId, Pid, Rect, WindowId, WorkspaceId};
 
 use crate::backend::{
@@ -122,7 +124,7 @@ impl NativeBackend {
 impl WorkspaceBackend for NativeBackend {
     fn topology(
         &mut self,
-        windows: &[(WindowId, Pid)],
+        windows: &HashMap<WindowId, (Pid, Rect)>,
         monitors: &[(MonitorId, Rect, bool)],
     ) -> Result<BackendTopology> {
         let displays = skylight::managed_display_spaces(self.cid);
@@ -130,7 +132,7 @@ impl WorkspaceBackend for NativeBackend {
         let folded = skylight::fold_topology(&displays, &known);
         // SkyLight keys purely on window ids; the pid half of identity is the
         // emulated ledger's concern.
-        let ids: Vec<WindowId> = windows.iter().map(|(w, _)| *w).collect();
+        let ids: Vec<WindowId> = windows.keys().copied().collect();
         let window_ws = skylight::window_workspaces(self.cid, &ids, &folded.space_to_ordinal);
 
         let monitors = folded

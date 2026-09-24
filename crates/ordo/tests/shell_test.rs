@@ -13,7 +13,7 @@ use ordo::clock::Clock;
 use ordo::engine::{Engine, Msg};
 use ordo::logger::Logger;
 use ordo::menubar::{MenuBarView, MonitorEntry, MonitorsView, WorkspaceEntry};
-use ordo::ports::{Effector, NullEffector, WorldSource};
+use ordo::ports::{Effector, NullEffector, SnapshotStats, WorldSource};
 use ordo::replay::replay;
 use ordo_core::{
     after_merge, anchor_after_add, AxHintKind, Effect, Event, FocusIntent, Gesture, HotkeyAction, MonitorId, MonitorSnap, MonitorWs, OpOutcome, Pid,
@@ -42,6 +42,10 @@ impl WorldSource for ScriptedWorld {
     /// Scripted snapshots come from fixtures, not a parking mechanism.
     fn take_park_trace(&mut self) -> Vec<ordo_emulated::ParkTrace> {
         Vec::new()
+    }
+
+    fn take_snapshot_stats(&mut self) -> Option<SnapshotStats> {
+        None
     }
 }
 
@@ -132,6 +136,19 @@ impl WorldSource for FakeWorld {
 
     fn take_park_trace(&mut self) -> Vec<ordo_emulated::ParkTrace> {
         Vec::new()
+    }
+
+    /// A fixed cost per snapshot, so the log's side channel can be checked
+    /// against the snapshots it describes.
+    fn take_snapshot_stats(&mut self) -> Option<SnapshotStats> {
+        Some(SnapshotStats {
+            total: Duration::from_millis(9),
+            walk: Duration::from_millis(6),
+            enforce: Duration::from_millis(2),
+            apps: 2,
+            windows: self.0.borrow().windows.len(),
+            slowest: Some((Pid(200), Duration::from_millis(6))),
+        })
     }
 }
 
@@ -824,6 +841,44 @@ fn queued_rescans_collapse_but_keep_their_creation_hints() {
     assert_eq!(os.borrow().active, WorkspaceId(2));
     let report = replay(&conn, run_id, None).unwrap();
     assert!(report.is_clean(), "{:?}", report.mismatches);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Every snapshot's cost lands beside it in the log, keyed to its own event —
+/// the rescan a hotkey waited behind is findable from the hotkey's batch.
+#[test]
+fn each_snapshot_logs_what_it_cost_against_its_own_event() {
+    let dir = std::env::temp_dir().join(format!("ordo-snapcost-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = dir.join("snapcost.db");
+    let _ = std::fs::remove_file(&db);
+    let os = fake_os(FocusPolicy::Lands);
+    {
+        let logger = Logger::open(&db, "test", "emulated", 1_000).unwrap();
+        let engine = engine_on(&os, logger);
+        let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
+        tx.send(Msg::hotkey(HotkeyAction::WorkspaceNext)).unwrap();
+        tx.send(Msg::Shutdown).unwrap();
+        engine.run(rx);
+    }
+    let conn = Connection::open(&db).unwrap();
+    let observed: Vec<i64> = conn
+        .prepare("SELECT seq FROM events WHERE kind = 'world_observed' ORDER BY seq")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    let costed: Vec<(i64, f64, i64)> = conn
+        .prepare("SELECT seq, total_ms, slowest_pid FROM snapshots ORDER BY seq")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert!(observed.len() >= 2, "the startup scan and the switch's rescan");
+    assert_eq!(costed.iter().map(|c| c.0).collect::<Vec<_>>(), observed);
+    assert!(costed.iter().all(|c| c.1 == 9.0 && c.2 == 200));
     let _ = std::fs::remove_dir_all(&dir);
 }
 

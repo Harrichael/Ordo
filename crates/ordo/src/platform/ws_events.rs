@@ -292,6 +292,10 @@ impl<W: WorldSource> WorldSource for SubscribingWorld<W> {
     fn take_park_trace(&mut self) -> Vec<ordo_emulated::ParkTrace> {
         self.inner.take_park_trace()
     }
+
+    fn take_snapshot_stats(&mut self) -> Option<crate::ports::SnapshotStats> {
+        self.inner.take_snapshot_stats()
+    }
 }
 
 #[cfg(test)]

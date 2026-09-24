@@ -70,14 +70,15 @@ pub trait WorkspaceBackend {
     ///
     /// Takes the world the enumerator already gathered — the current display
     /// set (frames, and which is main) and the scanned windows with their
-    /// owning apps — because both are needed to classify workspaces (native
-    /// maps window->space; emulated consults its ledger, whose identity unit
-    /// is the (id, pid) pair, and projects its virtual monitors onto the
-    /// displays by position) and neither backend should re-enumerate them
-    /// independently.
+    /// owning apps and frames — because both are needed to classify
+    /// workspaces (native maps window->space; emulated consults its ledger,
+    /// whose identity unit is the (id, pid) pair, and projects its virtual
+    /// monitors onto the displays by position) and neither backend should
+    /// re-enumerate them independently: a second walk of every app is a
+    /// second wait on every app.
     fn topology(
         &mut self,
-        windows: &[(WindowId, Pid)],
+        windows: &HashMap<WindowId, (Pid, Rect)>,
         monitors: &[(MonitorId, Rect, bool)],
     ) -> Result<BackendTopology>;
 

@@ -46,41 +46,85 @@ pub struct AxWindow {
 pub struct AxScan {
     pub windows: Vec<AxWindow>,
     pub focused: Option<WindowId>,
+    pub walk: Walk,
+}
+
+/// What a window walk cost: the walk as a whole, and the app it waited on
+/// longest — with apps read in parallel, that app IS the walk.
+pub struct Walk {
+    pub elapsed: Duration,
+    pub apps: usize,
+    pub slowest: Option<(Pid, Duration)>,
 }
 
 /// Enumerate every standard window of every regular (Dock-visible) app, plus
 /// which window currently has focus.
 pub fn scan() -> AxScan {
+    let focused = focused_window();
+    let (windows, walk) = walk();
     AxScan {
-        focused: focused_window(),
-        windows: windows(),
+        focused,
+        windows,
+        walk,
     }
 }
 
 /// The window half of [`scan`], for callers who don't need focus (asking every
 /// app "are you frontmost?" is a second full round of IPC).
 pub fn windows() -> Vec<AxWindow> {
-    let mut windows = Vec::new();
-    let apps = NSWorkspace::sharedWorkspace().runningApplications();
-    for app in apps.iter() {
-        if app.activationPolicy() != NSApplicationActivationPolicy::Regular {
-            continue;
-        }
-        let pid = app.processIdentifier();
-        if pid <= 0 {
-            continue;
-        }
-        let bundle_id = app.bundleIdentifier().map(|b| b.to_string());
-        let el = unsafe { AXUIElement::new_application(pid) };
-        unsafe { el.set_messaging_timeout(MESSAGING_TIMEOUT_SECS) };
+    walk().0
+}
 
-        // The window elements are borrowed from this array, so every read must
-        // happen before it's released — releasing first would leave dangling
-        // AXUIElement pointers (a use-after-free that only surfaces once the
-        // app actually has windows to enumerate).
-        let Some(raw) = (unsafe { copy_attr(&el, "AXWindows") }) else {
-            continue;
-        };
+/// Every app is asked on its own thread. Each read is a round trip to that
+/// app and waits on its main thread, and mid-switch the apps are busy with
+/// the very hides and moves Ordo just sent: read one after another, the walk
+/// cost the sum of every app's delay; in parallel it costs the slowest one.
+/// Results keep the running-apps order, so the snapshot reads the same.
+fn walk() -> (Vec<AxWindow>, Walk) {
+    let started = Instant::now();
+    // AppKit objects stay on this thread; only plain data crosses.
+    let apps: Vec<(i32, Option<String>)> = NSWorkspace::sharedWorkspace()
+        .runningApplications()
+        .iter()
+        .filter(|a| a.activationPolicy() == NSApplicationActivationPolicy::Regular)
+        .map(|a| (a.processIdentifier(), a.bundleIdentifier().map(|b| b.to_string())))
+        .filter(|(pid, _)| *pid > 0)
+        .collect();
+    let per_app: Vec<(Vec<AxWindow>, Duration)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = apps
+            .iter()
+            .map(|(pid, bundle_id)| scope.spawn(move || app_windows(*pid, bundle_id)))
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or_default())
+            .collect()
+    });
+    let slowest = apps
+        .iter()
+        .zip(&per_app)
+        .max_by_key(|(_, (_, took))| *took)
+        .map(|((pid, _), (_, took))| (Pid(*pid), *took));
+    let windows = per_app.into_iter().flat_map(|(w, _)| w).collect();
+    let walk = Walk {
+        elapsed: started.elapsed(),
+        apps: apps.len(),
+        slowest,
+    };
+    (windows, walk)
+}
+
+fn app_windows(pid: i32, bundle_id: &Option<String>) -> (Vec<AxWindow>, Duration) {
+    let started = Instant::now();
+    let mut windows = Vec::new();
+    let el = unsafe { AXUIElement::new_application(pid) };
+    unsafe { el.set_messaging_timeout(MESSAGING_TIMEOUT_SECS) };
+
+    // The window elements are borrowed from this array, so every read must
+    // happen before it's released — releasing first would leave dangling
+    // AXUIElement pointers (a use-after-free that only surfaces once the
+    // app actually has windows to enumerate).
+    if let Some(raw) = unsafe { copy_attr(&el, "AXWindows") } {
         unsafe {
             for i in 0..super::cf::array_len(raw) {
                 let win = super::cf::array_get(raw, i) as *const AXUIElement;
@@ -94,8 +138,7 @@ pub fn windows() -> Vec<AxWindow> {
             sys::CFRelease(raw);
         }
     }
-
-    windows
+    (windows, started.elapsed())
 }
 
 fn read_window(win: *const AXUIElement, app: Pid, bundle_id: Option<String>) -> Option<AxWindow> {

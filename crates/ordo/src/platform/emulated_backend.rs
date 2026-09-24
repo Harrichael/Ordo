@@ -126,7 +126,7 @@ impl EmulatedBackend {
 impl WorkspaceBackend for EmulatedBackend {
     fn topology(
         &mut self,
-        windows: &[(WindowId, Pid)],
+        windows: &HashMap<WindowId, (Pid, Rect)>,
         monitors: &[(MonitorId, Rect, bool)],
     ) -> Result<BackendTopology> {
         self.model.note_scan(&self.desktop, windows);

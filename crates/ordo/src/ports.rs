@@ -6,7 +6,9 @@
 //! reproducibly, so the OS edge is where fakes belong. The real implementations
 //! live in [`crate::platform`]; the tests script a fake world.
 
-use ordo_core::{Effect, OpOutcome, WindowId, WorldSnapshot};
+use std::time::Duration;
+
+use ordo_core::{Effect, OpOutcome, Pid, WindowId, WorldSnapshot};
 use ordo_emulated::ParkTrace;
 
 /// Produces a full observation of the world on demand. The engine never trusts
@@ -30,6 +32,26 @@ pub trait WorldSource {
     /// nothing failing. Requiring the method makes that omission a compile
     /// error, which is the only reason it was found at all.
     fn take_park_trace(&mut self) -> Vec<ParkTrace>;
+
+    /// What the snapshot just built cost, for the same telemetry side channel
+    /// (see [`SnapshotStats`]). Sources that don't measure return None. Not
+    /// defaulted, for the reason given on `take_park_trace`.
+    fn take_snapshot_stats(&mut self) -> Option<SnapshotStats>;
+}
+
+/// Where a snapshot's time went. A hotkey that arrives mid-snapshot waits for
+/// all of it, so this is what says whether reading the apps, or the placement
+/// check that rides along, is what a burst press is waiting on — and which
+/// app, when one app is most of it.
+pub struct SnapshotStats {
+    pub total: Duration,
+    /// Reading every app's windows (apps in parallel).
+    pub walk: Duration,
+    /// The placement check, which can write.
+    pub enforce: Duration,
+    pub apps: usize,
+    pub windows: usize,
+    pub slowest: Option<(Pid, Duration)>,
 }
 
 /// Carries out a core [`Effect`] against the OS.

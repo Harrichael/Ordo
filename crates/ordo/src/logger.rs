@@ -19,14 +19,15 @@
 //! Some side channels are telemetry, not record, there to answer a future
 //! statistics question rather than to replay: `restacks`/`raises` hold the
 //! z-order reassert's timing breakdown (see [`crate::ports::RestackStats`]),
-//! and `hotkey_batches` holds how long presses queued behind the engine and
-//! how many a burst folded away (see [`HotkeyBatch`]).
+//! `hotkey_batches` holds how long presses queued behind the engine and how
+//! many a burst folded away (see [`HotkeyBatch`]), and `snapshots` holds where
+//! each world snapshot's time went (see [`crate::ports::SnapshotStats`]).
 
 use std::path::{Path, PathBuf};
 
 use ordo_emulated::ParkTrace;
 
-use crate::ports::RestackStats;
+use crate::ports::{RestackStats, SnapshotStats};
 use crate::schema;
 use ordo_core::{Effect, Event, Note, OpId, OpOutcome, State};
 use rusqlite::{params, Connection};
@@ -298,6 +299,34 @@ impl Logger {
                 b.pumped as i64,
                 b.oldest_wait.as_millis() as i64,
                 b.newest_wait.as_millis() as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// `seq` is the snapshot's own `world_observed` event.
+    pub fn log_snapshot_stats(
+        &mut self,
+        seq: u64,
+        s: &SnapshotStats,
+        now_wall_ms: i64,
+    ) -> rusqlite::Result<()> {
+        let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+        self.conn.execute(
+            "INSERT INTO snapshots (run_id, wall_ms, seq, total_ms, walk_ms, enforce_ms,
+                 apps, windows, slowest_pid, slowest_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                self.run_id,
+                now_wall_ms,
+                seq as i64,
+                ms(s.total),
+                ms(s.walk),
+                ms(s.enforce),
+                s.apps as i64,
+                s.windows as i64,
+                s.slowest.map(|(p, _)| p.0),
+                s.slowest.map(|(_, d)| ms(d)),
             ],
         )?;
         Ok(())

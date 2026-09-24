@@ -25,7 +25,7 @@ use ordo_core::{
 
 use crate::clock::Clock;
 use crate::logger::{HotkeyBatch, Logger};
-use crate::ports::{Effector, RestackStats, WorldSource};
+use crate::ports::{Effector, RestackStats, SnapshotStats, WorldSource};
 
 /// What the outside world sends the engine. Producers (the tap thread, the
 /// periodic timer, later the AX observer and the rescue signal) speak this;
@@ -128,6 +128,10 @@ pub struct Engine {
     effector: Box<dyn Effector>,
     clock: Box<dyn Clock>,
     on_state: Option<StateWatcher>,
+    /// Each queued snapshot's cost, in the order their events were queued: a
+    /// snapshot taken mid-cascade has no sequence number until its event is
+    /// logged, and events leave the queue in the order they entered it.
+    snapshot_costs: VecDeque<Option<SnapshotStats>>,
 }
 
 type StateWatcher = Box<dyn FnMut(&State)>;
@@ -146,6 +150,7 @@ impl Engine {
             effector,
             clock,
             on_state: None,
+            snapshot_costs: VecDeque::new(),
         }
     }
 
@@ -186,6 +191,7 @@ impl Engine {
     pub fn observe(&mut self, trigger: RescanTrigger) {
         let snap = self.world.snapshot();
         self.drain_park_trace();
+        let cost = self.world.take_snapshot_stats();
         // No displays means the world is unobservable, not empty — displays
         // asleep make every window "missing", and believing that once erased
         // the whole model over a weekend. Discard the blind scan; the next
@@ -193,6 +199,7 @@ impl Engine {
         if snap.monitors.is_empty() {
             return;
         }
+        self.snapshot_costs.push_back(cost);
         self.pump(Event::WorldObserved {
             at: self.clock.now(),
             trigger,
@@ -332,9 +339,16 @@ impl Engine {
             }
 
             let step = update(&self.state, &ev);
-            let _ = self
+            let seq = self
                 .logger
                 .log_step(&ev, &step.effects, &step.notes, &step.state);
+            if let Event::WorldObserved { .. } = &ev {
+                if let (Ok(seq), Some(Some(cost))) = (seq, self.snapshot_costs.pop_front()) {
+                    let _ = self
+                        .logger
+                        .log_snapshot_stats(seq, &cost, self.clock.now().wall_ms);
+                }
+            }
             if let Event::EffectResult { op, outcome, at } = &ev {
                 let _ = self.logger.log_op_result(*op, outcome, at.wall_ms);
             }
@@ -344,6 +358,8 @@ impl Engine {
                 self.carry_out(effect, &mut queue);
             }
         }
+        // A cascade cut off at the cap leaves queued snapshots unlogged.
+        self.snapshot_costs.clear();
     }
 
     fn carry_out(&mut self, effect: &Effect, queue: &mut VecDeque<Event>) {
@@ -354,12 +370,14 @@ impl Engine {
             Effect::RequestRescan { reason } => {
                 let snap = self.world.snapshot();
                 self.drain_park_trace();
+                let cost = self.world.take_snapshot_stats();
                 // The same blind-scan discard as `observe`: a post-effect
                 // rescan during display sleep or a display reconfiguration
                 // must not feed the core an empty world.
                 if snap.monitors.is_empty() {
                     return;
                 }
+                self.snapshot_costs.push_back(cost);
                 queue.push_back(Event::WorldObserved {
                     at: self.clock.now(),
                     trigger: reason.clone(),
