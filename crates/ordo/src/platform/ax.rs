@@ -377,6 +377,18 @@ pub fn set_app_hidden(pid: Pid, hidden: bool) {
     }
 }
 
+/// Whether the app is hidden, read live from its `AXHidden` — not
+/// `NSRunningApplication.isHidden`, a cache this thread never refreshes (see
+/// [`set_app_hidden`]).
+pub fn app_hidden(pid: Pid) -> Option<bool> {
+    let el = unsafe { AXUIElement::new_application(pid.0) };
+    unsafe { el.set_messaging_timeout(MESSAGING_TIMEOUT_SECS) };
+    let raw = unsafe { copy_attr(&el, "AXHidden") }?;
+    let hidden = unsafe { &*(raw as *const CFBoolean) }.value();
+    unsafe { sys::CFRelease(raw) };
+    Some(hidden)
+}
+
 /// The frames of these windows of one app, read from the app itself — the
 /// only source for a hidden app, whose windows the window server's list
 /// drops. One AXWindows walk; windows not found are left out.

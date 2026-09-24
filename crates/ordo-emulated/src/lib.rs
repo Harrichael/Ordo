@@ -86,6 +86,10 @@ pub trait Desktop {
     /// out of it. Windows the app doesn't report are left out.
     fn window_frames(&self, pid: Pid, windows: &[WindowId]) -> Vec<(WindowId, Rect)>;
 
+    /// Whether the app is hidden right now, asked of the app itself; None when
+    /// it doesn't answer.
+    fn app_hidden(&self, pid: Pid) -> Option<bool>;
+
     /// Un-hide these apps, HOLDING each one's listed windows at the given
     /// origin until the desktop agrees they are there.
     ///

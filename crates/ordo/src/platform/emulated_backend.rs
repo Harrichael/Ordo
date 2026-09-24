@@ -37,6 +37,10 @@ impl Desktop for AxDesktop {
         ax::set_app_hidden(pid, true);
     }
 
+    fn app_hidden(&self, pid: Pid) -> Option<bool> {
+        ax::app_hidden(pid)
+    }
+
     fn window_frames(&self, pid: Pid, windows: &[WindowId]) -> Vec<(WindowId, Rect)> {
         ax::window_frames(pid, windows)
     }

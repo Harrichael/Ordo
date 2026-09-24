@@ -868,6 +868,8 @@ impl EmulatedWorkspaces {
         }
         let mut writes = Vec::new();
         let mut newly_parked = false;
+        // Asked only once something has left its park, and then once a pass.
+        let mut front: Option<Option<Pid>> = None;
         for w in hidden {
             let Some((pid, f)) = frames.get(&w) else {
                 continue;
@@ -877,6 +879,20 @@ impl EmulatedWorkspaces {
                 self.pending_repark.remove(&w);
                 continue;
             }
+            // Parked windows turn up at the display's edge, their app's own
+            // doing. Whether that app was still hidden (nothing showed) or
+            // had come back (it flashed), and who was in front, say which.
+            let front_app = *front.get_or_insert_with(|| d.frontmost_app());
+            let seen = format!(
+                "app {} hidden: {}; front app: {}",
+                pid.0,
+                match d.app_hidden(*pid) {
+                    Some(true) => "yes",
+                    Some(false) => "no",
+                    None => "unknown",
+                },
+                front_app.map_or("none".to_string(), |p| p.0.to_string())
+            );
             let own_write = self.saved.get(&w).is_some_and(|s| same_position(f, s))
                 || self
                     .last_requested
@@ -896,13 +912,16 @@ impl EmulatedWorkspaces {
                     )
                     .at_park(false)
                     .attempt(self.enforce_attempts.get(&w).copied().unwrap_or(0))
-                    .detail(if systemic {
-                        "display set changed; whole pass uncounted"
-                    } else if withheld {
-                        "our own write; re-park already in flight, none issued"
-                    } else {
-                        "frame matches our own write; re-park uncounted"
-                    });
+                    .detail(format!(
+                        "{}; {seen}",
+                        if systemic {
+                            "display set changed; whole pass uncounted"
+                        } else if withheld {
+                            "our own write; re-park already in flight, none issued"
+                        } else {
+                            "frame matches our own write; re-park uncounted"
+                        }
+                    ));
                 self.note(t);
                 if withheld {
                     continue;
@@ -956,7 +975,8 @@ impl EmulatedWorkspaces {
                         current,
                     )
                     .at_park(false)
-                    .attempt(self.enforce_attempts.get(&w).copied().unwrap_or(0));
+                    .attempt(self.enforce_attempts.get(&w).copied().unwrap_or(0))
+                    .detail(seen);
                 self.note(t);
                 self.park_request.insert(w, want);
                 if own_write && !systemic {
@@ -1950,6 +1970,10 @@ mod tests {
             }
         }
 
+        fn app_hidden(&self, pid: Pid) -> Option<bool> {
+            Some(self.hidden.borrow().contains(&pid))
+        }
+
         fn window_frames(&self, pid: Pid, windows: &[WindowId]) -> Vec<(WindowId, Rect)> {
             let ws = self.windows.borrow();
             windows
@@ -2122,6 +2146,32 @@ mod tests {
             .find(|t| t.kind == ParkTraceKind::AppHidden && t.pid == Some(Pid(10)))
             .expect("the hide is traced");
         assert!(hidden.detail.as_deref().unwrap().ends_with("1 off their spot"));
+    }
+
+    /// A parked window found off its park says whether its app was still
+    /// hidden — nothing showed — or had come back, which is the flash.
+    #[test]
+    fn a_parked_window_found_off_its_park_says_whether_its_app_was_hidden() {
+        let d = FakeDesktop::new(&[
+            (w(1), Pid(10), rect(100.0, 100.0)),
+            (w(2), Pid(20), rect(300.0, 200.0)),
+        ]);
+        let mut b = EmulatedWorkspaces::new(3);
+        b.note_scan(&d, &d.scan());
+        b.assign_window_to_workspace(w(2), ws(2)).unwrap();
+        b.switch_workspace(&d, ws(2));
+        d.yank_on_hide.set(true);
+        d.hide_app(Pid(10)); // AppKit's pull, while the app stays hidden
+        b.take_trace();
+
+        rescan(&d, &mut b);
+
+        let found = b
+            .take_trace()
+            .into_iter()
+            .find(|t| t.window == w(1) && t.kind == ParkTraceKind::Reassert)
+            .expect("the pulled window is re-parked");
+        assert!(found.detail.unwrap().contains("app 10 hidden: yes"));
     }
 
     #[test]
