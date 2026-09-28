@@ -155,6 +155,13 @@ pub struct State {
     /// events, so this is exact and replayable.
     #[serde(default)]
     pub(crate) navigation_gesture: bool,
+    /// A menu-bar click opened a menu that no click or hotkey has closed yet.
+    /// While a menu tracks, the front app can report a window on a hidden
+    /// workspace as focused (kitty was caught doing it on every click), and
+    /// refocusing in answer closes the menu; the click that ends it may be a
+    /// menu item, which can open anything.
+    #[serde(default)]
+    pub(crate) menu_open: bool,
     /// The app that kept the key window when enforcement last stood down,
     /// while it still holds the slot. Retiring to `Deferred` alone does not
     /// end a standoff against a window on a HIDDEN workspace: the
@@ -207,6 +214,7 @@ impl State {
             focus_intent: FocusIntent::Deferred,
             focus_corrections: 0,
             navigation_gesture: false,
+            menu_open: false,
             conceded: None,
             focus_history: FocusHistory::new(),
             misplaced_since: BTreeMap::new(),

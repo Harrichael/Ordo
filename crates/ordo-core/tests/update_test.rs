@@ -856,6 +856,59 @@ fn a_menu_bar_click_moves_focus_to_its_display_but_never_follows_a_hidden_window
     assert_eq!(count_switches(&landed.effects), 0);
 }
 
+/// While a menu from the menu bar is open, the front app may report one of
+/// its windows on a hidden workspace as focused. That is the menu tracking,
+/// not the user going there and not an app grabbing focus: refocusing in
+/// answer closes the menu under the user's cursor, so nothing is done. The
+/// click that ends the menu may be one of its items — "System Settings…",
+/// whose only window lives on workspace 2 — and the landing after it is the
+/// user going there, followed as Cmd+Tab's would be, even though the click
+/// fell where the menu hung over a visible window.
+#[test]
+fn an_open_menu_is_left_alone_and_the_app_its_item_opens_is_followed() {
+    let mut wins = std_windows();
+    wins[1].workspace = ws(2);
+    let obs = |focused: u32| {
+        observed(
+            vec![mon_a(1), mon_b(1)],
+            wins.clone(),
+            Some(focused),
+            RescanTrigger::Periodic,
+        )
+    };
+    let s = update(&booted(&[1]), &obs(1)).state;
+    let menu = gesture(Gesture::MenuBar {
+        at: Point { x: 20.0, y: 10.0 },
+    });
+
+    let open = update(&s, &menu).state;
+    let tracking = update(&open, &obs(2));
+    assert!(tracking.effects.is_empty(), "{:?}", tracking.effects);
+    let still_open = update(&tracking.state, &obs(2));
+    assert!(still_open.effects.is_empty(), "{:?}", still_open.effects);
+
+    let item = update(&update(&s, &menu).state, &click(200.0, 200.0));
+    assert!(item.notes.contains(&Note::GestureClassified {
+        gesture: Gesture::MouseDown {
+            at: Point { x: 200.0, y: 200.0 }
+        },
+        armed: true,
+        within: None,
+    }));
+    let opened = update(&item.state, &obs(2));
+    assert!(opened
+        .effects
+        .iter()
+        .any(|e| matches!(e, Effect::SwitchWorkspace { target, .. } if *target == ws(2))));
+    assert_eq!(opened.state.focus_intent(), FocusIntent::Window(wid(2)));
+
+    // Once the menu is closed, a click into a window is that window's again.
+    let after = update(&item.state, &click(200.0, 200.0)).state;
+    let fling = update(&after, &obs(2));
+    assert_eq!(count_switches(&fling.effects), 0);
+    assert_eq!(focus_targets(&fling.effects), vec![wid(1)]);
+}
+
 #[test]
 fn a_click_into_a_visible_window_does_not_license_a_follow_but_a_click_elsewhere_does() {
     // Same world: w2 parked on workspace 2, w1 (100,100 400x300) visible.

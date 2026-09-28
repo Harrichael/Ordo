@@ -139,6 +139,7 @@ pub fn update(state: &State, event: &Event) -> Step {
 
     match event {
         Event::Hotkey { at, action } => {
+            s.menu_open = false;
             if s.mode == Mode::Active {
                 handle_hotkey(&mut s, *action, at.mono_ns, &mut effects);
             }
@@ -261,11 +262,18 @@ fn view_for(s: &State, target: WindowId) -> (Option<VirtualMonitorId>, Projectio
 /// going there, but only if the gesture could have been aimed there: a click
 /// INTO a window on the visible workspace keys that window (or a sheet or
 /// child Ordo does not model), so a hidden landing after it is a fling.
+///
+/// A click that ends an open menu is classified as the menu's, not as a click
+/// into whatever window the menu was drawn over: it may be a menu item, and a
+/// menu item can open anything.
 fn handle_gesture(s: &mut State, gesture: Gesture, notes: &mut Vec<Note>) {
     s.declare_focus(FocusIntent::Deferred);
+    let opens_menu = matches!(gesture, Gesture::MenuBar { .. });
+    let menu_was_open = std::mem::replace(&mut s.menu_open, opens_menu);
     let (armed, within) = match gesture {
         Gesture::SystemSwitch => (true, None),
         Gesture::MenuBar { .. } => (false, None),
+        Gesture::MouseDown { .. } if menu_was_open => (true, None),
         Gesture::MouseDown { at } => {
             let here = s.current_workspace();
             let within = s
@@ -1437,6 +1445,10 @@ fn enforce_focus(
         .filter(|r| !s.is_visible(r) && r.workspace.0 >= 1 && r.workspace.0 <= s.workspace_count)
         .cloned();
     if let (Some(rec), None) = (&landed_hidden, s.focus_target()) {
+        // Neither the user going there nor a fling: see `State::menu_open`.
+        if s.menu_open {
+            return;
+        }
         if navigation_gesture {
             // Follow on whichever axes hide the window: the workspace, the
             // monitor, or both.
