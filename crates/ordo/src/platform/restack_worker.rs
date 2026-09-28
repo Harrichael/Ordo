@@ -65,6 +65,12 @@ impl RestackHandle {
         *slot = Some((generation, order, focus_top));
         self.shared.wake.notify_one();
     }
+
+    /// Cancel the order in flight, and its ghost watch, without a new one.
+    pub fn supersede(&self) {
+        self.shared.generation.fetch_add(1, Ordering::SeqCst);
+        *self.shared.slot.lock().unwrap() = None;
+    }
 }
 
 /// Spawn the worker; the thread lives until the process exits (same lifetime
@@ -117,9 +123,11 @@ pub fn spawn(tx: Sender<Msg>, signals: Arc<RaiseSignals>) -> RestackHandle {
             match signals.wait(&mut cursor, &ordered, deadline, &cancel) {
                 WaitOutcome::Hint => {
                     // The rerun is the read-back: it exits converged with
-                    // zero raises when the order in fact still holds.
+                    // zero raises when the order in fact still holds. It
+                    // never takes focus: a late landing doesn't move focus,
+                    // and a click in the watch window would be fought.
                     if let Some(mut stats) =
-                        super::zorder::reassert_stack(&order, focus_top, &cancel, Some(&signals))
+                        super::zorder::reassert_stack(&order, false, &cancel, Some(&signals))
                     {
                         stats.ghost_pass = true;
                         if tx.send(Msg::RestackStats(stats)).is_err() {

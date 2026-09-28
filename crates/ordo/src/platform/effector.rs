@@ -49,6 +49,20 @@ impl Effector for MacEffector {
     }
 
     fn execute(&mut self, effect: &Effect) -> Option<OpOutcome> {
+        // These change what is on screen, so the order in flight is stale
+        // before the new one is submitted after them: left running, its
+        // ghost watch reads this effect's own hides as late landings and
+        // re-raises a workspace the user is leaving.
+        if matches!(
+            effect,
+            Effect::SwitchWorkspace { .. }
+                | Effect::MoveWindowToWorkspace { .. }
+                | Effect::ViewMonitor { .. }
+                | Effect::SetVirtualMonitors { .. }
+                | Effect::MergeMonitors { .. }
+        ) {
+            self.restack.supersede();
+        }
         match effect {
             Effect::FocusWindow { window, .. } => {
                 Some(found_outcome(ax::focus(*window), "focus: window not found"))
