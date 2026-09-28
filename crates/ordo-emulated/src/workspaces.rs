@@ -21,6 +21,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use ordo_core::{
     project, Pid, Point, Rect, VirtualMonitorId, VirtualMonitors, WindowId,
@@ -58,6 +59,16 @@ const CLAMP_SLACK: f64 = 160.0;
 /// permanent, while a visibly misplaced window is obvious and self-heals on
 /// the next switch or command.
 const ENFORCE_LIMIT: u8 = 3;
+
+/// How long after the last switch the apps left with nothing on screen are
+/// hidden. A quick round trip then never hides and un-hides an app. Around
+/// one, a window was measured coming back under one that stayed shown (9 of
+/// 11 real hides), for the stacking worker to repair at the app's own pace;
+/// the cause is not yet understood (no isolated hide reproduced it).
+const HIDE_SETTLE: Duration = Duration::from_millis(500);
+
+/// Each app's windows that are off screen, with where each is parked.
+type ParkedByApp = HashMap<Pid, Vec<(WindowId, Point)>>;
 
 /// The rectangles park geometry depends on. They are NOT interchangeable, and
 /// conflating them is how a row of title bars ended up across the bottom of
@@ -197,6 +208,9 @@ pub struct EmulatedWorkspaces {
     /// The display set changed during a scan that saw no windows (a locked
     /// screen): the next scan that does see them is still the replug's pass.
     replug_unseen: bool,
+    /// When the apps left with nothing on screen are to be hidden: a switch
+    /// un-hides at once but hides only once the user settles.
+    hides_due: Option<Instant>,
     /// Diagnostic record of what this model did to windows' frames, drained by
     /// the shell each snapshot. See [`crate::trace`] for why it must exist:
     /// every other channel sees the substituted belief, so without this the
@@ -223,6 +237,7 @@ impl EmulatedWorkspaces {
             learn_monitors: false,
             homecoming: HashMap::new(),
             replug_unseen: false,
+            hides_due: None,
             trace: Vec::new(),
         }
     }
@@ -876,6 +891,10 @@ impl EmulatedWorkspaces {
                 self.move_windows(d, &writes);
             }
         }
+        if self.hides_due.is_some_and(|due| d.now() >= due) {
+            self.hides_due = None;
+            self.hide_idle_apps(d, frames, &g);
+        }
         let current = self.ledger.current();
         let proj = self.ledger.projection();
         let claims = self.ledger.window_claims();
@@ -1398,18 +1417,11 @@ impl EmulatedWorkspaces {
         (ParkTraceKind::Rehost, want)
     }
 
-    /// Dock dimming: hide (Cmd+H-style) every app whose known windows are all
-    /// off screen, unhide every app with a window here. With the Dock's
+    /// Dock dimming: unhide every app with a window here now, and hide
+    /// (Cmd+H-style) every app whose known windows are all off screen once
+    /// the user has settled — see [`HIDE_SETTLE`]. With the Dock's
     /// `showhidden` pref, "hidden" renders as a translucent icon — the
     /// closest macOS gets to a per-workspace Dock.
-    ///
-    /// The front app is never hidden: hiding the active app makes macOS fling
-    /// focus somewhere arbitrary. That is the front app, not the owner of the
-    /// key window — Finder holding the desktop has no key window, and hiding
-    /// it threw the desktop's focus away. Core-side, switches hand focus to
-    /// the destination (a window, or on an empty workspace the desktop)
-    /// before this runs, so the exemption almost never bites; when it does,
-    /// the app just stays undimmed.
     ///
     /// The un-hide carries the park origins of the app's windows declared
     /// elsewhere: revealing an app drags exactly those back on screen unless
@@ -1422,62 +1434,15 @@ impl EmulatedWorkspaces {
         g: &Geometry,
     ) {
         let current = self.ledger.current();
-        let proj = self.ledger.projection();
-        let mut here_by_app: HashMap<Pid, bool> = HashMap::new();
-        for (window, (pid, _)) in frames {
-            if self.ledger.claim(*window).is_some() {
-                *here_by_app.entry(*pid).or_insert(false) |= self.ledger.visible(*window, &proj);
-            }
-        }
-        let focused_app = d.frontmost_app();
-        // Each app's windows that are NOT on screen: the ones an unhide
-        // reveals along with the wanted one, so also the ones it has to be
-        // told to hold — and where. The park REQUEST is the anchor when there
-        // is one; without it (a promise loaded from disk, a window this
-        // process never parked) the corner is recomputed, which is the same
-        // answer because a park depends only on the window's width and keeps
-        // its y.
-        let mut elsewhere: HashMap<Pid, Vec<(WindowId, Point)>> = HashMap::new();
-        for (window, (pid, f)) in frames {
-            if self.ledger.claim(*window).is_some() && !self.ledger.visible(*window, &proj) {
-                let want = self
-                    .park_request
-                    .get(window)
-                    .copied()
-                    .unwrap_or_else(|| park_frame(*f, g));
-                elsewhere.entry(*pid).or_default().push((
-                    *window,
-                    Point {
-                        x: want.x,
-                        y: want.y,
-                    },
-                ));
-            }
-        }
-        for hold in elsewhere.values_mut() {
-            hold.sort_by_key(|(w, _)| w.0);
-        }
-        let mut shows: Vec<Unhide> = Vec::new();
-        let mut notes = Vec::new();
-        for (pid, has_window_here) in here_by_app {
-            let hold = elsewhere.get(&pid).cloned().unwrap_or_default();
-            if has_window_here {
-                shows.push(Unhide { pid, hold });
-            } else if Some(pid) != focused_app {
-                d.hide_app(pid);
-                let (read, off) = off_after_hide(d, pid, &hold);
-                notes.push(
-                    ParkTrace::app(pid, ParkTraceKind::AppHidden)
-                        .ws(current, current)
-                        .detail(format!(
-                            "hidden; {} window(s) parked, {read} read back, {} off their spot",
-                            hold.len(),
-                            off.len()
-                        )),
-                );
-                notes.extend(off.into_iter().map(|t| t.ws(current, current)));
-            }
-        }
+        let (here_by_app, elsewhere) = self.apps_on_screen(frames, g);
+        let shows: Vec<Unhide> = here_by_app
+            .into_iter()
+            .filter(|(_, here)| *here)
+            .map(|(pid, _)| Unhide {
+                pid,
+                hold: elsewhere.get(&pid).cloned().unwrap_or_default(),
+            })
+            .collect();
         // One call for every un-hide of this pass: they overlap in time rather
         // than queueing, so a switch costs the slowest app's reveal.
         let held: HashMap<Pid, HoldStat> = d
@@ -1495,11 +1460,89 @@ impl EmulatedWorkspaces {
             if let Some(s) = held.get(&u.pid) {
                 t = t.hold(s.clone());
             }
-            notes.push(t);
-        }
-        for t in notes {
             self.note(t);
         }
+        self.hides_due = Some(d.now() + HIDE_SETTLE);
+    }
+
+    /// The deferred half of [`Self::apply_app_visibility`], judged against
+    /// the screen as it is now rather than as the last switch left it.
+    ///
+    /// The front app is never hidden: hiding the active app makes macOS fling
+    /// focus somewhere arbitrary. That is the front app, not the owner of the
+    /// key window — Finder holding the desktop has no key window, and hiding
+    /// it threw the desktop's focus away. When the exemption bites, the app
+    /// just stays undimmed.
+    fn hide_idle_apps(
+        &mut self,
+        d: &dyn Desktop,
+        frames: &HashMap<WindowId, (Pid, Rect)>,
+        g: &Geometry,
+    ) {
+        let current = self.ledger.current();
+        let (here_by_app, elsewhere) = self.apps_on_screen(frames, g);
+        let focused_app = d.frontmost_app();
+        for (pid, has_window_here) in here_by_app {
+            if has_window_here || Some(pid) == focused_app || d.app_hidden(pid) == Some(true) {
+                continue;
+            }
+            let hold = elsewhere.get(&pid).cloned().unwrap_or_default();
+            d.hide_app(pid);
+            let (read, off) = off_after_hide(d, pid, &hold);
+            self.note(
+                ParkTrace::app(pid, ParkTraceKind::AppHidden)
+                    .ws(current, current)
+                    .detail(format!(
+                        "hidden; {} window(s) parked, {read} read back, {} off their spot",
+                        hold.len(),
+                        off.len()
+                    )),
+            );
+            for t in off {
+                self.note(t.ws(current, current));
+            }
+        }
+    }
+
+    /// Per app: whether any of its ledger windows is on screen, and where
+    /// each of its other ledger windows is parked. The park REQUEST is the
+    /// anchor when there is one; without it (a promise loaded from disk, a
+    /// window this process never parked) the corner is recomputed, which is
+    /// the same answer because a park depends only on the window's width and
+    /// keeps its y.
+    fn apps_on_screen(
+        &self,
+        frames: &HashMap<WindowId, (Pid, Rect)>,
+        g: &Geometry,
+    ) -> (HashMap<Pid, bool>, ParkedByApp) {
+        let proj = self.ledger.projection();
+        let mut here_by_app: HashMap<Pid, bool> = HashMap::new();
+        let mut elsewhere: ParkedByApp = HashMap::new();
+        for (window, (pid, f)) in frames {
+            if self.ledger.claim(*window).is_none() {
+                continue;
+            }
+            let visible = self.ledger.visible(*window, &proj);
+            *here_by_app.entry(*pid).or_insert(false) |= visible;
+            if !visible {
+                let want = self
+                    .park_request
+                    .get(window)
+                    .copied()
+                    .unwrap_or_else(|| park_frame(*f, g));
+                elsewhere.entry(*pid).or_default().push((
+                    *window,
+                    Point {
+                        x: want.x,
+                        y: want.y,
+                    },
+                ));
+            }
+        }
+        for hold in elsewhere.values_mut() {
+            hold.sort_by_key(|(w, _)| w.0);
+        }
+        (here_by_app, elsewhere)
     }
 }
 
@@ -1825,6 +1868,7 @@ mod tests {
         /// An active app with no key window (Finder on the desktop); else the
         /// front app is the focused window's.
         front: std::cell::Cell<Option<Pid>>,
+        now: std::cell::Cell<Instant>,
     }
 
     impl FakeDesktop {
@@ -1841,6 +1885,7 @@ mod tests {
                 displays: std::cell::RefCell::new(vec![MAIN, SECOND]),
                 focused: std::cell::Cell::new(None),
                 front: std::cell::Cell::new(None),
+                now: std::cell::Cell::new(Instant::now()),
             }
         }
 
@@ -1918,6 +1963,13 @@ mod tests {
 
         fn freeze(&self) {
             self.frozen.set(true);
+        }
+
+        /// The user stays put long enough for the deferred hides, and the
+        /// next snapshot carries them out.
+        fn settle(&self, b: &mut EmulatedWorkspaces) {
+            self.now.set(self.now.get() + HIDE_SETTLE);
+            b.enforce_placement(self, &self.scan());
         }
 
         fn thaw(&self) {
@@ -2001,6 +2053,10 @@ mod tests {
 
         fn app_hidden(&self, pid: Pid) -> Option<bool> {
             Some(self.hidden.borrow().contains(&pid))
+        }
+
+        fn now(&self) -> Instant {
+            self.now.get()
         }
 
         fn stack(&self) -> Vec<WindowId> {
@@ -2177,6 +2233,7 @@ mod tests {
         b.take_trace();
 
         b.switch_workspace(&d, ws(2));
+        d.settle(&mut b);
 
         let trace = b.take_trace();
         let off: Vec<_> = trace.iter().filter(|t| t.kind == ParkTraceKind::OffAfterHide).collect();
@@ -2192,7 +2249,7 @@ mod tests {
 
     /// Hides and un-hides reorder windows behind the stacking worker's back,
     /// so a switch records the order it started from and the one its
-    /// un-hides left — a hidden app's windows drop out of the second.
+    /// un-hides left — a hidden app's windows are missing until un-hidden.
     #[test]
     fn a_switch_traces_the_stack_before_it_and_after_its_unhides() {
         let d = FakeDesktop::new(&[
@@ -2202,9 +2259,11 @@ mod tests {
         let mut b = EmulatedWorkspaces::new(3);
         b.note_scan(&d, &d.scan());
         b.assign_window_to_workspace(w(2), ws(2)).unwrap();
+        b.switch_workspace(&d, ws(2));
+        d.settle(&mut b);
         b.take_trace();
 
-        b.switch_workspace(&d, ws(2));
+        b.switch_workspace(&d, ws(1));
 
         let stacks: Vec<_> = b
             .take_trace()
@@ -2212,7 +2271,7 @@ mod tests {
             .filter(|t| t.kind == ParkTraceKind::Stack)
             .filter_map(|t| t.detail)
             .collect();
-        assert_eq!(stacks, ["before: 1 2", "after un-hides: 2"]);
+        assert_eq!(stacks, ["before: 2", "after un-hides: 1 2"]);
     }
 
     /// A parked window found off its park says whether its app was still
@@ -2316,6 +2375,7 @@ mod tests {
         b.note_scan(&d, &d.scan());
         b.move_window_to_workspace(&d, w(1), ws(2)).unwrap();
         b.move_window_to_workspace(&d, w(2), ws(3)).unwrap();
+        d.settle(&mut b);
         assert!(
             d.is_hidden(Pid(10)),
             "dimming hid the app with nothing here"
@@ -3128,6 +3188,7 @@ mod tests {
         assert!(in_park_corner(&d.frame(w(2)), &geo()), "monitor 2 is hidden");
         assert_eq!(b.window_monitors()[&w(2)], vm(2), "declaration kept");
         assert_eq!(d.frame(w(1)), rect(100.0, 100.0), "monitor 1 untouched");
+        d.settle(&mut b);
         assert!(d.is_hidden(Pid(20)), "an app with nothing on screen is dimmed");
 
         // J/K: the other monitor's windows come up, this one's go down.
@@ -3200,8 +3261,33 @@ mod tests {
         rescan(&d, &mut b);
         d.front.set(Some(Pid(30)));
         b.switch_workspace(&d, ws(2));
+        d.settle(&mut b);
         assert!(d.is_hidden(Pid(10)));
         assert!(!d.is_hidden(Pid(30)), "the front app is spared");
+    }
+
+    /// An app is dimmed only once the user stays away from its windows. A
+    /// quick trip out and back never hides it, so it never has to come back
+    /// through an un-hide.
+    #[test]
+    fn a_quick_round_trip_never_hides_the_app_it_left() {
+        let d = FakeDesktop::new(&[
+            (w(1), Pid(10), rect(100.0, 100.0)),
+            (w(2), Pid(20), rect(300.0, 200.0)),
+        ]);
+        let mut b = EmulatedWorkspaces::new(3);
+        rescan(&d, &mut b);
+        b.assign_window_to_workspace(w(2), ws(2)).unwrap();
+
+        b.switch_workspace(&d, ws(2));
+        rescan(&d, &mut b);
+        assert!(!d.is_hidden(Pid(10)), "not yet: the user may be passing through");
+        b.switch_workspace(&d, ws(1));
+        d.settle(&mut b);
+        assert!(!d.is_hidden(Pid(10)));
+        assert!(d.is_hidden(Pid(20)), "the app left behind once settled is");
+        assert!(in_park_corner(&d.frame(w(2)), &geo()));
+        assert_eq!(d.frame(w(1)), rect(100.0, 100.0));
     }
 
     /// Unplugging piles windows onto the laptop: two staggered windows on

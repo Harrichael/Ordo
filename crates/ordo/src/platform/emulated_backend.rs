@@ -45,6 +45,10 @@ impl Desktop for AxDesktop {
         zorder::stack_front_to_back()
     }
 
+    fn now(&self) -> std::time::Instant {
+        std::time::Instant::now()
+    }
+
     fn window_frames(&self, pid: Pid, windows: &[WindowId]) -> Vec<(WindowId, Rect)> {
         ax::window_frames(pid, windows)
     }

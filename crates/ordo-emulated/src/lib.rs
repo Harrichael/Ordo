@@ -37,6 +37,8 @@ pub mod workspaces;
 pub use trace::{HoldStat, ParkTrace, ParkTraceKind};
 pub use workspaces::{EmulatedWorkspaces, MonitorOutOfRange, WorkspaceOutOfRange};
 
+use std::time::Instant;
+
 use ordo_core::{Pid, Point, Rect, WindowId};
 
 /// One app to un-hide, and the windows that must not come back with it.
@@ -93,6 +95,8 @@ pub trait Desktop {
     /// On-screen windows front to back, per the window server. A hidden
     /// app's windows are not in it.
     fn stack(&self) -> Vec<WindowId>;
+
+    fn now(&self) -> Instant;
 
     /// Un-hide these apps, HOLDING each one's listed windows at the given
     /// origin until the desktop agrees they are there.
