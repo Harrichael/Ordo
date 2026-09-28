@@ -178,8 +178,8 @@ impl Ui {
 
 /// Steps the icon's frame from `from` to `to`, as the menu's frame slides.
 /// Dispatched frame by frame rather than animated by AppKit, because a status
-/// item shows an image, and only a template image follows the menu bar's
-/// appearance.
+/// item shows an image, and an image drawn anew for each menu bar is what
+/// takes that bar's colors.
 fn slide(mailbox: &Arc<Mailbox>, ui: &Ui, from: Strip, to: Strip) {
     let run = ui.slide.get() + 1;
     ui.slide.set(run);
@@ -255,8 +255,8 @@ impl Mark {
     }
 
     fn draw(&self, x: f64) {
-        NSColor::blackColor().setFill();
-        NSColor::blackColor().setStroke();
+        NSColor::labelColor().setFill();
+        NSColor::labelColor().setStroke();
         match self {
             Mark::Current(label) => {
                 let w = self.width();
@@ -270,9 +270,9 @@ impl Mark {
                     PILL_H / 2.0,
                 )
                 .fill();
-                // Punched out rather than drawn in white: the icon is a
-                // template, so only alpha survives, and the hole is what lets
-                // the menu bar's own color show through as the digit.
+                // Punched out rather than drawn in a color: the hole lets the
+                // menu bar itself show through as the digit, whatever is
+                // behind it.
                 let Some(ctx) = NSGraphicsContext::currentContext() else {
                     return;
                 };
@@ -339,8 +339,8 @@ impl Strip {
     }
 
     fn draw(&self, x0: f64) {
-        NSColor::blackColor().setFill();
-        NSColor::blackColor().setStroke();
+        NSColor::labelColor().setFill();
+        NSColor::labelColor().setStroke();
         let y = (HEIGHT - SCREEN_H) / 2.0;
         for i in 0..self.screens {
             let x = screen_x(i);
@@ -439,7 +439,12 @@ fn icon(view: &MenuBarView, strip: Option<Strip>) -> Retained<NSImage> {
         false,
         &draw,
     );
-    image.setTemplate(true);
+    // Not a template, though that is the usual way to follow the menu bar:
+    // on the unfocused display's bar macOS dims template images far past its
+    // other items (measured at half their contrast, and gone entirely over a
+    // light wallpaper). Drawing in the label color, resolved per bar at draw
+    // time, tints it the same way without that dim.
+    image.setTemplate(false);
     image
 }
 
