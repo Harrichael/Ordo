@@ -125,7 +125,8 @@ pub struct RestackStats {
     pub untouched: u32,
     /// Windows still below one they must be above at the final read-back.
     pub violated_end: u32,
-    /// The planned windows' frames, so any restack can be replanned offline.
+    /// The planned windows' frames, attached ones included, so any restack
+    /// can be replanned offline.
     pub frames: Vec<(WindowId, Rect)>,
     pub raises: Vec<RaiseStat>,
 }

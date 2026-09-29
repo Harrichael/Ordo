@@ -256,6 +256,7 @@ pub(crate) fn apply_snapshot(s: &mut State, snap: &WorldSnapshot) {
                 vmonitor,
                 monitor,
                 frame: w.frame,
+                parent: w.parent,
                 ws_corrections,
                 frame_corrections,
             },
@@ -266,6 +267,17 @@ pub(crate) fn apply_snapshot(s: &mut State, snap: &WorldSnapshot) {
         if is_new {
             s.focus_history.note_created(w.id);
         }
+    }
+    // The history holds roots only; see `State::root_of`. Checked after every
+    // record is in, since a parent can arrive in the same snapshot as its child.
+    let attached: Vec<WindowId> = s
+        .windows
+        .keys()
+        .copied()
+        .filter(|w| s.root_of(*w) != *w)
+        .collect();
+    for w in attached {
+        s.focus_history.remove(w);
     }
 
     for gone in old_windows.keys() {

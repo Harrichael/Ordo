@@ -724,7 +724,9 @@ fn a_window_moved_by_its_app_gets_its_stack_checked_once_it_settles() {
     let restacks = |fx: &[Effect]| {
         fx.iter()
             .filter_map(|e| match e {
-                Effect::RestackWindows { order, focus_top } => Some((order.clone(), *focus_top)),
+                Effect::RestackWindows {
+                    order, focus_top, ..
+                } => Some((order.clone(), *focus_top)),
                 _ => None,
             })
             .collect::<Vec<_>>()
@@ -742,6 +744,58 @@ fn a_window_moved_by_its_app_gets_its_stack_checked_once_it_settles() {
         vec![(vec![wid(1), wid(3), wid(2)], false)]
     );
     assert_eq!(restacks(&after.effects), vec![]);
+}
+
+/// A popup attached to a window, like Chrome's address-bar suggestions, has
+/// no place of its own in the stack: the window server always
+/// draws it just above its parent. Restacks list roots only and carry the
+/// popup as attached to its root, and the popup resizing checks its root's
+/// stack once it settles.
+#[test]
+fn an_attached_popup_travels_with_its_root_window() {
+    let with_popup = |h| {
+        let mut wins = std_windows();
+        let frame = Rect {
+            x: 150.0,
+            y: 120.0,
+            w: 300.0,
+            h,
+        };
+        let mut popup = win(4, 100, 1, frame);
+        popup.snap.parent = Some(wid(1));
+        wins.push(popup);
+        wins
+    };
+    let see = |s: &State, wins, focused| {
+        update(
+            s,
+            &observed(
+                vec![mon_a(1), mon_b(1)],
+                wins,
+                Some(focused),
+                RescanTrigger::Periodic,
+            ),
+        )
+    };
+    let restacks = |fx: &[Effect]| {
+        fx.iter()
+            .filter_map(|e| match e {
+                Effect::RestackWindows {
+                    order, attached, ..
+                } => Some((order.clone(), attached.clone())),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let opened = see(&booted(&[2, 3, 1]), with_popup(200.0), 1);
+    let resizing = see(&opened.state, with_popup(160.0), 1);
+    let settled = see(&resizing.state, with_popup(160.0), 1);
+
+    assert_eq!(
+        restacks(&settled.effects),
+        vec![(vec![wid(1), wid(3), wid(2)], vec![(wid(4), wid(1))])]
+    );
 }
 
 #[test]
@@ -2969,7 +3023,7 @@ fn a_switch_hands_its_focus_target_to_the_stacking_worker_even_alone() {
     assert_eq!(focus_targets(&step.effects), vec![wid(2)]);
     assert!(step.effects.iter().any(|e| matches!(
         e,
-        Effect::RestackWindows { order, focus_top: true } if *order == vec![wid(2)]
+        Effect::RestackWindows { order, focus_top: true, .. } if *order == vec![wid(2)]
     )));
 }
 

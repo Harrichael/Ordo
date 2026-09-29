@@ -7,6 +7,8 @@ use crate::ids::WindowId;
 const CAP: usize = 512;
 
 /// One global focus history, most-recent-first, each window at most once.
+/// Only root windows are kept (see `State::root_of`): focusing an attached
+/// window is using its root.
 ///
 /// What enters it is DECLARED use, not observed focus: a command that names a
 /// window records it (`State::declare_focus`), and an observed focus is

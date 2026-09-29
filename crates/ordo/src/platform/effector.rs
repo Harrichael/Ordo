@@ -115,8 +115,13 @@ impl Effector for MacEffector {
                 mouse::warp_to(*to);
                 None
             }
-            Effect::RestackWindows { order, focus_top } => {
-                self.restack.submit(order.clone(), *focus_top);
+            Effect::RestackWindows {
+                order,
+                attached,
+                focus_top,
+            } => {
+                self.restack
+                    .submit(order.clone(), attached.clone(), *focus_top);
                 None
             }
             Effect::SetIntercepting { enabled } => {

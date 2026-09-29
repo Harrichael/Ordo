@@ -99,13 +99,23 @@ pub struct Layout {
     adj: [Bits; MAX_WINDOWS],
     /// Index 0 is the designated top, not just the highest present.
     has_top: bool,
+    /// Frames of windows attached to a root here, with the root's index:
+    /// part of the root's footprint.
+    attached: [(u8, Rect); MAX_WINDOWS],
+    n_attached: usize,
 }
 
 impl Layout {
     /// A window counts only if it is listed and more than a sliver of it is on
     /// some display: a parked window shows 1pt, and has no order anyone can
-    /// see.
-    pub fn new(priority: &[WindowId], stack: &[Seen], displays: &[Rect]) -> Layout {
+    /// see. `attached` pairs each attached window with its root: the root
+    /// overlaps whatever it or they overlap.
+    pub fn new(
+        priority: &[WindowId],
+        attached: &[(WindowId, WindowId)],
+        stack: &[Seen],
+        displays: &[Rect],
+    ) -> Layout {
         const NO_FRAME: Rect = Rect {
             x: 0.0,
             y: 0.0,
@@ -120,6 +130,8 @@ impl Layout {
             depth: [MISSING; MAX_WINDOWS],
             adj: [0; MAX_WINDOWS],
             has_top: false,
+            attached: [(0, NO_FRAME); MAX_WINDOWS],
+            n_attached: 0,
         };
         for &w in priority {
             if l.n == MAX_WINDOWS {
@@ -138,14 +150,38 @@ impl Layout {
             l.n += 1;
         }
         l.has_top = l.n > 0 && priority.first() == Some(&l.ids[0]);
+        for &(w, root) in attached {
+            if l.n_attached == MAX_WINDOWS {
+                break;
+            }
+            let (Some(i), Some(s)) = (l.index_of(root), stack.iter().find(|s| s.id == w)) else {
+                continue;
+            };
+            l.attached[l.n_attached] = (i as u8, s.frame);
+            l.n_attached += 1;
+        }
         for i in 0..l.n {
             for j in i + 1..l.n {
-                let o = overlap(&l.frames[i], &l.frames[j]) as Bits;
+                let o = l.footprints_overlap(i, j) as Bits;
                 l.adj[i] |= o << j;
                 l.adj[j] |= o << i;
             }
         }
         l
+    }
+
+    fn footprint(&self, i: usize) -> impl Iterator<Item = &Rect> {
+        std::iter::once(&self.frames[i]).chain(
+            self.attached[..self.n_attached]
+                .iter()
+                .filter(move |(r, _)| *r as usize == i)
+                .map(|(_, f)| f),
+        )
+    }
+
+    fn footprints_overlap(&self, i: usize, j: usize) -> bool {
+        self.footprint(i)
+            .any(|a| self.footprint(j).any(|b| overlap(a, b)))
     }
 
     pub fn len(&self) -> usize {
@@ -281,6 +317,7 @@ fn ms(d: Duration) -> u64 {
 pub fn reassert(
     ws: &mut dyn WindowServer,
     desired: &[WindowId],
+    attached: &[(WindowId, WindowId)],
     focus_top: bool,
     cancel: &dyn Fn() -> bool,
 ) -> Option<RestackStats> {
@@ -322,7 +359,7 @@ pub fn reassert(
     }
     let presence_wait_ms = ms(ws.now() - t0);
     let missing = (desired.len() - listed(&stack)) as u32;
-    let mut layout = Layout::new(desired, &stack, &displays);
+    let mut layout = Layout::new(desired, attached, &stack, &displays);
     let start_order: Vec<WindowId> = stack
         .iter()
         .map(|s| s.id)
@@ -330,6 +367,11 @@ pub fn reassert(
         .collect();
     let frames: Vec<(WindowId, Rect)> = (0..layout.n)
         .map(|i| (layout.ids[i], layout.frames[i]))
+        .chain(
+            attached
+                .iter()
+                .filter_map(|&(w, _)| stack.iter().find(|s| s.id == w).map(|s| (w, s.frame))),
+        )
         .collect();
     let top_pid = stack.iter().find(|s| s.id == top).map(|s| s.pid);
 
@@ -362,7 +404,7 @@ pub fn reassert(
         }
         if reread {
             ws.read_stack(&mut stack);
-            layout = Layout::new(&scope, &stack, &displays);
+            layout = Layout::new(&scope, attached, &stack, &displays);
         }
         reread = true;
         if pass == 0 {
@@ -410,7 +452,7 @@ pub fn reassert(
                 // The handoff raised the new key window, or the scope shrank:
                 // plan again.
                 ws.read_stack(&mut stack);
-                layout = Layout::new(&scope, &stack, &displays);
+                layout = Layout::new(&scope, attached, &stack, &displays);
                 r = layout.raise_set();
                 if r == 0 {
                     break;
@@ -449,7 +491,7 @@ pub fn reassert(
     }
     if reread && (!raises.is_empty() || refocused > 0) {
         ws.read_stack(&mut stack);
-        layout = Layout::new(&scope, &stack, &displays);
+        layout = Layout::new(&scope, attached, &stack, &displays);
     }
     let violated_end = layout.violators().count_ones();
     Some(RestackStats {
@@ -748,7 +790,7 @@ mod tests {
             for i in (1..stack.len()).rev() {
                 stack.swap(i, rng.below(i as u64 + 1) as usize);
             }
-            let l = Layout::new(&priority, &stack, &[]);
+            let l = Layout::new(&priority, &[], &stack, &[]);
             let r = l.raise_set();
             assert!(valid(&l, r));
             let smallest = (0..1u64 << n)
@@ -782,7 +824,7 @@ mod tests {
                 frame: rect(100.0, 0.0, 150.0, 100.0),
             },
         ];
-        let l = Layout::new(&[a, b, c], &stack, &[]);
+        let l = Layout::new(&[a, b, c], &[], &stack, &[]);
         assert_eq!(l.raise_set(), bit(0) | bit(1));
         assert_eq!(l.lanes().len(), 1);
     }

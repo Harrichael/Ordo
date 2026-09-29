@@ -1,8 +1,9 @@
 //! The restack against a fake window server with the raise physics probed on
 //! Tahoe: a raise lands just below the key window, a raise of another window
 //! of the key window's app lands above it, and focusing a window puts it on
-//! top. Every raise and focus lands after its app's own latency, on a fake
-//! clock that only moves when the restack waits.
+//! top; a window attached to another is always drawn just above it. Every
+//! raise and focus lands after its app's own latency, on a fake clock that
+//! only moves when the restack waits.
 //!
 //! Tests judge the final stack by geometry alone: every pair of windows that
 //! overlap on screen must be in priority order.
@@ -24,6 +25,8 @@ struct Fake {
     /// Front to back.
     stack: Vec<Seen>,
     key: Option<WindowId>,
+    /// Attached window -> the window it is attached to.
+    parents: HashMap<WindowId, WindowId>,
     displays: Vec<Rect>,
     latency: HashMap<i32, Duration>,
     due: Vec<(Duration, Act)>,
@@ -63,11 +66,33 @@ impl Fake {
                 .map(|&(id, pid, frame)| Seen { id, pid, frame })
                 .collect(),
             key,
+            parents: HashMap::new(),
             displays: vec![MAIN, EXTERNAL],
             latency: HashMap::new(),
             due: Vec::new(),
             raised: Vec::new(),
             landed: HashMap::new(),
+        }
+    }
+
+    fn attach(mut self, child: WindowId, parent: WindowId) -> Fake {
+        self.parents.insert(child, parent);
+        self
+    }
+
+    /// Put `w`'s attached windows back just above it.
+    fn carry_attached(&mut self, w: WindowId) {
+        let children: Vec<WindowId> = self
+            .stack
+            .iter()
+            .map(|s| s.id)
+            .filter(|c| self.parents.get(c) == Some(&w))
+            .collect();
+        for c in children {
+            let i = self.pos(c).unwrap();
+            let s = self.stack.remove(i);
+            let at = self.pos(w).unwrap();
+            self.stack.insert(at, s);
         }
     }
 
@@ -101,12 +126,14 @@ impl Fake {
                     self.key.and_then(|k| self.pos(k)).map_or(0, |k| k + 1)
                 };
                 self.stack.insert(at, s);
+                self.carry_attached(w);
                 self.landed.insert(w, self.t);
             }
             Act::Focus(w) => {
                 let Some(i) = self.pos(w) else { return };
                 let s = self.stack.remove(i);
                 self.stack.insert(0, s);
+                self.carry_attached(w);
                 self.key = Some(w);
             }
         }
@@ -231,7 +258,7 @@ fn a_display_already_in_order_is_left_alone() {
     );
     let priority = [w(1), w(4), w(2), w(5), w(3)];
 
-    let stats = reassert(&mut ws, &priority, true, &never).unwrap();
+    let stats = reassert(&mut ws, &priority, &[], true, &never).unwrap();
     ws.drain();
 
     assert_eq!(ws.out_of_order(&priority), vec![]);
@@ -259,7 +286,7 @@ fn siblings_ordered_under_the_key_window_leave_it_on_top() {
     .latency(2, 20);
     let priority = [top, s1, other, s2];
 
-    reassert(&mut ws, &priority, true, &never).unwrap();
+    reassert(&mut ws, &priority, &[], true, &never).unwrap();
     ws.drain();
 
     assert_eq!(ws.out_of_order(&priority), vec![]);
@@ -289,7 +316,7 @@ fn a_slow_app_on_one_display_does_not_hold_up_the_other() {
     .latency(4, 900);
     let priority = [top, slow, fast, below_slow, below_fast];
 
-    let stats = reassert(&mut ws, &priority, true, &never).unwrap();
+    let stats = reassert(&mut ws, &priority, &[], true, &never).unwrap();
     ws.drain();
 
     assert_eq!(ws.out_of_order(&priority), vec![]);
@@ -314,7 +341,7 @@ fn a_parked_sliver_constrains_nothing() {
     );
     let priority = [top, parked, flush];
 
-    let stats = reassert(&mut ws, &priority, true, &never).unwrap();
+    let stats = reassert(&mut ws, &priority, &[], true, &never).unwrap();
 
     assert_eq!(ws.raised, vec![]);
     assert_eq!(stats.presence_wait_ms, 0);
@@ -335,11 +362,62 @@ fn the_focus_handoff_is_waited_out_before_raising_over_the_old_key_window() {
     .latency(1, 80);
     let priority = [top, middle, demoted];
 
-    reassert(&mut ws, &priority, true, &never).unwrap();
+    reassert(&mut ws, &priority, &[], true, &never).unwrap();
     ws.drain();
 
     assert_eq!(ws.out_of_order(&priority), vec![]);
     assert_eq!(ws.key, Some(top));
+}
+
+/// Chrome's address-bar popup is attached to its window, and the window
+/// server keeps it just above it: already in order, there is nothing to do,
+/// and in particular no raising the window over its own popup, an order that
+/// can never land.
+#[test]
+fn a_window_is_never_raised_over_its_own_popup() {
+    let (chrome, popup, below) = (w(1), w(2), w(3));
+    let mut ws = Fake::new(
+        &[
+            (popup, 1, rect(300.0, 100.0, 1100.0, 200.0)),
+            (chrome, 1, rect(200.0, 60.0, 1400.0, 900.0)),
+            (below, 2, rect(100.0, 100.0, 800.0, 600.0)),
+        ],
+        Some(chrome),
+    )
+    .attach(popup, chrome);
+    let priority = [chrome, below];
+
+    let stats = reassert(&mut ws, &priority, &[(popup, chrome)], true, &never).unwrap();
+
+    assert_eq!(ws.raised, vec![]);
+    assert!(stats.total_ms < 50);
+}
+
+/// The popup hangs past its window's edge, over a Finder window the Chrome
+/// window itself doesn't reach. Chrome ranks above Finder, so the popup must
+/// be too: the popup counts as part of Chrome's footprint, and raising Chrome
+/// brings it along.
+#[test]
+fn a_popup_hanging_over_another_window_puts_its_root_above_it() {
+    let (chrome, popup, finder) = (w(1), w(2), w(3));
+    let mut ws = Fake::new(
+        &[
+            (finder, 2, rect(900.0, 100.0, 400.0, 400.0)),
+            (popup, 1, rect(600.0, 100.0, 500.0, 200.0)),
+            (chrome, 1, rect(0.0, 0.0, 800.0, 600.0)),
+        ],
+        Some(chrome),
+    )
+    .attach(popup, chrome);
+    let priority = [chrome, finder];
+
+    let stats = reassert(&mut ws, &priority, &[(popup, chrome)], true, &never).unwrap();
+    ws.drain();
+
+    let order: Vec<WindowId> = ws.stack.iter().map(|s| s.id).collect();
+    assert_eq!(order, vec![popup, chrome, finder]);
+    assert!(!ws.raised.contains(&popup));
+    assert!(stats.converged);
 }
 
 /// A seeded xorshift, so the layouts are random but every run is the same.
@@ -393,7 +471,7 @@ fn any_layout_ends_in_order() {
         }
         let priority: Vec<WindowId> = (1..=n).map(w).collect();
 
-        let stats = reassert(&mut ws, &priority, focus_top, &never);
+        let stats = reassert(&mut ws, &priority, &[], focus_top, &never);
         ws.drain();
 
         assert_eq!(ws.out_of_order(&priority), vec![], "case {case}");

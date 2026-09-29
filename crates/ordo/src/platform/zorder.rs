@@ -303,6 +303,7 @@ pub fn read_stack(out: &mut Vec<Seen>) {
 /// `None` (probes) every gate is the classic 5ms poll.
 pub fn reassert_stack(
     desired: &[WindowId],
+    attached: &[(WindowId, WindowId)],
     focus_top: bool,
     cancel: &dyn Fn() -> bool,
     signals: Option<&RaiseSignals>,
@@ -311,7 +312,7 @@ pub fn reassert_stack(
         gate: Gate::new(signals),
         raiser: ax::Raiser::default(),
     };
-    restack::reassert(&mut live, desired, focus_top, cancel)
+    restack::reassert(&mut live, desired, attached, focus_top, cancel)
 }
 
 struct Live<'a> {

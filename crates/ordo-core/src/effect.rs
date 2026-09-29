@@ -100,7 +100,15 @@ pub enum Effect {
     /// not part of the core's belief, so there is no op and no expectation
     /// (the shell self-verifies against async apps).
     RestackWindows {
+        /// Root windows only (see `State::root_of`).
         order: Vec<WindowId>,
+        /// Visible windows attached to a root in `order`, as (window, root).
+        /// The window server keeps each just above its root, so it is never
+        /// ordered itself; the shell counts its frame as part of its root's,
+        /// since a popup hanging over another window is the root's overlap.
+        /// `serde(default)` so older logs still load.
+        #[serde(default)]
+        attached: Vec<(WindowId, WindowId)>,
         /// The stack's top is the window to be key: the shell makes it so
         /// before ordering the rest, when it isn't already. Revealing a
         /// workspace un-hides apps, and an un-hide can hand focus to the app

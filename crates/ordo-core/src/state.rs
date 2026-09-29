@@ -58,6 +58,10 @@ pub struct WindowRecord {
     /// it every snapshot and reconcile already recomputes it per snapshot.
     pub monitor: MonitorId,
     pub frame: Rect,
+    /// OBSERVED: the window this one is attached to (a popup, a hover card),
+    /// per the window server. See [`State::root_of`].
+    #[serde(default)]
+    pub parent: Option<WindowId>,
     /// Placement correctives issued without the world staying put, damped per
     /// axis: workspace assignment and on-screen frame are independent fights
     /// (a new window can be wrong on both at once), so a single counter would
@@ -250,12 +254,30 @@ impl State {
     /// evidence that the user wants the slot moved, so it is fought for anew.
     pub(crate) fn declare_focus(&mut self, intent: FocusIntent) {
         if let FocusIntent::Window(w) = intent {
-            self.focus_history.touch(w);
+            let root = self.root_of(w);
+            self.focus_history.touch(root);
         }
         self.focus_intent = intent;
         self.focus_corrections = 0;
         self.navigation_gesture = false;
         self.conceded = None;
+    }
+
+    /// The window `w` is attached to at the top: itself, unless it has a
+    /// parent in the model. Stacking and MRU are about roots: the window
+    /// server always draws an attached window just above its parent, so it
+    /// has no place of its own in either, and ordering it against its parent
+    /// is an order that can never land.
+    pub fn root_of(&self, w: WindowId) -> WindowId {
+        let mut root = w;
+        // Bounded, so a cycle in what the window server reports can't hang.
+        for _ in 0..8 {
+            match self.windows.get(&root).and_then(|r| r.parent) {
+                Some(p) if p != root && self.windows.contains_key(&p) => root = p,
+                _ => break,
+            }
+        }
+        root
     }
 
     /// The declared window while it is actually in the model. A declaration

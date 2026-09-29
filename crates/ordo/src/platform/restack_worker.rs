@@ -51,7 +51,12 @@ struct Shared {
     wake: Condvar,
 }
 
-type Job = (u64, Vec<WindowId>, bool);
+struct Job {
+    generation: u64,
+    order: Vec<WindowId>,
+    attached: Vec<(WindowId, WindowId)>,
+    focus_top: bool,
+}
 
 #[derive(Clone)]
 pub struct RestackHandle {
@@ -59,10 +64,20 @@ pub struct RestackHandle {
 }
 
 impl RestackHandle {
-    pub fn submit(&self, order: Vec<WindowId>, focus_top: bool) {
+    pub fn submit(
+        &self,
+        order: Vec<WindowId>,
+        attached: Vec<(WindowId, WindowId)>,
+        focus_top: bool,
+    ) {
         let generation = self.shared.generation.fetch_add(1, Ordering::SeqCst) + 1;
         let mut slot = self.shared.slot.lock().unwrap();
-        *slot = Some((generation, order, focus_top));
+        *slot = Some(Job {
+            generation,
+            order,
+            attached,
+            focus_top,
+        });
         self.shared.wake.notify_one();
     }
 
@@ -92,7 +107,12 @@ pub fn spawn(tx: Sender<Msg>, signals: Arc<RaiseSignals>) -> RestackHandle {
         // its plan is minimal, and often touches none of them.
         let mut owed = false;
         loop {
-            let (generation, order, focus_top) = {
+            let Job {
+                generation,
+                order,
+                attached,
+                focus_top,
+            } = {
                 let mut slot = shared.slot.lock().unwrap();
                 loop {
                     if let Some(job) = slot.take() {
@@ -102,7 +122,13 @@ pub fn spawn(tx: Sender<Msg>, signals: Arc<RaiseSignals>) -> RestackHandle {
                 }
             };
             let cancel = || shared.generation.load(Ordering::SeqCst) != generation;
-            let stats = super::zorder::reassert_stack(&order, focus_top, &cancel, Some(&signals));
+            let stats = super::zorder::reassert_stack(
+                &order,
+                &attached,
+                focus_top,
+                &cancel,
+                Some(&signals),
+            );
             let issued = stats.as_ref().is_some_and(|s| !s.raises.is_empty());
             let watch = stats
                 .as_ref()
@@ -137,9 +163,13 @@ pub fn spawn(tx: Sender<Msg>, signals: Arc<RaiseSignals>) -> RestackHandle {
                         // zero raises when the order in fact still holds. It
                         // never takes focus: a late landing doesn't move focus,
                         // and a click in the watch window would be fought.
-                        if let Some(mut stats) =
-                            super::zorder::reassert_stack(&order, false, &cancel, Some(&signals))
-                        {
+                        if let Some(mut stats) = super::zorder::reassert_stack(
+                            &order,
+                            &attached,
+                            false,
+                            &cancel,
+                            Some(&signals),
+                        ) {
                             stats.ghost_pass = true;
                             if tx.send(Msg::RestackStats(stats)).is_err() {
                                 return;
