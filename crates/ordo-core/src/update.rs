@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use serde::{Deserialize, Serialize};
 
 use crate::effect::{CorrectionAxis, Effect, Expectation};
@@ -1261,10 +1263,69 @@ fn handle_snapshot(
         }
     }
 
+    restack_settled_moves(s, &deltas, &entry_expectations, fx);
+
     if let Some(op) = last_op {
         fx.push(Effect::RequestRescan {
             reason: RescanTrigger::PostEffect { op },
         });
+    }
+}
+
+/// A window moved or resized by a hand that wasn't Ordo's may now overlap
+/// windows it didn't, in whatever order the stack happens to have. A user's
+/// drag clicks the window first, which puts it on top; this is for the moves
+/// nobody clicked, like an app re-applying its saved frame. The check waits
+/// until the window holds still for one observation, so a drag in progress
+/// isn't restacked on every snapshot, and while any op is pending, so it
+/// doesn't cut into a switch's own restack. It costs one stack read when the
+/// order is already right.
+fn restack_settled_moves(
+    s: &mut State,
+    deltas: &[Delta],
+    entry_expectations: &[Expectation],
+    fx: &mut Vec<Effect>,
+) {
+    let visible = |s: &State, w: &WindowId| s.windows.get(w).is_some_and(|r| s.is_visible(r));
+    let moved: BTreeSet<WindowId> = deltas
+        .iter()
+        .filter_map(|d| match d {
+            Delta::WindowFrameChanged { window, .. }
+                if !entry_expectations.iter().any(|e| reconcile::explains(e, d)) =>
+            {
+                Some(*window)
+            }
+            _ => None,
+        })
+        .filter(|w| visible(s, w))
+        .collect();
+    let settled: BTreeSet<WindowId> = s
+        .moving
+        .iter()
+        .filter(|w| !moved.contains(w) && visible(s, w))
+        .copied()
+        .collect();
+    let covered = fx
+        .iter()
+        .any(|e| matches!(e, Effect::RestackWindows { .. }));
+    s.moving = moved;
+    if settled.is_empty() || covered {
+        return;
+    }
+    if !s.pending.is_empty() {
+        s.moving.extend(settled);
+        return;
+    }
+    let Some(here) = s.current_workspace() else {
+        return;
+    };
+    let order = mru_stack(s, here);
+    if order.len() >= 2 {
+        // Taking focus only where Ordo already declares it: this can
+        // supersede a switch's restack still in flight, which would otherwise
+        // lose its focus take-back.
+        let focus_top = s.focus_intent() == FocusIntent::Window(order[0]);
+        fx.push(Effect::RestackWindows { order, focus_top });
     }
 }
 

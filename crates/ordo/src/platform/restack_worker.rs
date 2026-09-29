@@ -86,57 +86,69 @@ pub fn spawn(tx: Sender<Msg>, signals: Arc<RaiseSignals>) -> RestackHandle {
     let handle = RestackHandle {
         shared: shared.clone(),
     };
-    std::thread::spawn(move || loop {
-        let (generation, order, focus_top) = {
-            let mut slot = shared.slot.lock().unwrap();
-            loop {
-                if let Some(job) = slot.take() {
-                    break job;
-                }
-                slot = shared.wake.wait(slot).unwrap();
-            }
-        };
-        let cancel = || shared.generation.load(Ordering::SeqCst) != generation;
-        let stats = super::zorder::reassert_stack(&order, focus_top, &cancel, Some(&signals));
-        let watch = stats
-            .as_ref()
-            .is_some_and(|s| s.converged && !s.aborted && !s.raises.is_empty());
-        if let Some(stats) = stats {
-            if tx.send(Msg::RestackStats(stats)).is_err() {
-                return; // engine gone; nothing left to report to
-            }
-        }
-        if !watch {
-            continue;
-        }
-        // Ghost watch: an 808/815 for an ORDERED window after convergence is
-        // a landing we stopped waiting for, touching down where the read-back
-        // can no longer see it. The cursor starts HERE — our own raises'
-        // events are behind it — and is refreshed past each rerun's own
-        // events, or the watch would feed on itself. Two reruns is the cap:
-        // more within one watch means something (a user, an app) is actively
-        // reordering, and the next real generation owns that fight.
-        let ordered = |w: u32| order.contains(&WindowId(w));
-        let deadline = Instant::now() + Duration::from_millis(GHOST_WATCH_MS);
-        let mut cursor = signals.cursor();
-        for _ in 0..2 {
-            match signals.wait(&mut cursor, &ordered, deadline, &cancel) {
-                WaitOutcome::Hint => {
-                    // The rerun is the read-back: it exits converged with
-                    // zero raises when the order in fact still holds. It
-                    // never takes focus: a late landing doesn't move focus,
-                    // and a click in the watch window would be fought.
-                    if let Some(mut stats) =
-                        super::zorder::reassert_stack(&order, false, &cancel, Some(&signals))
-                    {
-                        stats.ghost_pass = true;
-                        if tx.send(Msg::RestackStats(stats)).is_err() {
-                            return;
-                        }
+    std::thread::spawn(move || {
+        // A cancelled generation's raises can still land after its successor
+        // converged, so the watch is owed even when the successor raised nothing:
+        // its plan is minimal, and often touches none of them.
+        let mut owed = false;
+        loop {
+            let (generation, order, focus_top) = {
+                let mut slot = shared.slot.lock().unwrap();
+                loop {
+                    if let Some(job) = slot.take() {
+                        break job;
                     }
-                    cursor = signals.cursor();
+                    slot = shared.wake.wait(slot).unwrap();
                 }
-                WaitOutcome::Timeout | WaitOutcome::Cancelled => break,
+            };
+            let cancel = || shared.generation.load(Ordering::SeqCst) != generation;
+            let stats = super::zorder::reassert_stack(&order, focus_top, &cancel, Some(&signals));
+            let issued = stats.as_ref().is_some_and(|s| !s.raises.is_empty());
+            let watch = stats
+                .as_ref()
+                .is_some_and(|s| s.converged && !s.aborted && (issued || owed));
+            owed = match &stats {
+                None => owed,
+                Some(s) if s.aborted => owed || issued,
+                Some(_) => false,
+            };
+            if let Some(stats) = stats {
+                if tx.send(Msg::RestackStats(stats)).is_err() {
+                    return; // engine gone; nothing left to report to
+                }
+            }
+            if !watch {
+                continue;
+            }
+            // Ghost watch: an 808/815 for an ORDERED window after convergence is
+            // a landing we stopped waiting for, touching down where the read-back
+            // can no longer see it. The cursor starts HERE — our own raises'
+            // events are behind it — and is refreshed past each rerun's own
+            // events, or the watch would feed on itself. Two reruns is the cap:
+            // more within one watch means something (a user, an app) is actively
+            // reordering, and the next real generation owns that fight.
+            let ordered = |w: u32| order.contains(&WindowId(w));
+            let deadline = Instant::now() + Duration::from_millis(GHOST_WATCH_MS);
+            let mut cursor = signals.cursor();
+            for _ in 0..2 {
+                match signals.wait(&mut cursor, &ordered, deadline, &cancel) {
+                    WaitOutcome::Hint => {
+                        // The rerun is the read-back: it exits converged with
+                        // zero raises when the order in fact still holds. It
+                        // never takes focus: a late landing doesn't move focus,
+                        // and a click in the watch window would be fought.
+                        if let Some(mut stats) =
+                            super::zorder::reassert_stack(&order, false, &cancel, Some(&signals))
+                        {
+                            stats.ghost_pass = true;
+                            if tx.send(Msg::RestackStats(stats)).is_err() {
+                                return;
+                            }
+                        }
+                        cursor = signals.cursor();
+                    }
+                    WaitOutcome::Timeout | WaitOutcome::Cancelled => break,
+                }
             }
         }
     });

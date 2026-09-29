@@ -187,6 +187,28 @@ pub fn focused_window() -> Option<WindowId> {
     id
 }
 
+/// Whether `w` is the key window, asking only its own app: is it frontmost,
+/// and is `w` its focused window. [`focused_window`] has to ask every app to
+/// find the frontmost one.
+pub fn is_key(w: WindowId, pid: i32) -> bool {
+    let el = unsafe { AXUIElement::new_application(pid) };
+    unsafe { el.set_messaging_timeout(MESSAGING_TIMEOUT_SECS) };
+    let Some(front) = (unsafe { copy_attr(&el, "AXFrontmost") }) else {
+        return false;
+    };
+    let is_front = unsafe { &*(front as *const CFBoolean) }.value();
+    unsafe { sys::CFRelease(front) };
+    if !is_front {
+        return false;
+    }
+    let Some(focused) = (unsafe { copy_attr(&el, "AXFocusedWindow") }) else {
+        return false;
+    };
+    let id = window_id(focused as *const AXUIElement);
+    unsafe { sys::CFRelease(focused) };
+    id == Some(w)
+}
+
 pub fn frontmost_app() -> Option<Pid> {
     // Ask each app's live `AXFrontmost` attribute — NOT
     // NSWorkspace.frontmostApplication, which is a cache that refreshes only
@@ -698,6 +720,57 @@ pub fn raise_sequenced(targets: &[WindowId], mut after_each: impl FnMut(WindowId
     }
     for raw in arrays {
         unsafe { sys::CFRelease(raw) };
+    }
+}
+
+/// Raises windows, collecting an app's window elements the first time one of
+/// its windows is raised, so a restack asks only the apps it raises in rather
+/// than every running app. The elements are borrowed from each app's
+/// `AXWindows` array, which stays alive until the raiser drops.
+#[derive(Default)]
+pub struct Raiser {
+    asked: Vec<i32>,
+    arrays: Vec<*const c_void>,
+    found: HashMap<WindowId, *const AXUIElement>,
+}
+
+impl Raiser {
+    /// Issue an `AXRaise`; false when the window has no element (it closed).
+    pub fn raise(&mut self, w: WindowId, pid: i32) -> bool {
+        if !self.asked.contains(&pid) {
+            let el = unsafe { AXUIElement::new_application(pid) };
+            unsafe { el.set_messaging_timeout(MESSAGING_TIMEOUT_SECS) };
+            // A failed read is asked again on the next raise: a busy app's
+            // timeout says nothing about whether its windows exist.
+            if let Some(raw) = unsafe { copy_attr(&el, "AXWindows") } {
+                self.asked.push(pid);
+                self.arrays.push(raw);
+                unsafe {
+                    for i in 0..super::cf::array_len(raw) {
+                        let win = super::cf::array_get(raw, i) as *const AXUIElement;
+                        if let Some(id) = window_id(win) {
+                            self.found.insert(id, win);
+                        }
+                    }
+                }
+            }
+        }
+        let Some(&win) = self.found.get(&w) else {
+            return false;
+        };
+        let raise = CFString::from_str("AXRaise");
+        unsafe {
+            let _ = (*win).perform_action(&raise);
+        }
+        true
+    }
+}
+
+impl Drop for Raiser {
+    fn drop(&mut self) {
+        for raw in self.arrays.drain(..) {
+            unsafe { sys::CFRelease(raw) };
+        }
     }
 }
 

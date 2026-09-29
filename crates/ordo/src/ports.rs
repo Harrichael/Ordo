@@ -8,7 +8,7 @@
 
 use std::time::Duration;
 
-use ordo_core::{Effect, OpOutcome, Pid, WindowId, WorldSnapshot};
+use ordo_core::{Effect, OpOutcome, Pid, Rect, WindowId, WorldSnapshot};
 use ordo_emulated::ParkTrace;
 
 /// Produces a full observation of the world on demand. The engine never trusts
@@ -95,11 +95,9 @@ pub struct RestackStats {
     pub desired: u32,
     /// Desired windows that never resurfaced and were ordered around.
     pub missing: u32,
-    /// Windows already in correct relative order at the bottom, not raised.
-    pub skipped_suffix: u32,
     /// A ghost-absorption pass actually ran (pass one ended mis-ordered).
     pub second_pass: bool,
-    /// Final read-back matched the desired order exactly.
+    /// No overlapping pair was out of order at the final read-back.
     pub converged: bool,
     /// A newer desired order arrived mid-reassert and this one yielded to it.
     /// Aborted rows are expected under rapid switching and are NOT failures;
@@ -117,6 +115,18 @@ pub struct RestackStats {
     /// The desired windows as they stood, front to back, once the un-hides
     /// had resurfaced them: the order this reassert set out to repair.
     pub start_order: Vec<WindowId>,
+    /// Overlapping pairs whose order is enforced, at the first plan.
+    pub edges: u32,
+    /// Independent overlap groups the first plan raised in.
+    pub lanes: u32,
+    /// Windows the first plan had to raise, the top included.
+    pub raise_set: u32,
+    /// Windows present at the first plan that it left in place.
+    pub untouched: u32,
+    /// Windows still below one they must be above at the final read-back.
+    pub violated_end: u32,
+    /// The planned windows' frames, so any restack can be replanned offline.
+    pub frames: Vec<(WindowId, Rect)>,
     pub raises: Vec<RaiseStat>,
 }
 
@@ -127,12 +137,20 @@ pub struct RaiseStat {
     pub pid: i32,
     pub kind: RaiseKind,
     pub pass: u8,
+    /// Which overlap group it was raised in; raises in different lanes can be
+    /// in flight at once.
+    pub lane: u8,
     /// Windows above this one when its pass began — `above_scope` counts
     /// only windows being ordered, `above_all` the whole layer-0 stack.
     /// Read once per pass, not per raise: positions drift as earlier raises
     /// land, so these are "how buried was it", not exact hop counts.
     pub above_scope: u32,
     pub above_all: u32,
+    /// The raise call itself, which blocks until the app acknowledges it.
+    /// Lanes overlap only landing, so if this dominates, a slow app still
+    /// holds up the others.
+    pub ax_ms: u64,
+    /// From issue to confirmed landing, `ax_ms` included.
     pub wait_ms: u64,
     pub timed_out: bool,
     /// The landing was confirmed on a wake caused by the WindowServer's push

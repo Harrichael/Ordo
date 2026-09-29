@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -193,6 +193,11 @@ pub struct State {
     /// change and whenever the window is back on its host.
     #[serde(default)]
     pub(crate) misplaced_since: BTreeMap<WindowId, u64>,
+    /// Visible windows moved or resized, by a hand that wasn't Ordo's, in the
+    /// last observation, and settled ones whose stack check is still owed.
+    /// See `restack_settled_moves`.
+    #[serde(default)]
+    pub(crate) moving: BTreeSet<WindowId>,
     pub pending: Vec<PendingOp>,
     /// Damping for tear re-alignment, mirroring `WindowRecord::corrections`.
     pub tear_corrections: u8,
@@ -218,6 +223,7 @@ impl State {
             conceded: None,
             focus_history: FocusHistory::new(),
             misplaced_since: BTreeMap::new(),
+            moving: BTreeSet::new(),
             pending: Vec::new(),
             tear_corrections: 0,
             next_op: 0,

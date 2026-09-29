@@ -33,7 +33,7 @@
 use rusqlite::{Connection, Transaction};
 
 /// The schema version this build writes and understands.
-pub const CURRENT_VERSION: i32 = 6;
+pub const CURRENT_VERSION: i32 = 7;
 
 type Migration = fn(&Transaction) -> rusqlite::Result<()>;
 
@@ -44,6 +44,7 @@ const MIGRATIONS: &[Migration] = &[
     m4_snapshots,
     m5_restack_refocused,
     m6_restack_start_order,
+    m7_overlap_restacks,
 ];
 
 /// Read the version of an existing log, refusing one written by a newer Ordo.
@@ -180,6 +181,22 @@ fn m5_restack_refocused(tx: &Transaction) -> rusqlite::Result<()> {
 
 fn m6_restack_start_order(tx: &Transaction) -> rusqlite::Result<()> {
     tx.execute_batch("ALTER TABLE restacks ADD COLUMN start_order TEXT NOT NULL DEFAULT '';")
+}
+
+/// The overlap-scoped restack's plan and lanes. `skipped_suffix` belonged to
+/// the old whole-order plan and is 0 from here on; `untouched` is its nearest
+/// successor.
+fn m7_overlap_restacks(tx: &Transaction) -> rusqlite::Result<()> {
+    tx.execute_batch(
+        "ALTER TABLE restacks ADD COLUMN edges INTEGER NOT NULL DEFAULT 0;
+         ALTER TABLE restacks ADD COLUMN lanes INTEGER NOT NULL DEFAULT 0;
+         ALTER TABLE restacks ADD COLUMN raise_set INTEGER NOT NULL DEFAULT 0;
+         ALTER TABLE restacks ADD COLUMN untouched INTEGER NOT NULL DEFAULT 0;
+         ALTER TABLE restacks ADD COLUMN violated_end INTEGER NOT NULL DEFAULT 0;
+         ALTER TABLE restacks ADD COLUMN frames TEXT NOT NULL DEFAULT '';
+         ALTER TABLE raises ADD COLUMN lane INTEGER NOT NULL DEFAULT 0;
+         ALTER TABLE raises ADD COLUMN ax_ms INTEGER NOT NULL DEFAULT 0;",
+    )
 }
 
 /// Version 1: the schema as it first shipped. Frozen — see the module rules.
@@ -480,6 +497,8 @@ CREATE INDEX events_by_kind ON events(run_id, kind);
         assert!(columns(&conn, "raises").contains(&"via_event".to_string()));
         assert!(columns(&conn, "restacks").contains(&"refocused".to_string()));
         assert!(columns(&conn, "restacks").contains(&"start_order".to_string()));
+        assert!(columns(&conn, "restacks").contains(&"frames".to_string()));
+        assert!(columns(&conn, "raises").contains(&"ax_ms".to_string()));
     }
 
     #[test]

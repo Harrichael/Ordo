@@ -698,6 +698,52 @@ fn switching_restacks_the_destination_by_mru() {
     );
 }
 
+/// An app moving one of its windows over another (re-applying a saved frame,
+/// say) leaves them in whatever order the stack had. Once the window holds
+/// still, the stack is checked by MRU, taking focus only where Ordo has
+/// declared it (here it hasn't); while it is still moving, it isn't, and once
+/// checked it isn't again.
+#[test]
+fn a_window_moved_by_its_app_gets_its_stack_checked_once_it_settles() {
+    let at = |x, y| {
+        let mut wins = std_windows();
+        wins[2].snap.frame = rect(x, y);
+        wins
+    };
+    let see = |s: &State, wins| {
+        update(
+            s,
+            &observed(
+                vec![mon_a(1), mon_b(1)],
+                wins,
+                Some(1),
+                RescanTrigger::Periodic,
+            ),
+        )
+    };
+    let restacks = |fx: &[Effect]| {
+        fx.iter()
+            .filter_map(|e| match e {
+                Effect::RestackWindows { order, focus_top } => Some((order.clone(), *focus_top)),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let moving = see(&booted(&[2, 3, 1]), at(400.0, 300.0));
+    let still_moving = see(&moving.state, at(200.0, 150.0));
+    let settled = see(&still_moving.state, at(200.0, 150.0));
+    let after = see(&settled.state, at(200.0, 150.0));
+
+    assert_eq!(restacks(&moving.effects), vec![]);
+    assert_eq!(restacks(&still_moving.effects), vec![]);
+    assert_eq!(
+        restacks(&settled.effects),
+        vec![(vec![wid(1), wid(3), wid(2)], false)]
+    );
+    assert_eq!(restacks(&after.effects), vec![]);
+}
+
 #[test]
 fn round_trip_through_empty_workspace_refocuses_the_same_window() {
     // Leaving for an empty workspace never moves focus (parking doesn't

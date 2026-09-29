@@ -23,7 +23,8 @@ use std::time::{Duration, Instant};
 use ordo_core::{Rect, WindowId};
 use ordo_skylight_sys as sys;
 
-use crate::ports::{RaiseKind, RaiseStat, RestackStats};
+use crate::ports::RestackStats;
+use crate::restack::{self, Seen, WindowServer};
 
 use super::ws_events::{RaiseSignals, WaitOutcome};
 use super::{ax, cf};
@@ -246,261 +247,113 @@ pub fn stack_front_to_back() -> Vec<WindowId> {
     out
 }
 
-/// Impose `desired` (front-to-back) as the relative z-order of those windows.
+/// On-screen layer-0 windows with their pids and frames, front to back, from
+/// one list read: the frames ride in the same descriptors as the order.
+pub fn read_stack(out: &mut Vec<Seen>) {
+    out.clear();
+    unsafe {
+        let arr = CGWindowListCopyWindowInfo(ON_SCREEN_ONLY | EXCLUDE_DESKTOP, 0);
+        if arr.is_null() {
+            return;
+        }
+        for i in 0..cf::array_len(arr) {
+            let d = cf::array_get(arr, i) as sys::CFDictionaryRef;
+            if cf::number_i64(cf::dict_get(d, "kCGWindowLayer")) != Some(0) {
+                continue;
+            }
+            let b = cf::dict_get(d, "kCGWindowBounds");
+            let seen = (|| {
+                Some(Seen {
+                    id: WindowId(cf::number_i64(cf::dict_get(d, "kCGWindowNumber"))? as u32),
+                    pid: cf::number_i64(cf::dict_get(d, "kCGWindowOwnerPID"))? as i32,
+                    frame: Rect {
+                        x: cf::number_f64(cf::dict_get(b, "X"))?,
+                        y: cf::number_f64(cf::dict_get(b, "Y"))?,
+                        w: cf::number_f64(cf::dict_get(b, "Width"))?,
+                        h: cf::number_f64(cf::dict_get(b, "Height"))?,
+                    },
+                })
+            })();
+            out.extend(seen);
+        }
+        sys::CFRelease(arr);
+    }
+}
+
+/// Impose `desired` (front to back) wherever those windows overlap; see
+/// [`crate::restack`] for the plan and the lanes.
 ///
 /// The only per-window lever a SIP-on daemon has is `AXRaise` (probed:
 /// SLSOrderWindow is refused with error 1000; SLPS make-key records don't
 /// reorder; a burst of SLPSSetFrontProcessWithOptions coalesces to the last
 /// call — see examples/order_probe.rs and slps_order_probe.rs). AXRaise is
 /// processed on the target APP's schedule (Chromium: 100ms+), so raises to
-/// different apps land in arbitrary relative order. Fire-and-verify loops
-/// can't fix that: a pass can verify clean and then be broken by a raise
-/// still in flight.
+/// different apps land in arbitrary relative order: within a lane, each raise
+/// is confirmed landed, read back from the window server, before the next.
 ///
-/// The rule that makes it deterministic: NEVER have two raises in flight.
-/// Each raise is confirmed landed — read back from WindowServer — before the
-/// next is issued. Same-app raises are ordered by the app's own AX queue;
-/// cross-app ordering is enforced by the landing check. When the pass ends,
-/// nothing is in flight, so nothing can retroactively break it. Fast apps
-/// confirm in one ~few-ms poll; a slow app costs its true latency, once.
-///
-/// Two prerequisites are also waited on, because they're app-async too:
-/// windows still resurfacing from an un-hide (absent from the CG list) are
-/// awaited before ordering starts, and windows already in correct relative
-/// position at the bottom are skipped entirely — the common round trip
-/// raises only what actually moved.
-///
-/// `cancel` is polled at every gate tick and between raises: when it turns
-/// true (a newer desired order exists), this reassert yields mid-flight and
-/// reports `aborted` — finishing an order the user has already switched away
-/// from is pure wasted latency, and the newer reassert re-reads the world
-/// anyway. A raise already issued cannot be recalled; its late landing is
-/// absorbed by the successor's passes exactly like any other ghost.
+/// Raise physics (examples/slps_sibling_probe.rs, refuting AeroSpace #395 on
+/// Tahoe): a background app's window raises to just below the key window, but
+/// a sibling of the key window raises ABOVE it, and raising the key window
+/// again freezes the siblings beneath it.
 ///
 /// `signals`, when present, is the WindowServer's push stream (808/815): a
 /// gate sleeps until a hint instead of a fixed tick, and wakes read back
 /// exactly as before — events cut the latency between a landing and our
 /// seeing it to ~zero, they never replace the CG read as the authority. With
 /// `None` (probes) every gate is the classic 5ms poll.
-///
-/// `desired[0]` is the DESIGNATED top — the window the core wants focused —
-/// not whatever AX says is focused right now. Asking AX mid-reveal races the
-/// focus effect's own landing (and the outgoing app may already be hidden),
-/// which returned the old window or nothing; that put the real top window
-/// into the ordering set, made every "first among want" gate unsatisfiable
-/// (backgrounds can't rise above the key window), burned all the timeouts,
-/// and let the unsequenced raises land coin-flip — the lived "scrambled,
-/// then the top window ping-pongs each round trip" bug. Intent is the
-/// authority; the actual key window, whichever it transiently is, sits in no
-/// gate's scope and settles on top by itself.
-///
-/// With `focus_top`, the designated top is also made key here, once the
-/// un-hides have resurfaced and again if the final read-back finds focus
-/// elsewhere. The caller's own focus request went out before the switch's
-/// un-hides, and an un-hide can hand focus to the app it revealed (measured:
-/// 10 of 24 switches on a two-display rig); waiting for a handoff that was
-/// stolen burned the gate timeouts and left focus wrong for 1.6s. Raises land
-/// below the key window, so the top is made key before the rest are ordered.
 pub fn reassert_stack(
     desired: &[WindowId],
     focus_top: bool,
     cancel: &dyn Fn() -> bool,
     signals: Option<&RaiseSignals>,
 ) -> Option<RestackStats> {
-    const PRESENCE_TIMEOUT_MS: u64 = 600;
-    // Generous on purpose: a landed gate exits in single-digit ms, so this is
-    // paid only by an app genuinely slower than it — and a timeout means an
-    // unaccounted-for raise is in flight, which is exactly what the second
-    // pass exists to absorb. (Chrome has been measured past 400ms.)
-    const LANDING_TIMEOUT_MS: u64 = 1000;
-    const POLL_MS: u64 = 5;
+    let mut live = Live {
+        gate: Gate::new(signals),
+        raiser: ax::Raiser::default(),
+    };
+    restack::reassert(&mut live, desired, focus_top, cancel)
+}
 
-    let t_total = Instant::now();
-    let (&top, rest) = desired.split_first()?;
-    if rest.is_empty() && !focus_top {
-        return None;
+struct Live<'a> {
+    gate: Gate<'a>,
+    raiser: ax::Raiser,
+}
+
+impl WindowServer for Live<'_> {
+    fn now(&self) -> Instant {
+        Instant::now()
     }
 
-    // Latch abort at the checks that steer execution: a fully-converged
-    // reassert whose successor merely arrived microseconds later is a valid
-    // latency sample, and re-sampling the raw flag at stats time would
-    // mislabel it (biasing the very distributions the telemetry feeds).
-    let aborted = std::cell::Cell::new(false);
-    let raw_cancel = cancel;
-    let cancel = || -> bool {
-        if raw_cancel() {
-            aborted.set(true);
-            true
-        } else {
-            false
-        }
-    };
+    fn read_stack(&mut self, out: &mut Vec<Seen>) {
+        read_stack(out);
+    }
 
-    let observed = |scope: &[WindowId]| -> Vec<WindowId> {
-        stack_front_to_back()
+    fn displays(&mut self) -> Vec<Rect> {
+        super::display::active_displays()
             .into_iter()
-            .filter(|w| scope.contains(w))
+            .map(|d| d.frame)
             .collect()
-    };
-
-    let mut gate = Gate::new(signals);
-
-    // Wait for un-hides to finish resurfacing every window we're about to
-    // order; a window that pops back mid-pass would land wherever it left off.
-    // Each resurfacing emits an ordered-in (815) hint, so this gate mostly
-    // sleeps until one arrives.
-    let t_presence = Instant::now();
-    let presence_deadline = t_presence + Duration::from_millis(PRESENCE_TIMEOUT_MS);
-    while observed(desired).len() < desired.len() && Instant::now() < presence_deadline && !cancel()
-    {
-        gate.wait(None, presence_deadline, &cancel);
-    }
-    let presence_wait_ms = t_presence.elapsed().as_millis() as u64;
-    // Anything still missing isn't coming (closed, or a stuck app): order
-    // what's actually there.
-    let present = observed(desired);
-    let missing = (desired.len() - present.len()) as u32;
-    let mut refocused = 0u32;
-    let take_focus = |refocused: &mut u32| {
-        if focus_top && !cancel() && ax::focused_window() != Some(top) && ax::focus(top) {
-            *refocused += 1;
-        }
-    };
-    take_focus(&mut refocused);
-    let mut want: Vec<WindowId> = rest
-        .iter()
-        .copied()
-        .filter(|w| present.contains(w))
-        .collect();
-    if want.is_empty() {
-        return (refocused > 0).then(|| RestackStats {
-            total_ms: t_total.elapsed().as_millis() as u64,
-            presence_wait_ms,
-            handoff_wait_ms: 0,
-            desired: desired.len() as u32,
-            missing,
-            skipped_suffix: 0,
-            second_pass: false,
-            converged: true,
-            aborted: aborted.get(),
-            ghost_pass: false,
-            refocused,
-            start_order: present,
-            raises: Vec::new(),
-        });
     }
 
-    // While a window we must order HOLDS key status, nothing can be raised
-    // above it — so wait out the in-flight focus handoff (the effect always
-    // precedes the restack) until the key window is out of `want`. This is
-    // AX-as-wait-condition, not AX-as-authority: the condition is monotone
-    // (once the handoff lands it stays landed), unlike the racing "who's
-    // focused" read this function used to key its physics on. Alt+End is the
-    // flow that needs it: the demoted window stays key until the handoff.
-    let t_handoff = Instant::now();
-    let handoff_deadline = t_handoff + Duration::from_millis(LANDING_TIMEOUT_MS);
-    let mut key_in_want = None;
-    while Instant::now() < handoff_deadline && !cancel() {
-        match ax::focused_window() {
-            Some(f) if want.contains(&f) => {
-                key_in_want = Some(f);
-                // The handoff completing emits 808 for the newly-keyed
-                // window, so a hint is the moment to re-ask AX.
-                gate.wait(None, handoff_deadline, &cancel);
-            }
-            _ => {
-                key_in_want = None;
-                break;
-            }
-        }
+    fn is_key(&mut self, w: WindowId, pid: i32) -> bool {
+        ax::is_key(w, pid)
     }
-    let handoff_wait_ms = t_handoff.elapsed().as_millis() as u64;
-    // Still key after the wait — the handoff isn't coming (an external focus
-    // grab, or a caller whose desired[0] isn't the window it focused).
-    // Physics wins: nothing can be raised above the key window, so exempt it
-    // and order the rest instead of burning every gate's timeout against an
-    // unsatisfiable condition (once a 13-second engine freeze per switch).
-    if let Some(f) = key_in_want {
-        want.retain(|w| *w != f);
-        if want.is_empty() {
-            return None;
-        }
-    }
-    let scope: Vec<WindowId> = std::iter::once(top).chain(want.iter().copied()).collect();
 
-    // Two passes: the first does the work; the second exists solely to absorb
-    // a ghost — a raise that outlived its landing timeout and touched down
-    // after the pass finished, breaking the order behind our back. The settle
-    // sleep gives such a straggler time to land where the re-pass can see it;
-    // the suffix-skip keeps the re-pass to just the windows it displaced.
-    let mut raises = Vec::new();
-    let mut skipped_suffix = 0;
-    let mut second_pass = false;
-    for pass in 0..2u8 {
-        if pass > 0 {
-            // Sleep only when a straggler can actually exist: every raise
-            // either confirmed landing at its gate or set timed_out, so with
-            // no timeouts nothing from this pass is still in flight and the
-            // read-back can run immediately. Measured (run 38): the
-            // unconditional form cost ~200ms wall on 100% of restacks — 76%
-            // of the median switch — to cover the 3.3% with a live
-            // straggler. Ghosts from a CANCELLED generation land on their
-            // own schedule either way; those are the worker's event-driven
-            // ghost watch's job, not this sleep's.
-            if raises.iter().any(|r: &RaiseStat| r.timed_out) {
-                // The settle sleep is the longest uninterruptible stretch
-                // left if done in one call — tick it so a preemption isn't
-                // blind for 150ms.
-                let mut slept = 0;
-                while slept < 150 && !cancel() {
-                    std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
-                    slept += POLL_MS;
-                }
-            }
-        }
-        if cancel() {
-            break;
-        }
-        if observed(&scope) == scope {
-            break; // exact (also the common repeated-switch case: zero raises)
-        }
-        if pass > 0 {
-            second_pass = true;
-        }
-        let keep = raise_pass(
-            top,
-            &want,
-            &scope,
-            &observed,
-            pass,
-            &mut raises,
-            &cancel,
-            &mut gate,
-        );
-        if pass == 0 {
-            skipped_suffix = keep as u32;
-        }
+    fn focused_window(&mut self) -> Option<WindowId> {
+        ax::focused_window()
     }
-    // The read-back covers the key window too: an activation that landed
-    // late, after the order was built, is taken back here rather than left
-    // for the core's focus expectation to time out.
-    take_focus(&mut refocused);
 
-    Some(RestackStats {
-        total_ms: t_total.elapsed().as_millis() as u64,
-        presence_wait_ms,
-        handoff_wait_ms,
-        desired: desired.len() as u32,
-        missing,
-        skipped_suffix,
-        second_pass,
-        converged: observed(&scope) == scope,
-        aborted: aborted.get(),
-        ghost_pass: false, // the worker marks its ghost-watch reruns
-        refocused,
-        start_order: present,
-        raises,
-    })
+    fn focus(&mut self, w: WindowId) -> bool {
+        ax::focus(w)
+    }
+
+    fn raise(&mut self, w: WindowId, pid: i32) -> bool {
+        self.raiser.raise(w, pid)
+    }
+
+    fn wait(&mut self, until: Instant, cancel: &dyn Fn() -> bool) -> bool {
+        self.gate.wait(until, cancel)
+    }
 }
 
 /// One sleep between condition re-checks. With a push stream, the sleep ends
@@ -521,16 +374,15 @@ impl<'a> Gate<'a> {
         }
     }
 
-    /// Returns whether the wake was a matching hint (telemetry: the event
-    /// path carried this gate, rather than the fallback tick).
-    fn wait(&mut self, wid: Option<u32>, deadline: Instant, cancel: &dyn Fn() -> bool) -> bool {
+    /// Returns whether the wake was a hint (telemetry: the event path
+    /// carried this gate, rather than the fallback tick).
+    fn wait(&mut self, deadline: Instant, cancel: &dyn Fn() -> bool) -> bool {
         const POLL_FALLBACK: Duration = Duration::from_millis(50);
         match self.signals {
             Some(s) => {
                 let slice_end = deadline.min(Instant::now() + POLL_FALLBACK);
-                let matches = |w: u32| wid.is_none_or(|t| t == w);
                 matches!(
-                    s.wait(&mut self.cursor, &matches, slice_end, cancel),
+                    s.wait(&mut self.cursor, &|_| true, slice_end, cancel),
                     WaitOutcome::Hint
                 )
             }
@@ -540,150 +392,4 @@ impl<'a> Gate<'a> {
             }
         }
     }
-}
-
-/// One sequenced, landing-gated raise pass. See [`reassert_stack`] for why
-/// this shape is the only deterministic one available. Returns the length of
-/// the already-correct suffix it skipped, and appends one [`RaiseStat`] per
-/// issued raise.
-#[allow(clippy::too_many_arguments)]
-fn raise_pass(
-    top: WindowId,
-    want: &[WindowId],
-    scope: &[WindowId],
-    observed: &dyn Fn(&[WindowId]) -> Vec<WindowId>,
-    pass: u8,
-    raises: &mut Vec<RaiseStat>,
-    cancel: &dyn Fn() -> bool,
-    gate: &mut Gate<'_>,
-) -> usize {
-    const LANDING_TIMEOUT_MS: u64 = 1000;
-
-    // The designated top's OWN app's windows obey different raise physics
-    // than everyone else's (probed in slps_sibling_probe.rs, refuting
-    // AeroSpace #395 on Tahoe): a background app's window raises to just
-    // below the key window, but a sibling of the key window raises ABOVE it.
-    //
-    // Both still amount to "insert on top of the processed region" if the
-    // stack is built back-to-front and every sibling raise is immediately
-    // followed by re-raising the designated top: the sibling briefly covers
-    // it, the re-raise freezes the sibling in as the new top of the below-
-    // top region, and later background raises insert above it as usual. That
-    // one extra same-app raise per sibling makes ANY interleaving of apps in
-    // the desired order achievable — no focus changes, key status never
-    // moves. A final unconditional raise of the designated top makes the
-    // result independent of when its focus effect happens to land.
-    let with_pids = stack_with_pids();
-    let fpid = with_pids.iter().find(|(w, _)| *w == top.0).map(|(_, p)| *p);
-    let is_sibling = |w: WindowId| {
-        fpid.is_some()
-            && with_pids
-                .iter()
-                .find(|(x, _)| *x == w.0)
-                .map(|(_, p)| Some(*p) == fpid)
-                .unwrap_or(false)
-    };
-
-    // Skip the already-correct bottom of the stack.
-    let actual = observed(want);
-    let mut keep = 0;
-    while keep < want.len()
-        && keep < actual.len()
-        && want[want.len() - 1 - keep] == actual[actual.len() - 1 - keep]
-    {
-        keep += 1;
-    }
-
-    let mut sequence: Vec<(WindowId, RaiseKind)> = Vec::new();
-    for i in (0..want.len() - keep).rev() {
-        let kind = if is_sibling(want[i]) {
-            RaiseKind::Sibling
-        } else {
-            RaiseKind::Background
-        };
-        sequence.push((want[i], kind));
-        if kind == RaiseKind::Sibling {
-            sequence.push((top, RaiseKind::Top));
-        }
-    }
-    if sequence.last().map(|&(w, _)| w) != Some(top) {
-        sequence.push((top, RaiseKind::Top));
-    }
-
-    // Per-raise stats use this pass-start read (same one the sibling
-    // classification is from): "how buried was it", not exact hop counts.
-    let pid_of = |w: WindowId| {
-        with_pids
-            .iter()
-            .find(|(x, _)| *x == w.0)
-            .map(|&(_, p)| p)
-            .unwrap_or(-1)
-    };
-    let above = |w: WindowId| -> (u32, u32) {
-        let mut in_scope = 0;
-        for (i, (x, _)) in with_pids.iter().enumerate() {
-            if *x == w.0 {
-                return (in_scope, i as u32);
-            }
-            if scope.iter().any(|s| s.0 == *x) {
-                in_scope += 1;
-            }
-        }
-        (in_scope, with_pids.len() as u32)
-    };
-
-    // One landing at a time. Landed is the raise's own observable, never a
-    // vacuous ordering check (the first window's "suffix in order" is
-    // trivially true, which once let its in-flight raise leapfrog two later
-    // ones), and always RELATIVE to the windows being ordered — never "the
-    // absolute top", which the transient key window owns: a landed raise
-    // reads back above every other window in its scope. The designated top's
-    // scope includes everything; the others' excludes the designated top,
-    // which legitimately sits above them.
-    let ids: Vec<WindowId> = sequence.iter().map(|&(w, _)| w).collect();
-    let mut step = 0;
-    ax::raise_sequenced(&ids, |w| {
-        let kind = sequence[step].1;
-        step += 1;
-        let landed = |w: WindowId| {
-            if w == top {
-                observed(scope).first() == Some(&w)
-            } else {
-                observed(want).first() == Some(&w)
-            }
-        };
-        let t = Instant::now();
-        let land_deadline = t + Duration::from_millis(LANDING_TIMEOUT_MS);
-        let mut via_event = false;
-        let mut timed_out = false;
-        loop {
-            if landed(w) {
-                break;
-            }
-            if cancel() {
-                break;
-            }
-            if Instant::now() >= land_deadline {
-                timed_out = true;
-                break;
-            }
-            // via_event labels the wake that PRECEDED the confirming read:
-            // true means the push stream carried this landing.
-            via_event = gate.wait(Some(w.0), land_deadline, cancel);
-        }
-        let (above_scope, above_all) = above(w);
-        raises.push(RaiseStat {
-            window: w,
-            pid: pid_of(w),
-            kind,
-            pass,
-            above_scope,
-            above_all,
-            wait_ms: t.elapsed().as_millis() as u64,
-            timed_out,
-            via_event,
-        });
-        !cancel()
-    });
-    keep
 }

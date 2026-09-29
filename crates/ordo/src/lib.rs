@@ -18,6 +18,8 @@
 //! - [`menubar`] — what the menu bar item shows, derived from the core's state.
 //! - [`platform`] — the macOS FFI: displays, Accessibility, SkyLight, mouse.
 //! - [`rescue`] — the log-driven recovery gather.
+//! - [`restack`] — which windows must be raised to put the stack in order,
+//!   and raising them, against a narrow window-server port.
 
 pub mod backend;
 pub mod clock;
@@ -29,6 +31,7 @@ pub mod menubar;
 pub mod ports;
 pub mod replay;
 pub mod rescue;
+pub mod restack;
 pub mod schema;
 
 #[cfg(target_os = "macos")]

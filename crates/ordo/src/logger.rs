@@ -269,8 +269,10 @@ impl Logger {
         tx.execute(
             "INSERT INTO restacks (run_id, wall_ms, total_ms, presence_wait_ms,
                  handoff_wait_ms, desired, missing, skipped_suffix, second_pass, converged,
-                 aborted, ghost_pass, refocused, start_order)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                 aborted, ghost_pass, refocused, start_order, edges, lanes, raise_set,
+                 untouched, violated_end, frames)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+                 ?16, ?17, ?18, ?19)",
             params![
                 self.run_id,
                 now_wall_ms,
@@ -279,7 +281,6 @@ impl Logger {
                 s.handoff_wait_ms as i64,
                 s.desired,
                 s.missing,
-                s.skipped_suffix,
                 s.second_pass,
                 s.converged,
                 s.aborted,
@@ -290,14 +291,24 @@ impl Logger {
                     .map(|w| w.0.to_string())
                     .collect::<Vec<_>>()
                     .join(" "),
+                s.edges,
+                s.lanes,
+                s.raise_set,
+                s.untouched,
+                s.violated_end,
+                s.frames
+                    .iter()
+                    .map(|(w, f)| format!("{}:{},{},{},{}", w.0, f.x, f.y, f.w, f.h))
+                    .collect::<Vec<_>>()
+                    .join(" "),
             ],
         )?;
         let restack_id = tx.last_insert_rowid();
         for (ord, r) in s.raises.iter().enumerate() {
             tx.execute(
                 "INSERT INTO raises (restack_id, ord, window, pid, kind, pass,
-                     above_scope, above_all, wait_ms, timed_out, via_event)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                     above_scope, above_all, wait_ms, timed_out, via_event, lane, ax_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 params![
                     restack_id,
                     ord as i64,
@@ -310,6 +321,8 @@ impl Logger {
                     r.wait_ms as i64,
                     r.timed_out,
                     r.via_event,
+                    r.lane,
+                    r.ax_ms as i64,
                 ],
             )?;
         }
