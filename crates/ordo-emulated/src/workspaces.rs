@@ -539,11 +539,15 @@ impl EmulatedWorkspaces {
         }
         self.persist();
         self.move_windows(d, &writes);
+        self.note_stack(d, "after moves");
         self.apply_app_visibility(d, &frames, &g);
         self.note_stack(d, "after un-hides");
     }
 
     fn note_stack(&mut self, d: &dyn Desktop, moment: &str) {
+        if !d.traces_stacks() {
+            return;
+        }
         let ids: Vec<String> = d
             .stack()
             .into_iter()
@@ -1451,13 +1455,26 @@ impl EmulatedWorkspaces {
             .map(|s| (s.pid, s))
             .collect();
         for u in shows {
-            let mut t = ParkTrace::app(u.pid, ParkTraceKind::AppShown)
-                .ws(current, current)
-                .detail(format!(
+            let stat = held.get(&u.pid);
+            let detail = if let Some(s) = stat.filter(|s| !s.unhid) {
+                if s.writes == 0 {
+                    "already showing; left alone".to_string()
+                } else {
+                    format!(
+                        "already showing, but revealed: {} parked window(s) held back",
+                        u.hold.len()
+                    )
+                }
+            } else {
+                format!(
                     "unhidden; also reveals {} window(s) parked for other workspaces",
                     u.hold.len()
-                ));
-            if let Some(s) = held.get(&u.pid) {
+                )
+            };
+            let mut t = ParkTrace::app(u.pid, ParkTraceKind::AppShown)
+                .ws(current, current)
+                .detail(detail);
+            if let Some(s) = stat {
                 t = t.hold(s.clone());
             }
             self.note(t);
@@ -2059,6 +2076,10 @@ mod tests {
             self.now.get()
         }
 
+        fn traces_stacks(&self) -> bool {
+            true
+        }
+
         fn stack(&self) -> Vec<WindowId> {
             let hidden = self.hidden.borrow();
             let mut ids: Vec<WindowId> = self
@@ -2097,9 +2118,14 @@ mod tests {
         fn show_apps(&self, apps: &[Unhide]) -> Vec<HoldStat> {
             let mut out = Vec::new();
             for a in apps {
+                let unhid = self.hidden.borrow().contains(&a.pid);
+                let revealed = a.hold.iter().any(|(w, at)| {
+                    let f = self.windows.borrow()[w].1;
+                    !same_position(&f, &Rect { x: at.x, y: at.y, ..f })
+                });
                 // A frozen app applies nothing — neither our writes nor its
                 // own reveal — so it stays hidden and everything holds still.
-                if !self.frozen.get() {
+                if (unhid || revealed) && !self.frozen.get() {
                     if self.hidden.borrow_mut().remove(&a.pid) {
                         let ordering_in: Vec<(WindowId, Rect)> = self
                             .windows
@@ -2142,13 +2168,8 @@ mod tests {
                     })
                     .map(|(w, _)| *w)
                     .collect();
-                out.push(HoldStat::new(
-                    a.pid,
-                    a.hold.len(),
-                    a.hold.len() as u32,
-                    0,
-                    escaped,
-                ));
+                let writes = if unhid || revealed { a.hold.len() as u32 } else { 0 };
+                out.push(HoldStat::new(a.pid, unhid, a.hold.len(), writes, 0, escaped));
             }
             out
         }
@@ -2248,8 +2269,9 @@ mod tests {
     }
 
     /// Hides and un-hides reorder windows behind the stacking worker's back,
-    /// so a switch records the order it started from and the one its
-    /// un-hides left — a hidden app's windows are missing until un-hidden.
+    /// so a switch records the order it started from, the one its moves
+    /// left, and the one its un-hides left — a hidden app's windows are
+    /// missing until un-hidden.
     #[test]
     fn a_switch_traces_the_stack_before_it_and_after_its_unhides() {
         let d = FakeDesktop::new(&[
@@ -2271,7 +2293,7 @@ mod tests {
             .filter(|t| t.kind == ParkTraceKind::Stack)
             .filter_map(|t| t.detail)
             .collect();
-        assert_eq!(stacks, ["before: 2", "after un-hides: 1 2"]);
+        assert_eq!(stacks, ["before: 2", "after moves: 2", "after un-hides: 1 2"]);
     }
 
     /// A parked window found off its park says whether its app was still
@@ -2335,21 +2357,16 @@ mod tests {
             &geo()
         ));
 
-        // The app stays visible (it owns a window here), and the record says
-        // how many of its windows the unhide also exposes — 1, the parked w1.
+        // The app owns a window here and was never hidden, so it is left
+        // alone — an un-hide sent to a showing app brings its parked windows
+        // forward — and the record says so.
         let shown = trace
             .iter()
             .find(|t| t.kind == ParkTraceKind::AppShown)
-            .expect("the unhide is attributable");
+            .expect("the visibility pass is attributable");
         assert_eq!(shown.pid, Some(Pid(10)));
-        assert!(
-            shown
-                .detail
-                .as_deref()
-                .is_some_and(|d| d.contains("1 window")),
-            "counts the windows a flash would show: {:?}",
-            shown.detail
-        );
+        assert_eq!(shown.detail.as_deref(), Some("already showing; left alone"));
+        assert!(in_park_corner(&d.frame(w(1)), &geo()));
     }
 
     /// Un-hiding an app is not the mirror of hiding it. Dock dimming hides an
@@ -3264,6 +3281,44 @@ mod tests {
         d.settle(&mut b);
         assert!(d.is_hidden(Pid(10)));
         assert!(!d.is_hidden(Pid(30)), "the front app is spared");
+    }
+
+    /// A switch focuses the destination's window before it un-hides, and
+    /// focusing a window of a hidden app un-hides that app with nothing
+    /// holding its parked windows: AppKit drags them on screen. Arriving, the
+    /// app reads as showing — so it is not sent an un-hide, which would bring
+    /// all its windows forward — but its parked window is held back anyway.
+    #[test]
+    fn an_app_revealed_behind_the_switch_still_has_its_parked_windows_held() {
+        let d = FakeDesktop::new(&[
+            (w(1), Pid(10), rect(100.0, 100.0)),
+            (w(2), Pid(10), rect(300.0, 200.0)),
+            (w(3), Pid(20), rect(500.0, 300.0)),
+        ]);
+        let mut b = EmulatedWorkspaces::new(3);
+        rescan(&d, &mut b);
+        b.assign_window_to_workspace(w(2), ws(2)).unwrap();
+        b.assign_window_to_workspace(w(3), ws(3)).unwrap();
+        b.switch_workspace(&d, ws(2));
+        b.switch_workspace(&d, ws(3));
+        d.settle(&mut b);
+        assert!(d.is_hidden(Pid(10)));
+
+        // The focus request's un-hide, which nothing held.
+        d.hidden.borrow_mut().remove(&Pid(10));
+        d.place(w(2), rect(0.0, 200.0));
+        b.take_trace();
+
+        b.switch_workspace(&d, ws(1));
+
+        assert_eq!(d.frame(w(1)), rect(100.0, 100.0));
+        assert!(in_park_corner(&d.frame(w(2)), &geo()), "{:?}", d.frame(w(2)));
+        let shown = b
+            .take_trace()
+            .into_iter()
+            .find(|t| t.kind == ParkTraceKind::AppShown && t.pid == Some(Pid(10)))
+            .expect("the visibility pass is attributable");
+        assert!(shown.detail.unwrap().contains("revealed"));
     }
 
     /// An app is dimmed only once the user stays away from its windows. A

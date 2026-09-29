@@ -479,6 +479,12 @@ define_class!(
                 .tx
                 .send(Msg::hotkey(HotkeyAction::WorkspaceSwitchTo(WorkspaceId(n))));
         }
+
+        // SAFETY: the signature matches the action selector's.
+        #[unsafe(method(toggleDebug:))]
+        fn toggle_debug(&self, _sender: &NSMenuItem) {
+            crate::debug::set(!crate::debug::enabled());
+        }
     }
 
     unsafe impl NSObjectProtocol for Controller {}
@@ -599,6 +605,42 @@ impl Controller {
             menu.addItem(&NSMenuItem::separatorItem(mtm));
             menu.addItem(&info_item("Paused — press ⌃⌥⌘O to resume", mtm));
         }
+        menu.addItem(&NSMenuItem::separatorItem(mtm));
+        menu.addItem(&self.settings(mtm));
+    }
+
+    fn settings(&self, mtm: MainThreadMarker) -> Retained<NSMenuItem> {
+        let debug = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                ns_string!("Debug mode"),
+                Some(sel!(toggleDebug:)),
+                ns_string!(""),
+            )
+        };
+        unsafe { debug.setTarget(Some(self)) };
+        debug.setState(if crate::debug::enabled() {
+            NSControlStateValueOn
+        } else {
+            NSControlStateValueOff
+        });
+        debug.setToolTip(Some(ns_string!(
+            "Logs the stacking order at each step of a switch. Costs a few ms per switch; off at every launch."
+        )));
+        let submenu = NSMenu::new(mtm);
+        submenu.addItem(&debug);
+
+        let item = NSMenuItem::new(mtm);
+        item.setTitle(ns_string!("Settings"));
+        item.setImage(
+            NSImage::imageWithSystemSymbolName_accessibilityDescription(
+                ns_string!("gearshape"),
+                Some(ns_string!("Settings")),
+            )
+            .as_deref(),
+        );
+        item.setSubmenu(Some(&submenu));
+        item
     }
 }
 

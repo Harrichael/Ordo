@@ -96,6 +96,10 @@ pub trait Desktop {
     /// app's windows are not in it.
     fn stack(&self) -> Vec<WindowId>;
 
+    /// Whether switches should trace [`Desktop::stack`] at each step: a
+    /// window-list read apiece, too costly to run on every switch.
+    fn traces_stacks(&self) -> bool;
+
     fn now(&self) -> Instant;
 
     /// Un-hide these apps, HOLDING each one's listed windows at the given
@@ -115,6 +119,15 @@ pub trait Desktop {
     ///
     /// Batched for the same reason [`Desktop::move_windows`] is: a switch
     /// un-hides several apps and must cost the slowest, not the sum.
+    ///
+    /// An app already showing is not un-hidden: an un-hide sent to it brings
+    /// every window it owns forward, parked ones included (measured 8 of 8,
+    /// and 0 of 8 without it), which reorders the windows of both the
+    /// workspace left and the one arrived at. Its held windows are still
+    /// checked, and held if any left its spot: an app can be revealed behind
+    /// this call's back — focusing a window of a hidden app un-hides it, and
+    /// a switch focuses before it un-hides. Asked per app alongside the
+    /// un-hides themselves, so it costs the slowest app's answer, not the sum.
     ///
     /// The returned stats are telemetry only — the model reads nothing back
     /// into its beliefs from them.

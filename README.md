@@ -57,6 +57,8 @@ The two rules that make it work:
   merge them: after a confirm, the first monitor's windows join the second on
   every workspace, and the monitors after it renumber down by one. The `+`
   after the last tile adds an empty monitor; nothing on screen moves.
+  Settings (the gear, last) holds Debug mode: it logs the stacking order at
+  each step of a switch, for a few ms per switch, and is off at every launch.
   Dimmed while Ordo is paused. Not shown with
   `--observe`. Preview the design without the daemon:
   `cargo run --example menubar_preview`.

@@ -85,6 +85,8 @@ pub enum ParkTraceKind {
 #[derive(Debug, Clone, Serialize)]
 pub struct HoldStat {
     pub pid: Pid,
+    /// False when the app was already showing and was left alone.
+    pub unhid: bool,
     /// Windows this un-hide had to hold — 0 for an app with nothing parked,
     /// where the hold is a single window-server read and no writes at all.
     pub windows: usize,
@@ -94,11 +96,17 @@ pub struct HoldStat {
     /// `escaped.is_empty()`, carried as its own field so the question this
     /// telemetry exists to answer is one column and not an array to measure.
     pub converged: bool,
+    /// Whether the app's `AXEnhancedUserInterface` was toggled for the hold.
+    pub enhanced_ui: bool,
+    /// The on-screen stack, front to back, at each step of the un-hide, as
+    /// the port read it.
+    pub stacks: Vec<(String, Vec<WindowId>)>,
 }
 
 impl HoldStat {
     pub fn new(
         pid: Pid,
+        unhid: bool,
         windows: usize,
         writes: u32,
         elapsed_ms: u64,
@@ -106,12 +114,21 @@ impl HoldStat {
     ) -> Self {
         HoldStat {
             pid,
+            unhid,
             windows,
             writes,
             elapsed_ms,
             converged: escaped.is_empty(),
             escaped,
+            enhanced_ui: false,
+            stacks: Vec::new(),
         }
+    }
+
+    pub fn with_steps(mut self, enhanced_ui: bool, stacks: Vec<(String, Vec<WindowId>)>) -> Self {
+        self.enhanced_ui = enhanced_ui;
+        self.stacks = stacks;
+        self
     }
 }
 

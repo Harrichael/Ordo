@@ -45,6 +45,10 @@ impl Desktop for AxDesktop {
         zorder::stack_front_to_back()
     }
 
+    fn traces_stacks(&self) -> bool {
+        crate::debug::enabled()
+    }
+
     fn now(&self) -> std::time::Instant {
         std::time::Instant::now()
     }
@@ -69,12 +73,20 @@ impl Desktop for AxDesktop {
                 }
                 HoldStat::new(
                     o.pid,
+                    o.unhid,
                     apps.iter()
                         .find(|u| u.pid == o.pid)
                         .map_or(0, |u| u.hold.len()),
                     o.writes,
                     o.elapsed_ms,
                     o.escaped,
+                )
+                .with_steps(
+                    o.enhanced_ui,
+                    o.stacks
+                        .into_iter()
+                        .map(|(step, ids)| (step.to_string(), ids))
+                        .collect(),
                 )
             })
             .collect()

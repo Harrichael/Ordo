@@ -443,9 +443,20 @@ const HOLD_BUDGET: Duration = Duration::from_millis(250);
 /// window listed there was left on screen for enforcement to find.
 pub struct HoldOutcome {
     pub pid: Pid,
+    /// False when the app was already showing and was left alone.
+    pub unhid: bool,
     pub writes: u32,
     pub elapsed_ms: u64,
     pub escaped: Vec<WindowId>,
+    /// Whether the app had `AXEnhancedUserInterface` on, so it was turned off
+    /// for the hold and back on after.
+    pub enhanced_ui: bool,
+    /// The on-screen stack, front to back, at each step of this app's un-hide,
+    /// in debug mode only (empty otherwise).
+    /// A switch was seen lifting an app's windows above others' between its
+    /// moves and the end of its un-hides; these name the step. Other apps'
+    /// un-hides run alongside, so a step's read can include their effects.
+    pub stacks: Vec<(&'static str, Vec<WindowId>)>,
 }
 
 /// Un-hide these apps, holding each one's listed windows at the given origins
@@ -481,17 +492,48 @@ pub fn show_apps(apps: &[(Pid, &[(WindowId, Point)])]) -> Vec<HoldOutcome> {
 /// loop into one write" would throw away.
 fn show_app_holding(pid: Pid, hold: &[(WindowId, Point)]) -> HoldOutcome {
     let started = Instant::now();
+    let mut stacks = Vec::new();
+    let tracing = crate::debug::enabled();
+    let mut mark = |step| {
+        if tracing {
+            stacks.push((step, super::zorder::stack_front_to_back()));
+        }
+    };
     let el = unsafe { AXUIElement::new_application(pid.0) };
     unsafe { el.set_messaging_timeout(MESSAGING_TIMEOUT_SECS) };
-    if hold.is_empty() {
-        // Nothing to lose to the reveal, and most un-hides are this: don't pay
-        // an AXWindows walk (a round trip to the app) to discover it.
-        unsafe { set_bool(&el, "AXHidden", false) };
+    // See `Desktop::show_apps`: an un-hide sent to a showing app brings all
+    // its windows forward, so a showing app is never sent one. But showing
+    // is not proof its parked windows stayed parked: the switch's own focus
+    // request un-hides the destination's app before this runs, with nothing
+    // holding them. So they are checked, and held if any left its spot. An
+    // app that doesn't answer is un-hidden anyway — skipping a hidden one
+    // would leave its windows invisible.
+    let showing = app_hidden(pid) == Some(false);
+    if showing && hold.iter().all(|(w, at)| holds_at(*w, *at)) {
         return HoldOutcome {
             pid,
+            unhid: false,
             writes: 0,
             elapsed_ms: started.elapsed().as_millis() as u64,
             escaped: Vec::new(),
+            enhanced_ui: false,
+            stacks,
+        };
+    }
+    if hold.is_empty() {
+        // Nothing to lose to the reveal, and most un-hides are this: don't pay
+        // an AXWindows walk (a round trip to the app) to discover it.
+        mark("before un-hide");
+        unsafe { set_bool(&el, "AXHidden", false) };
+        mark("after un-hide");
+        return HoldOutcome {
+            pid,
+            unhid: true,
+            writes: 0,
+            elapsed_ms: started.elapsed().as_millis() as u64,
+            escaped: Vec::new(),
+            enhanced_ui: false,
+            stacks,
         };
     }
 
@@ -514,8 +556,15 @@ fn show_app_holding(pid: Pid, hold: &[(WindowId, Point)]) -> HoldOutcome {
         }
     }
 
+    mark("before un-hide");
     let restore_eui = unsafe { disable_enhanced_ui(&el) };
-    unsafe { set_bool(&el, "AXHidden", false) };
+    if restore_eui {
+        mark("after enhanced UI off");
+    }
+    if !showing {
+        unsafe { set_bool(&el, "AXHidden", false) };
+        mark("after un-hide");
+    }
 
     let deadline = started + HOLD_BUDGET;
     let mut writes = 0u32;
@@ -541,6 +590,7 @@ fn show_app_holding(pid: Pid, hold: &[(WindowId, Point)]) -> HoldOutcome {
         });
     }
 
+    mark("after holds");
     unsafe {
         if restore_eui {
             set_bool(&el, "AXEnhancedUserInterface", true);
@@ -549,12 +599,16 @@ fn show_app_holding(pid: Pid, hold: &[(WindowId, Point)]) -> HoldOutcome {
             sys::CFRelease(raw);
         }
     }
+    if restore_eui {
+        mark("after enhanced UI on");
+    }
 
     // Asked fresh rather than inferred from the loop, so a window that was
     // never found in AXWindows or whose handle went stale is reported as
     // escaped rather than silently counted as held.
     HoldOutcome {
         pid,
+        unhid: !showing,
         writes,
         elapsed_ms: started.elapsed().as_millis() as u64,
         escaped: hold
@@ -562,6 +616,8 @@ fn show_app_holding(pid: Pid, hold: &[(WindowId, Point)]) -> HoldOutcome {
             .filter(|(w, at)| !holds_at(*w, *at))
             .map(|(w, _)| *w)
             .collect(),
+        enhanced_ui: restore_eui,
+        stacks,
     }
 }
 
