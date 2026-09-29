@@ -34,7 +34,7 @@ pub mod statefile;
 pub mod trace;
 pub mod workspaces;
 
-pub use trace::{HoldStat, ParkTrace, ParkTraceKind};
+pub use trace::{AppMoveStat, HoldStat, ParkTrace, ParkTraceKind, WriteStat};
 pub use workspaces::{EmulatedWorkspaces, MonitorOutOfRange, WorkspaceOutOfRange};
 
 use std::time::Instant;
@@ -75,7 +75,8 @@ pub trait Desktop {
     /// Batched because a switch parks the outgoing workspace and restores the
     /// incoming one in a single breath, and an implementation that has to walk
     /// each app's window list should walk it once for both.
-    fn move_windows(&self, moves: &[(Pid, WindowId, Point)]);
+    /// What each app's share cost, one entry per app.
+    fn move_windows(&self, moves: &[(Pid, WindowId, Point)]) -> Vec<AppMoveStat>;
 
     /// Hide an app, the Cmd+H way. Fire-and-forget: the hide itself needs no
     /// confirming. It is not always quiet, though — its windows parked at the

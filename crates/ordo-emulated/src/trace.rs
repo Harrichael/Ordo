@@ -67,6 +67,9 @@ pub enum ParkTraceKind {
     /// its park spot. Says whether the hide itself moves parked windows, or
     /// they move later (then the next scan's `Reassert` is the first sign).
     OffAfterHide,
+    /// One app's share of a batch of moves: what reaching its windows, and
+    /// writing them, cost. The batch lands in the time of its slowest app.
+    AppMoved,
     /// The stacking order of the ledger's on-screen windows, front to back,
     /// at a named moment of a switch. A switch's hides and un-hides reorder
     /// windows as a side effect, and nothing else records the order they
@@ -161,7 +164,54 @@ pub struct ParkTrace {
     /// On an [`ParkTraceKind::AppShown`]: what it cost to keep that app's
     /// parked windows at the corner while its windows ordered back in.
     pub hold: Option<HoldStat>,
+    /// On a write record: what the write cost once it was made.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub write: Option<WriteStat>,
+    /// On an [`ParkTraceKind::AppMoved`] record.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub moves: Option<AppMoveStat>,
+    /// On a [`ParkTraceKind::Switch`] or [`ParkTraceKind::View`] record: where
+    /// the switch's own time went.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost: Option<SwitchCost>,
     pub detail: Option<String>,
+}
+
+/// One window's position write, timed in its app's thread.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct WriteStat {
+    pub ax_ms: f64,
+    /// When it finished, from the start of the whole batch: moves run on one
+    /// thread per app, so this is what says whether a write waited.
+    pub done_ms: f64,
+}
+
+/// One app's part of a batch of moves.
+#[derive(Debug, Clone, Serialize)]
+pub struct AppMoveStat {
+    #[serde(skip)]
+    pub pid: Pid,
+    pub windows: usize,
+    /// Reading the app's window list, before any write could start.
+    pub list_ms: f64,
+    /// Whether `AXEnhancedUserInterface` was toggled around the writes.
+    pub enhanced_ui: bool,
+    pub total_ms: f64,
+    #[serde(skip)]
+    pub writes: Vec<(WindowId, WriteStat)>,
+}
+
+/// Where a switch's time went, on the engine thread. The focus request that
+/// precedes it and the rescan after it are timed elsewhere.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct SwitchCost {
+    /// Reading every window's frame and the display geometry.
+    pub read_ms: f64,
+    pub moves_ms: f64,
+    /// Writing the ledger to disk, before any window moves.
+    pub persist_ms: f64,
+    /// Un-hiding and holding the destination's apps.
+    pub visibility_ms: f64,
 }
 
 impl ParkTrace {
@@ -178,6 +228,9 @@ impl ParkTrace {
             at_park: None,
             attempt: None,
             hold: None,
+            write: None,
+            moves: None,
+            cost: None,
             detail: None,
         }
     }
@@ -222,6 +275,11 @@ impl ParkTrace {
 
     pub fn hold(mut self, h: HoldStat) -> Self {
         self.hold = Some(h);
+        self
+    }
+
+    pub fn moves(mut self, m: AppMoveStat) -> Self {
+        self.moves = Some(m);
         self
     }
 

@@ -30,7 +30,7 @@ use ordo_core::{
 
 use crate::ledger::{Claim, Ledger, SwitchPlan};
 use crate::statefile::{self, PersistedState, PersistedWindow};
-use crate::trace::{HoldStat, ParkTrace, ParkTraceKind};
+use crate::trace::{HoldStat, ParkTrace, ParkTraceKind, SwitchCost};
 use crate::{Desktop, Unhide};
 
 /// How much of a parked window stays on-screen. macOS refuses to keep a fully
@@ -500,7 +500,21 @@ impl EmulatedWorkspaces {
             .iter()
             .map(|(pid, w, f)| (*pid, *w, Point { x: f.x, y: f.y }))
             .collect();
-        d.move_windows(&moves);
+        for app in d.move_windows(&moves) {
+            // Each write's own record was made when it was decided, just
+            // before this; the cost is only known now.
+            for (w, stat) in &app.writes {
+                if let Some(t) = self
+                    .trace
+                    .iter_mut()
+                    .rev()
+                    .find(|t| t.window == *w && t.requested.is_some() && t.write.is_none())
+                {
+                    t.write = Some(*stat);
+                }
+            }
+            self.note(ParkTrace::app(app.pid, ParkTraceKind::AppMoved).moves(app));
+        }
     }
 
     /// Carry out a plan: park what left the screen, restore what entered it.
@@ -518,8 +532,11 @@ impl EmulatedWorkspaces {
             self.persist(); // the declaration may still have changed
             return;
         }
+        let started = d.now();
         let frames = current_frames(d);
         let g = Geometry::read(d);
+        let read = d.now();
+        let boundary_at = self.trace.len();
         self.note(boundary.detail(format!(
             "parking {}, restoring {}, rehosting {}",
             plan.park.len(),
@@ -537,10 +554,23 @@ impl EmulatedWorkspaces {
         for w in plan.rehost {
             writes.extend(self.rehost(w, &frames, &g));
         }
+        let persist_began = d.now();
         self.persist();
+        let moves_began = d.now();
         self.move_windows(d, &writes);
+        let moved = d.now();
         self.note_stack(d, "after moves");
+        let visibility_began = d.now();
         self.apply_app_visibility(d, &frames, &g);
+        let ms = |a: std::time::Instant, b: std::time::Instant| (b - a).as_secs_f64() * 1000.0;
+        if let Some(t) = self.trace.get_mut(boundary_at) {
+            t.cost = Some(SwitchCost {
+                read_ms: ms(started, read),
+                moves_ms: ms(moves_began, moved),
+                persist_ms: ms(persist_began, moves_began),
+                visibility_ms: ms(visibility_began, d.now()),
+            });
+        }
         self.note_stack(d, "after un-hides");
     }
 
@@ -1768,6 +1798,7 @@ fn merge_fresh_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::trace::AppMoveStat;
 
     fn w(n: u32) -> WindowId {
         WindowId(n)
@@ -2038,9 +2069,9 @@ mod tests {
         /// size WOULD suffer is modelled in `write_whole_frame`; the ratchet
         /// that shrank the author's windows by 58pt lived in the gap between
         /// the two.
-        fn move_windows(&self, moves: &[(Pid, WindowId, Point)]) {
+        fn move_windows(&self, moves: &[(Pid, WindowId, Point)]) -> Vec<AppMoveStat> {
             if self.frozen.get() {
-                return;
+                return Vec::new();
             }
             for (pid, w, at) in moves {
                 let size_is_the_windows_own = self.windows.borrow()[w].1;
@@ -2054,6 +2085,29 @@ mod tests {
                     },
                 );
             }
+            // Every write costs a millisecond, one app after another.
+            let mut out: Vec<AppMoveStat> = Vec::new();
+            for (n, (pid, w, _)) in moves.iter().enumerate() {
+                let stat = crate::trace::WriteStat {
+                    ax_ms: 1.0,
+                    done_ms: n as f64 + 1.0,
+                };
+                match out.iter_mut().find(|a| a.pid == *pid) {
+                    Some(a) => {
+                        a.windows += 1;
+                        a.writes.push((*w, stat));
+                    }
+                    None => out.push(AppMoveStat {
+                        pid: *pid,
+                        windows: 1,
+                        list_ms: 0.0,
+                        enhanced_ui: false,
+                        total_ms: 0.0,
+                        writes: vec![(*w, stat)],
+                    }),
+                }
+            }
+            out
         }
 
         fn hide_app(&self, pid: Pid) {
@@ -2356,6 +2410,18 @@ mod tests {
             &parked.requested.expect("with the frame asked for"),
             &geo()
         ));
+        // With what each write cost, the app's share of the batch, and where
+        // the switch's own time went.
+        assert!(parked.write.is_some());
+        let app = trace
+            .iter()
+            .find(|t| t.kind == ParkTraceKind::AppMoved)
+            .expect("the app's share of the moves");
+        assert_eq!(
+            (app.pid, app.moves.as_ref().map(|m| m.windows)),
+            (Some(Pid(10)), Some(1))
+        );
+        assert!(sw.cost.is_some());
 
         // The app owns a window here and was never hidden, so it is left
         // alone — an un-hide sent to a showing app brings its parked windows

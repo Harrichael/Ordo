@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use ordo_core::{
     MonitorId, Pid, Point, Rect, VirtualMonitorId, VirtualMonitorsWord, WindowId, WorkspaceId,
 };
-use ordo_emulated::{Desktop, EmulatedWorkspaces, HoldStat, Unhide};
+use ordo_emulated::{AppMoveStat, Desktop, EmulatedWorkspaces, HoldStat, Unhide};
 
 use crate::backend::{
     BackendError, BackendTopology, Capabilities, MonitorWorkspace, Result, WorkspaceBackend,
@@ -29,8 +29,8 @@ impl Desktop for AxDesktop {
             .collect()
     }
 
-    fn move_windows(&self, moves: &[(Pid, WindowId, Point)]) {
-        ax::move_windows(moves);
+    fn move_windows(&self, moves: &[(Pid, WindowId, Point)]) -> Vec<AppMoveStat> {
+        ax::move_windows(moves)
     }
 
     fn hide_app(&self, pid: Pid) {

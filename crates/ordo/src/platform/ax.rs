@@ -22,6 +22,7 @@ use objc2_app_kit::{NSApplicationActivationPolicy, NSWorkspace};
 use objc2_application_services::{AXError, AXUIElement, AXValue, AXValueType};
 use objc2_core_foundation::{CFBoolean, CFString, CFType, CGPoint, CGSize};
 use ordo_core::{Pid, Point, Rect, WindowId};
+use ordo_emulated::{AppMoveStat, WriteStat};
 use ordo_skylight_sys as sys;
 
 /// A quarter second: long enough for a healthy app to answer, short enough that
@@ -808,26 +809,42 @@ pub fn set_frame(target: WindowId, frame: Rect) -> bool {
 /// per-app threads make the whole batch land in the time of the slowest *app*,
 /// not the sum of all writes. AX is just Mach IPC and safe off the main thread —
 /// each thread builds its own app element rather than sharing one.
-pub fn move_windows(moves: &[(Pid, WindowId, Point)]) {
+pub fn move_windows(moves: &[(Pid, WindowId, Point)]) -> Vec<AppMoveStat> {
     let mut by_app: HashMap<i32, Vec<(WindowId, Point)>> = HashMap::new();
     for (pid, w, p) in moves {
         by_app.entry(pid.0).or_default().push((*w, *p));
     }
+    let batch = Instant::now();
     std::thread::scope(|scope| {
-        for (pid, wins) in by_app {
-            scope.spawn(move || move_app_windows(pid, &wins));
-        }
-    });
+        let threads: Vec<_> = by_app
+            .into_iter()
+            .map(|(pid, wins)| scope.spawn(move || move_app_windows(pid, &wins, batch)))
+            .collect();
+        threads.into_iter().filter_map(|t| t.join().ok()).collect()
+    })
 }
 
-fn move_app_windows(pid: i32, wins: &[(WindowId, Point)]) {
+fn move_app_windows(pid: i32, wins: &[(WindowId, Point)], batch: Instant) -> AppMoveStat {
+    let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+    let started = Instant::now();
+    let mut stat = AppMoveStat {
+        pid: Pid(pid),
+        windows: wins.len(),
+        list_ms: 0.0,
+        enhanced_ui: false,
+        total_ms: 0.0,
+        writes: Vec::new(),
+    };
     let el = unsafe { AXUIElement::new_application(pid) };
     unsafe { el.set_messaging_timeout(MESSAGING_TIMEOUT_SECS) };
-    let Some(raw) = (unsafe { copy_attr(&el, "AXWindows") }) else {
-        return;
+    let raw = unsafe { copy_attr(&el, "AXWindows") };
+    stat.list_ms = ms(started.elapsed());
+    let Some(raw) = raw else {
+        stat.total_ms = stat.list_ms;
+        return stat;
     };
     // One EUI bracket around the whole app's batch, not one per window.
-    let restore_eui = unsafe { disable_enhanced_ui(&el) };
+    stat.enhanced_ui = unsafe { disable_enhanced_ui(&el) };
     unsafe {
         for i in 0..super::cf::array_len(raw) {
             let win = super::cf::array_get(raw, i) as *const AXUIElement;
@@ -835,13 +852,23 @@ fn move_app_windows(pid: i32, wins: &[(WindowId, Point)]) {
             let Some((_, at)) = wins.iter().find(|(w, _)| *w == id) else {
                 continue;
             };
+            let t = Instant::now();
             let _ = set_point(&*win, "AXPosition", at.x, at.y);
+            stat.writes.push((
+                id,
+                WriteStat {
+                    ax_ms: ms(t.elapsed()),
+                    done_ms: ms(batch.elapsed()),
+                },
+            ));
         }
-        if restore_eui {
+        if stat.enhanced_ui {
             set_bool(&el, "AXEnhancedUserInterface", true);
         }
         sys::CFRelease(raw);
     }
+    stat.total_ms = ms(started.elapsed());
+    stat
 }
 
 /// Walk regular apps, and when the window whose id is `target` is found, run
