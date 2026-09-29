@@ -8,7 +8,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use ordo_core::{Effect, OpOutcome};
+use ordo_core::{Effect, OpOutcome, Pid};
 
 use crate::ports::Effector;
 
@@ -46,6 +46,10 @@ impl Effector for MacEffector {
 
     fn persist_workspaces(&mut self) {
         self.backend.borrow_mut().resume_persistence();
+    }
+
+    fn note_app_visibility(&mut self, pid: Pid, hidden: bool) {
+        self.backend.borrow_mut().note_app_visibility(pid, hidden);
     }
 
     fn execute(&mut self, effect: &Effect) -> Option<OpOutcome> {

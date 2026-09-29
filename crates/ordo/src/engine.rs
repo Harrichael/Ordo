@@ -19,7 +19,7 @@ use std::time::Instant;
 
 use crossbeam_channel::Receiver;
 use ordo_core::{
-    coalesce_hotkeys, update, AxHintKind, Effect, Event, Gesture, HotkeyAction, OpId,
+    coalesce_hotkeys, update, AxHintKind, Effect, Event, Gesture, HotkeyAction, OpId, Pid,
     RescanTrigger, State,
 };
 
@@ -56,6 +56,10 @@ pub enum Msg {
     /// Telemetry from the restack worker, delivered as a message because the
     /// SQLite logger is engine-thread-only. Never becomes a core event.
     RestackStats(RestackStats),
+    /// An app was hidden (true) or shown, by anyone, for the workspace
+    /// backend. Never becomes a core event; the observer follows it with a
+    /// rescan hint, which is what gets it acted on.
+    AppVisibility(Pid, bool),
     /// Stop the loop and close the run. Needed because producer threads (the
     /// event tap) hold sender clones that outlive shutdown, so channel-close
     /// alone can't end the loop.
@@ -88,6 +92,9 @@ fn collapse_rescans(batch: Vec<Msg>) -> Vec<Msg> {
         match m {
             Msg::Rescan(trigger) => rescans.push(trigger),
             Msg::Hotkey(..) | Msg::RestackStats(_) => after.push(m),
+            // Ahead of the look the batch's rescans become, so that look acts
+            // on it.
+            Msg::AppVisibility(..) => out.push(m),
             fence => {
                 flush_rescans(&mut rescans, &mut out);
                 out.append(&mut after);
@@ -250,6 +257,11 @@ impl Engine {
                             .logger
                             .log_restack_stats(&stats, self.clock.now().wall_ms);
                     }
+                    // Not a fence either: a switch's own un-hides report
+                    // mid-burst. Recording it is instant.
+                    Msg::AppVisibility(pid, hidden) => {
+                        self.effector.note_app_visibility(pid, hidden);
+                    }
                     other => {
                         self.flush_hotkeys(&mut hotkeys);
                         match other {
@@ -285,7 +297,7 @@ impl Engine {
                             }
                             Msg::SaveState => self.effector.persist_workspaces(),
                             Msg::Shutdown => break 'recv,
-                            Msg::Hotkey(..) | Msg::RestackStats(_) => {
+                            Msg::Hotkey(..) | Msg::RestackStats(_) | Msg::AppVisibility(..) => {
                                 unreachable!("handled above")
                             }
                         }

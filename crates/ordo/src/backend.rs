@@ -148,6 +148,10 @@ pub trait WorkspaceBackend {
     /// as the new durable state. Idempotent when persistence is already on.
     fn resume_persistence(&mut self) {}
 
+    /// An app was hidden or shown, by anyone. Native leaves hiding to the
+    /// user; default no-op.
+    fn note_app_visibility(&mut self, _pid: Pid, _hidden: bool) {}
+
     /// Assert this backend's placement declarations, given the frames the
     /// enumerator already read (no backend re-enumerates on its own).
     /// Called once per rescan, and only while Ordo is actively driving —

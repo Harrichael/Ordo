@@ -8,6 +8,9 @@
 //! core's handling of `RescanTrigger::AxHint`). This thread turns that
 //! notification into `Msg::Rescan(AxHint { WindowCreated, pid })`.
 //!
+//! Hides and shows (`AXApplicationHidden`, `AXApplicationShown`) also go to
+//! the workspace backend as facts, since it alone decides what is hidden.
+//!
 //! Focus changes (`AXFocusedWindowChanged`, `AXApplicationActivated`) are hints
 //! too. Without them the MRU history learns external focus only from the
 //! periodic scan — click a window and press Alt+Tab within the ~2s gap and the
@@ -134,7 +137,12 @@ fn attach_one(pid: i32, ctx: *mut c_void) -> Option<CFRetained<AXObserver>> {
     // Focus hints are additive: an app that rejects them (some AX-poor apps do)
     // still gets window-created coverage, and the periodic scan remains the
     // safety net for its focus changes.
-    for name in ["AXFocusedWindowChanged", "AXApplicationActivated"] {
+    for name in [
+        "AXFocusedWindowChanged",
+        "AXApplicationActivated",
+        "AXApplicationHidden",
+        "AXApplicationShown",
+    ] {
         let notif = CFString::from_str(name);
         let _ = unsafe { observer.add_notification(&app, &notif, ctx) };
     }
@@ -164,6 +172,18 @@ unsafe extern "C-unwind" fn callback(
     } else {
         AxHintKind::Other(name)
     };
+    // The workspace backend alone decides what is hidden, so it hears of
+    // every hide and show; the rescan below is what gets them acted on.
+    if let (true, AxHintKind::Other(n)) = (got, &kind) {
+        let hidden = match n.as_str() {
+            "AXApplicationHidden" => Some(true),
+            "AXApplicationShown" => Some(false),
+            _ => None,
+        };
+        if let Some(hidden) = hidden {
+            let _ = ctx.tx.send(Msg::AppVisibility(Pid(pid), hidden));
+        }
+    }
     let _ = ctx.tx.send(Msg::Rescan(RescanTrigger::AxHint {
         pid: got.then_some(Pid(pid)),
         kind,

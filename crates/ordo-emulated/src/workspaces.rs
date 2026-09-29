@@ -211,6 +211,15 @@ pub struct EmulatedWorkspaces {
     /// When the apps left with nothing on screen are to be hidden: a switch
     /// un-hides at once but hides only once the user settles.
     hides_due: Option<Instant>,
+    /// The apps hidden right now, as far as this model knows: the ones it
+    /// hid, and ones found hidden with nothing on screen. Hiding is Ordo's
+    /// alone. An app hidden any other way while it has a window on screen is
+    /// shown again ([`Self::note_app_visibility`]), which is what lets a
+    /// switch ask only these apps whether they are hidden. `None` until
+    /// filled, by asking each app once, on the first pass that sees windows.
+    hidden_apps: Option<HashSet<Pid>>,
+    /// Hide and show notifications not yet acted on, oldest first.
+    visibility_news: Vec<(Pid, bool)>,
     /// Diagnostic record of what this model did to windows' frames, drained by
     /// the shell each snapshot. See [`crate::trace`] for why it must exist:
     /// every other channel sees the substituted belief, so without this the
@@ -238,6 +247,8 @@ impl EmulatedWorkspaces {
             homecoming: HashMap::new(),
             replug_unseen: false,
             hides_due: None,
+            hidden_apps: None,
+            visibility_news: Vec::new(),
             trace: Vec::new(),
         }
     }
@@ -925,6 +936,7 @@ impl EmulatedWorkspaces {
                 self.move_windows(d, &writes);
             }
         }
+        self.reconcile_visibility(d, frames, &g);
         if self.hides_due.is_some_and(|due| d.now() >= due) {
             self.hides_due = None;
             self.hide_idle_apps(d, frames, &g);
@@ -1469,14 +1481,41 @@ impl EmulatedWorkspaces {
     ) {
         let current = self.ledger.current();
         let (here_by_app, elsewhere) = self.apps_on_screen(frames, g);
-        let shows: Vec<Unhide> = here_by_app
+        let hidden = self.hidden_apps(d, frames).clone();
+        // A hide Ordo wasn't told of (an app its observer never attached to)
+        // shows here as an app none of whose windows on screen are in the
+        // window server's list: a hidden app's windows drop out of it. One
+        // list read for every app, against a round trip to each.
+        let listed: HashSet<WindowId> = d.stack().into_iter().collect();
+        let proj = self.ledger.projection();
+        let unlisted = |pid: &Pid| {
+            frames.iter().all(|(w, (p, _))| {
+                p != pid || !self.ledger.visible(*w, &proj) || !listed.contains(w)
+            })
+        };
+        let (shows, showing): (Vec<Pid>, Vec<Pid>) = here_by_app
             .into_iter()
             .filter(|(_, here)| *here)
-            .map(|(pid, _)| Unhide {
+            .map(|(pid, _)| pid)
+            .partition(|pid| hidden.contains(pid) || unlisted(pid));
+        // Any other app is showing, and nothing un-hidden needs holding.
+        for pid in showing {
+            self.note(
+                ParkTrace::app(pid, ParkTraceKind::AppShown)
+                    .ws(current, current)
+                    .detail("showing; not asked"),
+            );
+        }
+        let shows: Vec<Unhide> = shows
+            .into_iter()
+            .map(|pid| Unhide {
                 pid,
                 hold: elsewhere.get(&pid).cloned().unwrap_or_default(),
             })
             .collect();
+        for u in &shows {
+            self.hidden_apps(d, frames).remove(&u.pid);
+        }
         // One call for every un-hide of this pass: they overlap in time rather
         // than queueing, so a switch costs the slowest app's reveal.
         let held: HashMap<Pid, HoldStat> = d
@@ -1529,12 +1568,14 @@ impl EmulatedWorkspaces {
         let current = self.ledger.current();
         let (here_by_app, elsewhere) = self.apps_on_screen(frames, g);
         let focused_app = d.frontmost_app();
+        let hidden = self.hidden_apps(d, frames).clone();
         for (pid, has_window_here) in here_by_app {
-            if has_window_here || Some(pid) == focused_app || d.app_hidden(pid) == Some(true) {
+            if has_window_here || Some(pid) == focused_app || hidden.contains(&pid) {
                 continue;
             }
             let hold = elsewhere.get(&pid).cloned().unwrap_or_default();
             d.hide_app(pid);
+            self.hidden_apps(d, frames).insert(pid);
             let (read, off) = off_after_hide(d, pid, &hold);
             self.note(
                 ParkTrace::app(pid, ParkTraceKind::AppHidden)
@@ -1548,6 +1589,100 @@ impl EmulatedWorkspaces {
             for t in off {
                 self.note(t.ws(current, current));
             }
+        }
+    }
+
+    /// The apps hidden right now, filled on first use by asking each app the
+    /// ledger has a window of.
+    fn hidden_apps(
+        &mut self,
+        d: &dyn Desktop,
+        frames: &HashMap<WindowId, (Pid, Rect)>,
+    ) -> &mut HashSet<Pid> {
+        if self.hidden_apps.is_none() {
+            let apps: HashSet<Pid> = frames
+                .iter()
+                .filter(|(w, _)| self.ledger.claim(**w).is_some())
+                .map(|(_, (pid, _))| *pid)
+                .collect();
+            let hidden = apps
+                .into_iter()
+                .filter(|pid| d.app_hidden(*pid) == Some(true))
+                .collect();
+            self.hidden_apps = Some(hidden);
+        }
+        self.hidden_apps.as_mut().unwrap()
+    }
+
+    /// An app was hidden or shown, by anyone: Ordo's own hides and un-hides
+    /// arrive here too. Acted on at the next pass, which has the frames.
+    pub fn note_app_visibility(&mut self, pid: Pid, hidden: bool) {
+        self.visibility_news.push((pid, hidden));
+    }
+
+    /// Hiding is Ordo's alone. An app hidden some other way (Cmd+H, Hide
+    /// Others, the app itself) with a window on screen is shown again, its
+    /// parked windows held as a switch's un-hide holds them; one with nothing
+    /// on screen is already as Ordo wants it, and is kept hidden as if Ordo
+    /// had hidden it. A shown app is simply no longer hidden.
+    fn reconcile_visibility(
+        &mut self,
+        d: &dyn Desktop,
+        frames: &HashMap<WindowId, (Pid, Rect)>,
+        g: &Geometry,
+    ) {
+        let news = std::mem::take(&mut self.visibility_news);
+        if news.is_empty() {
+            return;
+        }
+        let current = self.ledger.current();
+        let (here_by_app, elsewhere) = self.apps_on_screen(frames, g);
+        // The latest word per app wins.
+        let mut latest: Vec<(Pid, bool)> = Vec::new();
+        for (pid, hidden) in news {
+            latest.retain(|(p, _)| *p != pid);
+            latest.push((pid, hidden));
+        }
+        let mut shows = Vec::new();
+        for (pid, hidden) in latest {
+            let known = self.hidden_apps(d, frames);
+            if !hidden {
+                known.remove(&pid);
+            } else if known.contains(&pid) {
+                // Ordo's own hide.
+            } else if here_by_app.get(&pid) == Some(&true) {
+                shows.push(Unhide {
+                    pid,
+                    hold: elsewhere.get(&pid).cloned().unwrap_or_default(),
+                });
+            } else if here_by_app.contains_key(&pid) {
+                known.insert(pid);
+                self.note(
+                    ParkTrace::app(pid, ParkTraceKind::AppHidden)
+                        .ws(current, current)
+                        .detail("hidden outside Ordo; kept hidden, nothing of it is on screen"),
+                );
+            }
+        }
+        if shows.is_empty() {
+            return;
+        }
+        let held: HashMap<Pid, HoldStat> = d
+            .show_apps(&shows)
+            .into_iter()
+            .map(|s| (s.pid, s))
+            .collect();
+        for u in shows {
+            let mut t = ParkTrace::app(u.pid, ParkTraceKind::AppShown)
+                .ws(current, current)
+                .detail(format!(
+                    "hidden outside Ordo; shown again, {} parked window(s) held",
+                    u.hold.len()
+                ));
+            if let Some(s) = held.get(&u.pid) {
+                t = t.hold(s.clone());
+            }
+            self.note(t);
         }
     }
 
@@ -1917,6 +2052,9 @@ mod tests {
         /// front app is the focused window's.
         front: std::cell::Cell<Option<Pid>>,
         now: std::cell::Cell<Instant>,
+        /// Times an app was asked whether it is hidden: a round trip to the
+        /// app's main thread each, which a busy app is slow to answer.
+        asked: std::cell::Cell<u32>,
     }
 
     impl FakeDesktop {
@@ -1934,6 +2072,7 @@ mod tests {
                 focused: std::cell::Cell::new(None),
                 front: std::cell::Cell::new(None),
                 now: std::cell::Cell::new(Instant::now()),
+                asked: std::cell::Cell::new(0),
             }
         }
 
@@ -2123,6 +2262,7 @@ mod tests {
         }
 
         fn app_hidden(&self, pid: Pid) -> Option<bool> {
+            self.asked.set(self.asked.get() + 1);
             Some(self.hidden.borrow().contains(&pid))
         }
 
@@ -2172,6 +2312,8 @@ mod tests {
         fn show_apps(&self, apps: &[Unhide]) -> Vec<HoldStat> {
             let mut out = Vec::new();
             for a in apps {
+                // The port asks each app before deciding to un-hide it.
+                self.asked.set(self.asked.get() + 1);
                 let unhid = self.hidden.borrow().contains(&a.pid);
                 let revealed = a.hold.iter().any(|(w, at)| {
                     let f = self.windows.borrow()[w].1;
@@ -2423,15 +2565,15 @@ mod tests {
         );
         assert!(sw.cost.is_some());
 
-        // The app owns a window here and was never hidden, so it is left
-        // alone — an un-hide sent to a showing app brings its parked windows
-        // forward — and the record says so.
+        // The app owns a window here and Ordo never hid it, so it is left
+        // alone, not even asked — an un-hide sent to a showing app brings its
+        // parked windows forward — and the record says so.
         let shown = trace
             .iter()
             .find(|t| t.kind == ParkTraceKind::AppShown)
             .expect("the visibility pass is attributable");
         assert_eq!(shown.pid, Some(Pid(10)));
-        assert_eq!(shown.detail.as_deref(), Some("already showing; left alone"));
+        assert_eq!(shown.detail.as_deref(), Some("showing; not asked"));
         assert!(in_park_corner(&d.frame(w(1)), &geo()));
     }
 
@@ -3385,6 +3527,99 @@ mod tests {
             .find(|t| t.kind == ParkTraceKind::AppShown && t.pid == Some(Pid(10)))
             .expect("the visibility pass is attributable");
         assert!(shown.detail.unwrap().contains("revealed"));
+    }
+
+    /// Hiding is Ordo's alone. Cmd+H on an app with a window on screen is
+    /// undone, and the un-hide holds its windows parked for other workspaces,
+    /// which revealing the app would otherwise drag back on screen.
+    #[test]
+    fn an_app_hidden_outside_ordo_with_a_window_on_screen_is_shown_again() {
+        let d = FakeDesktop::new(&[
+            (w(1), Pid(10), rect(100.0, 100.0)),
+            (w(2), Pid(10), rect(300.0, 200.0)),
+        ]);
+        let mut b = EmulatedWorkspaces::new(3);
+        rescan(&d, &mut b);
+        b.assign_window_to_workspace(w(2), ws(2)).unwrap();
+        rescan(&d, &mut b);
+
+        d.hidden.borrow_mut().insert(Pid(10));
+        b.note_app_visibility(Pid(10), true);
+        rescan(&d, &mut b);
+
+        assert!(!d.is_hidden(Pid(10)));
+        assert_eq!(d.frame(w(1)), rect(100.0, 100.0));
+        assert!(in_park_corner(&d.frame(w(2)), &geo()));
+    }
+
+    /// Cmd+H on an app with nothing on screen leaves it as Ordo wants it.
+    /// Ordo takes it as its own hide, so switching to the app's workspace
+    /// shows it.
+    #[test]
+    fn an_app_hidden_outside_ordo_with_nothing_on_screen_stays_hidden_until_needed() {
+        let d = FakeDesktop::new(&[
+            (w(1), Pid(10), rect(100.0, 100.0)),
+            (w(2), Pid(20), rect(300.0, 200.0)),
+        ]);
+        let mut b = EmulatedWorkspaces::new(3);
+        rescan(&d, &mut b);
+        b.assign_window_to_workspace(w(2), ws(2)).unwrap();
+        rescan(&d, &mut b);
+
+        d.hidden.borrow_mut().insert(Pid(20));
+        b.note_app_visibility(Pid(20), true);
+        rescan(&d, &mut b);
+        assert!(d.is_hidden(Pid(20)));
+
+        b.switch_workspace(&d, ws(2));
+        assert!(!d.is_hidden(Pid(20)));
+        assert_eq!(d.frame(w(2)), rect(300.0, 200.0));
+    }
+
+    /// Some apps never get an observer, so a hide of theirs goes unheard.
+    /// Their windows are missing from the window server's list, which is what
+    /// gives it away: the switch asks that app after all, and shows it.
+    #[test]
+    fn an_unheard_hide_is_still_undone_by_the_next_switch() {
+        let d = FakeDesktop::new(&[
+            (w(1), Pid(10), rect(100.0, 100.0)),
+            (w(2), Pid(20), rect(300.0, 200.0)),
+        ]);
+        let mut b = EmulatedWorkspaces::new(3);
+        rescan(&d, &mut b);
+        b.assign_window_to_workspace(w(2), ws(2)).unwrap();
+        rescan(&d, &mut b);
+        d.hidden.borrow_mut().insert(Pid(10));
+
+        b.switch_workspace(&d, ws(2));
+        b.switch_workspace(&d, ws(1));
+
+        assert!(!d.is_hidden(Pid(10)));
+    }
+
+    /// Asking an app whether it is hidden is a round trip to its main thread,
+    /// slow when the app is busy. A switch asks only the apps Ordo hid.
+    #[test]
+    fn a_switch_asks_only_the_apps_ordo_hid() {
+        let d = FakeDesktop::new(&[
+            (w(1), Pid(10), rect(100.0, 100.0)),
+            (w(2), Pid(10), rect(300.0, 200.0)),
+            (w(3), Pid(20), rect(500.0, 300.0)),
+        ]);
+        let mut b = EmulatedWorkspaces::new(3);
+        rescan(&d, &mut b);
+        b.assign_window_to_workspace(w(2), ws(2)).unwrap();
+        b.assign_window_to_workspace(w(3), ws(2)).unwrap();
+        b.switch_workspace(&d, ws(2));
+        b.switch_workspace(&d, ws(1));
+        d.settle(&mut b);
+        assert!(d.is_hidden(Pid(20)));
+        d.asked.set(0);
+
+        b.switch_workspace(&d, ws(2));
+
+        assert_eq!(d.asked.get(), 1, "Pid(20), which Ordo hid; not Pid(10)");
+        assert!(!d.is_hidden(Pid(20)));
     }
 
     /// An app is dimmed only once the user stays away from its windows. A

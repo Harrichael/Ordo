@@ -74,6 +74,10 @@ pub trait Effector {
     /// The save-state chord: resume persistence and write the current model
     /// as the new durable state. Default no-op.
     fn persist_workspaces(&mut self) {}
+
+    /// An app was hidden or shown, by anyone; for the workspace backend,
+    /// which alone decides what is hidden. Default no-op.
+    fn note_app_visibility(&mut self, _pid: Pid, _hidden: bool) {}
 }
 
 /// One restack's timing breakdown. The point is the question it exists to

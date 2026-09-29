@@ -231,6 +231,10 @@ impl WorkspaceBackend for EmulatedBackend {
         self.model.resume_persistence(&self.desktop);
     }
 
+    fn note_app_visibility(&mut self, pid: Pid, hidden: bool) {
+        self.model.note_app_visibility(pid, hidden);
+    }
+
     fn enforce_placement(&mut self, frames: &HashMap<WindowId, (Pid, Rect)>) {
         self.model.enforce_placement(&self.desktop, frames);
     }
