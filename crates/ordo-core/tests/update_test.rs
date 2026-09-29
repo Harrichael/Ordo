@@ -798,6 +798,46 @@ fn an_attached_popup_travels_with_its_root_window() {
     );
 }
 
+/// An app's AX read fails now and then, and one scan misses a window that is
+/// still there. It keeps its place in the MRU order when it reappears, so
+/// Alt+Tab and restacks don't treat it as the least recently used. A window
+/// gone for longer than that really closed, and one that shows up with its
+/// id later starts at the back.
+#[test]
+fn a_window_missing_from_one_scan_keeps_its_place() {
+    let without_w3 = || {
+        let mut wins = std_windows();
+        wins.retain(|w| w.snap.id != wid(3));
+        wins
+    };
+    let at = |s: &State, t: Ts, wins| {
+        update(
+            s,
+            &observed_at(
+                t,
+                vec![mon_a(1), mon_b(1)],
+                wins,
+                Some(1),
+                RescanTrigger::Periodic,
+            ),
+        )
+        .state
+    };
+    let s = booted(&[2, 3, 1]); // history: [1, 3, 2]
+    let t = ts();
+
+    let missed = at(&s, t, without_w3());
+    let back = at(&missed, plus_ms(t, 2_000), std_windows());
+    let tab = update(&back, &hotkey(HotkeyAction::MruWorkspace));
+    assert_eq!(focus_targets(&tab.effects), vec![wid(3)]);
+
+    let closed = at(&back, plus_ms(t, 4_000), without_w3());
+    let still_gone = at(&closed, plus_ms(t, 16_000), without_w3());
+    let reborn = at(&still_gone, plus_ms(t, 18_000), std_windows());
+    let tab = update(&reborn, &hotkey(HotkeyAction::MruWorkspace));
+    assert_eq!(focus_targets(&tab.effects), vec![wid(2)]);
+}
+
 #[test]
 fn round_trip_through_empty_workspace_refocuses_the_same_window() {
     // Leaving for an empty workspace never moves focus (parking doesn't

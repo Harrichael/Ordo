@@ -961,6 +961,7 @@ fn handle_snapshot(
 
     let deltas = reconcile::diff(pre, snap);
     reconcile::apply_snapshot(s, snap);
+    keep_vanished_places(pre, s, now_ns);
 
     // While the OS owns the slot, its choice among the VISIBLE windows is the
     // only record of where the user went. A hidden landing is never recorded
@@ -1274,6 +1275,37 @@ fn handle_snapshot(
             reason: RescanTrigger::PostEffect { op },
         });
     }
+}
+
+/// How long a window missing from the scans keeps its place in the focus
+/// history.
+const VANISH_GRACE_NS: u64 = 10_000_000_000;
+
+/// A window missing from one scan is usually still there: an app's AX read
+/// fails now and then (a Ghostty window dropped out of single scans three
+/// times in run 45). Forgetting its place would put it back at the end of the
+/// history when it reappears, and the next restack would push it under
+/// windows used less recently than it. So the place is kept, and only a
+/// window gone for `VANISH_GRACE_NS` leaves the history. Every reader of the
+/// history already skips windows that aren't in the model.
+fn keep_vanished_places(pre: &State, s: &mut State, now_ns: u64) {
+    for w in pre.windows.keys() {
+        if !s.windows.contains_key(w) {
+            s.vanished.entry(*w).or_insert(now_ns);
+        }
+    }
+    let mut vanished = std::mem::take(&mut s.vanished);
+    vanished.retain(|w, since| {
+        if s.windows.contains_key(w) {
+            false
+        } else if now_ns.saturating_sub(*since) >= VANISH_GRACE_NS {
+            s.focus_history.remove(*w);
+            false
+        } else {
+            true
+        }
+    });
+    s.vanished = vanished;
 }
 
 /// A window moved or resized by a hand that wasn't Ordo's may now overlap

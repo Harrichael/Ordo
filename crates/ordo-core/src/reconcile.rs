@@ -262,8 +262,8 @@ pub(crate) fn apply_snapshot(s: &mut State, snap: &WorldSnapshot) {
             },
         );
         // Enter never-before-seen windows into the MRU history at the back — but
-        // only ones that actually made it into the model, so focus_history stays
-        // a subset of `windows` (an invariant the rest of the core relies on).
+        // only ones that actually made it into the model. A window returning
+        // from a missed scan is still in the history, and keeps its place.
         if is_new {
             s.focus_history.note_created(w.id);
         }
@@ -280,11 +280,8 @@ pub(crate) fn apply_snapshot(s: &mut State, snap: &WorldSnapshot) {
         s.focus_history.remove(w);
     }
 
-    for gone in old_windows.keys() {
-        if !s.windows.contains_key(gone) {
-            s.focus_history.remove(*gone);
-        }
-    }
+    // A window gone from this scan keeps its history entry for now; the
+    // update decides when it is really gone (`keep_vanished_places`).
 
     s.focused = snap.focused.filter(|w| s.windows.contains_key(w));
 }

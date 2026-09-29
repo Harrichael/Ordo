@@ -202,6 +202,10 @@ pub struct State {
     /// See `restack_settled_moves`.
     #[serde(default)]
     pub(crate) moving: BTreeSet<WindowId>,
+    /// Windows missing from the model since `mono_ns`, whose place in the
+    /// focus history is kept for now. See `keep_vanished_places`.
+    #[serde(default)]
+    pub(crate) vanished: BTreeMap<WindowId, u64>,
     pub pending: Vec<PendingOp>,
     /// Damping for tear re-alignment, mirroring `WindowRecord::corrections`.
     pub tear_corrections: u8,
@@ -228,6 +232,7 @@ impl State {
             focus_history: FocusHistory::new(),
             misplaced_since: BTreeMap::new(),
             moving: BTreeSet::new(),
+            vanished: BTreeMap::new(),
             pending: Vec::new(),
             tear_corrections: 0,
             next_op: 0,
