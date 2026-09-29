@@ -677,4 +677,44 @@ CREATE INDEX events_by_kind ON events(run_id, kind);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// Pruning deletes rows, but only a vacuum gives their pages back: without
+    /// one the file keeps its size forever, however little of it is live.
+    #[test]
+    fn a_pruned_run_gives_its_disk_space_back() {
+        let dir = std::env::temp_dir().join(format!("ordo-reclaim-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("log.db");
+        let _ = std::fs::remove_file(&db);
+        let day_ms = 24 * 60 * 60 * 1000i64;
+        let size = || std::fs::metadata(&db).unwrap().len();
+
+        let old = Logger::open(&db, "test", "native", 0).unwrap().run_id();
+        {
+            let conn = Connection::open(&db).unwrap();
+            let payload = "x".repeat(4096);
+            for seq in 0..500 {
+                conn.execute(
+                    "INSERT INTO events (run_id, seq, wall_ms, mono_ns, kind, payload)
+                     VALUES (?1, ?2, 0, 0, 'engaged', ?3)",
+                    rusqlite::params![old, seq, payload],
+                )
+                .unwrap();
+            }
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        }
+        let full = size();
+
+        drop(Logger::open(&db, "test", "native", 30 * day_ms).unwrap());
+        let wal = dir.join("log.db-wal");
+        assert!(std::fs::metadata(&wal).map_or(0, |m| m.len()) < full / 4, "the WAL kept it");
+        let conn = Connection::open(&db).unwrap();
+        let free: i64 = conn
+            .pragma_query_value(None, "freelist_count", |r| r.get(0))
+            .unwrap();
+        assert_eq!(free, 0);
+        assert!(size() < full / 4, "{} of {full} bytes kept", size());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

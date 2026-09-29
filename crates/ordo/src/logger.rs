@@ -41,6 +41,29 @@ const CHECKPOINT_EVERY: u64 = 200;
 /// bug you noticed a week and a half ago; short enough to bound disk use.
 const RETENTION_DAYS: i64 = 14;
 
+/// Give the pages freed by pruned runs back to the disk. SQLite keeps a
+/// deleted row's pages inside the file, so retention alone never shrank it
+/// (measured: a 1.85 GB log that was 83% free pages). Incremental auto-vacuum
+/// returns them cheaply at each open, but an existing file only switches to
+/// it through one full VACUUM (about 3 s at that size, once). Either passes
+/// through the write-ahead log, which SQLite reuses but never shrinks, so it
+/// is truncated after.
+fn reclaim(conn: &Connection) -> rusqlite::Result<()> {
+    const INCREMENTAL: i64 = 2;
+    let mode: i64 = conn.pragma_query_value(None, "auto_vacuum", |r| r.get(0))?;
+    if mode == INCREMENTAL {
+        // Frees pages as it is stepped, so it must be stepped to the end:
+        // `execute_batch` stops after the first and frees next to nothing.
+        let mut stmt = conn.prepare("PRAGMA incremental_vacuum")?;
+        let mut rows = stmt.query([])?;
+        while rows.next()?.is_some() {}
+    } else {
+        conn.pragma_update(None, "auto_vacuum", INCREMENTAL)?;
+        conn.execute_batch("VACUUM;")?;
+    }
+    conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+}
+
 /// One batch of queued hotkeys, as the engine dequeued it. The core's hotkey
 /// events are stamped at dequeue, so this is the only record of time spent
 /// waiting behind the engine's previous work.
@@ -107,6 +130,7 @@ impl Logger {
             conn.execute("DELETE FROM runs WHERE started_wall < ?1", params![cutoff])?;
         }
         schema::migrate(&conn, schema_version)?;
+        reclaim(&conn)?;
 
         conn.execute(
             "INSERT INTO runs (started_wall, version, backend) VALUES (?1, ?2, ?3)",
