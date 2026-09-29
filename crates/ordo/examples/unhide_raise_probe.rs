@@ -30,6 +30,11 @@
 //!
 //! `<top>` and `<under>` are a pid, or `pid:window` to pick one window.
 //!
+//! `unhide-shown`: a different question. Nothing is hidden: each trial
+//! either un-hides `under`'s app while it is already showing (what a switch
+//! does to every app with a window on the new workspace) or does nothing,
+//! and watches whether `under` jumps above `top`.
+//!
 //! `RAISE_WHILE_HIDDEN=<window>` (env): raise that window while `top` is
 //! hidden, as a switch's stacking does on the workspace in between.
 //!
@@ -231,6 +236,52 @@ fn run_trial(
     }
 }
 
+fn unhide_shown(trials: usize, top: WindowId, under: (Pid, WindowId)) {
+    let (pid, win) = under;
+    let mut jumps = [0usize; 2];
+    let mut ran = [0usize; 2];
+    for i in 0..trials {
+        for (k, call) in [false, true].into_iter().enumerate() {
+            if !reset(top, win) {
+                println!("  trial {} {}: could not put top above under; skipped", i + 1, label(call));
+                continue;
+            }
+            if call {
+                ax::set_app_hidden(pid, false);
+            }
+            let start = Instant::now();
+            let mut jumped = None;
+            while start.elapsed() < Duration::from_millis(1000) {
+                if place(win, top) == Place::Above {
+                    jumped = Some(start.elapsed().as_millis());
+                    break;
+                }
+                sleep(POLL);
+            }
+            ran[k] += 1;
+            if jumped.is_some() {
+                jumps[k] += 1;
+            }
+            println!(
+                "  trial {} {:9}: under {}",
+                i + 1,
+                label(call),
+                jumped.map_or("stayed below".into(), |ms| format!("JUMPED above after {ms}ms"))
+            );
+        }
+    }
+    println!("\nno call:   {} of {} jumped", jumps[0], ran[0]);
+    println!("un-hide:   {} of {} jumped", jumps[1], ran[1]);
+}
+
+fn label(call: bool) -> &'static str {
+    if call {
+        "un-hide"
+    } else {
+        "no call"
+    }
+}
+
 /// `top` above `under`, both below the key window, as a switch leaves them.
 fn reset(top: WindowId, under: WindowId) -> bool {
     ax::raise(under);
@@ -324,6 +375,11 @@ fn main() {
     };
     if !park.is_empty() {
         println!("mode {mode}: parking {} window(s) off x={left_edge:.0}", park.len());
+    }
+
+    if mode == "unhide-shown" {
+        unhide_shown(trials, top, (Pid(under_pid), under));
+        return;
     }
 
     let routes = [Route::None, Route::After, Route::With, Route::First, Route::Front];
