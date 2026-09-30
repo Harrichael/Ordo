@@ -49,6 +49,7 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use objc2_app_kit::NSRunningApplication;
+use ordo::app_queue::AppSession;
 use ordo::platform::{ax, zorder};
 use ordo_core::{Pid, Point, Rect, WindowId};
 use ordo_skylight_sys as sys;
@@ -155,7 +156,7 @@ fn run_trial(
                 )
             })
             .collect();
-        ax::move_windows(&away);
+        move_windows(&away);
         sleep(Duration::from_millis(50));
     }
     ax::set_app_hidden(pid, true);
@@ -171,7 +172,7 @@ fn run_trial(
         .iter()
         .map(|&(p, w, home)| (p, w, Point { x: home.x, y: home.y }))
         .collect();
-    ax::move_windows(&homes);
+    move_windows(&homes);
 
     let mut raise_unhid = false;
     let start = Instant::now();
@@ -433,5 +434,19 @@ fn main() {
             rs.iter().filter(|t| t.on_top.is_none()).count(),
             rs.iter().filter(|t| t.focus_stolen).count(),
         );
+    }
+}
+
+/// Each app's moves through its own session, one app after another.
+fn move_windows(moves: &[(Pid, WindowId, Point)]) {
+    let mut pids: Vec<Pid> = moves.iter().map(|(p, _, _)| *p).collect();
+    pids.dedup();
+    for pid in pids {
+        let mine: Vec<(WindowId, Point)> = moves
+            .iter()
+            .filter(|(p, _, _)| *p == pid)
+            .map(|(_, w, at)| (*w, *at))
+            .collect();
+        ax::AxApp::open(pid).move_windows(&mine, &|| false);
     }
 }

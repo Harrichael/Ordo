@@ -591,20 +591,15 @@ fn switching_to_an_empty_workspace_gives_focus_to_the_desktop_and_holds_it() {
     // The sliver on workspace 7: switching away from Chrome to an empty
     // workspace left Chrome key, the backend spares the focused app when it
     // hides apps, and Chrome's windows parked for other workspaces lined the
-    // screen's left edge. The desktop takes focus instead, granted before
-    // the switch so the hiding that follows finds nobody to spare; when the
-    // app takes focus back, the desktop is re-granted rather than the app
-    // followed or anything grabbed.
+    // screen's left edge. The desktop takes focus instead, granted with
+    // the switch so the hiding that follows it finds nobody to spare; when
+    // the app takes focus back, the desktop is re-granted rather than the
+    // app followed or anything grabbed.
     let s = booted(&[1]);
     let away = update(&s, &hotkey(HotkeyAction::WorkspaceNext)); // ws2 is empty
     let on_a = |e: &Effect| matches!(e, Effect::FocusDesktop { display, .. } if *display == mid(1));
-    let desktop_at = away.effects.iter().position(on_a).expect("the desktop is granted");
-    let switch_at = away
-        .effects
-        .iter()
-        .position(|e| matches!(e, Effect::SwitchWorkspace { .. }))
-        .expect("the switch is issued");
-    assert!(desktop_at < switch_at, "{:?}", away.effects);
+    assert!(away.effects.iter().any(on_a), "the desktop is granted: {:?}", away.effects);
+    assert_eq!(count_switches(&away.effects), 1);
     assert_eq!(away.state.focus_intent(), FocusIntent::Desktop);
 
     let world = |focused| observed(vec![mon_a(2), mon_b(2)], std_windows(), focused, RescanTrigger::Periodic);
@@ -619,8 +614,10 @@ fn switching_to_an_empty_workspace_gives_focus_to_the_desktop_and_holds_it() {
 
 #[test]
 fn switching_hands_focus_to_the_destinations_mru_window() {
-    // w2 lives on workspace 2; it should be focused BEFORE the switch lands
-    // (typing must never keep flowing into a freshly parked window).
+    // w2 lives on workspace 2. Its focus is issued AFTER the switch: its app
+    // may still be hidden, and fronting a hidden app un-hides it before its
+    // parked windows can be held, so the grant follows the switch's moves
+    // and un-hides.
     let mut wins = std_windows();
     wins[1].workspace = ws(2);
     let s = update(
@@ -645,7 +642,7 @@ fn switching_hands_focus_to_the_destinations_mru_window() {
         .iter()
         .position(|e| matches!(e, Effect::SwitchWorkspace { target, .. } if *target == ws(2)))
         .expect("switch effect");
-    assert!(focus_pos < switch_pos);
+    assert!(switch_pos < focus_pos);
     assert_eq!(step.state.pending.len(), 2, "focus + switch both expected");
     // No warp: the core's frame belief for a parked window is its sliver.
     assert!(!step
@@ -2866,8 +2863,8 @@ fn viewing_the_next_monitor_hands_focus_to_its_mru_window_and_clamps_at_the_ends
     assert_eq!(focus_targets(&step.effects), vec![wid(2)]);
     assert_eq!(view_targets(&step.effects), vec![vm(2)]);
     assert_eq!(step.state.focus_intent(), FocusIntent::Window(wid(2)));
-    // The focus is issued BEFORE the view, as a switch hands focus before it
-    // parks the old workspace.
+    // The focus is issued AFTER the view, as a switch issues it after the
+    // switch: the grant follows the moves and un-hides that reveal w2.
     let focus_at = step
         .effects
         .iter()
@@ -2878,7 +2875,7 @@ fn viewing_the_next_monitor_hands_focus_to_its_mru_window_and_clamps_at_the_ends
         .iter()
         .position(|e| matches!(e, Effect::ViewMonitor { .. }))
         .unwrap();
-    assert!(focus_at < view_at);
+    assert!(view_at < focus_at);
 
     // The backend's word confirms the view: our own echo.
     let confirmed = update(

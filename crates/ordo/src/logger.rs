@@ -270,9 +270,9 @@ impl Logger {
             "INSERT INTO restacks (run_id, wall_ms, total_ms, presence_wait_ms,
                  handoff_wait_ms, desired, missing, skipped_suffix, second_pass, converged,
                  aborted, ghost_pass, refocused, start_order, edges, lanes, raise_set,
-                 untouched, violated_end, frames)
+                 untouched, violated_end, frames, landing_wait_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-                 ?16, ?17, ?18, ?19)",
+                 ?16, ?17, ?18, ?19, ?20)",
             params![
                 self.run_id,
                 now_wall_ms,
@@ -301,6 +301,7 @@ impl Logger {
                     .map(|(w, f)| format!("{}:{},{},{},{}", w.0, f.x, f.y, f.w, f.h))
                     .collect::<Vec<_>>()
                     .join(" "),
+                s.landing_wait_ms as i64,
             ],
         )?;
         let restack_id = tx.last_insert_rowid();

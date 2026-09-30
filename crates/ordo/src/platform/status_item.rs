@@ -605,6 +605,16 @@ impl Controller {
             menu.addItem(&NSMenuItem::separatorItem(mtm));
             menu.addItem(&info_item("Paused — press ⌃⌥⌘O to resume", mtm));
         }
+        if !view.unreachable.is_empty() {
+            menu.addItem(&NSMenuItem::separatorItem(mtm));
+            for pid in &view.unreachable {
+                let name = app_name(*pid).unwrap_or_else(|| format!("pid {}", pid.0));
+                menu.addItem(&info_item(
+                    &format!("Can't reach {name}: quit and reopen it"),
+                    mtm,
+                ));
+            }
+        }
         menu.addItem(&NSMenuItem::separatorItem(mtm));
         menu.addItem(&self.settings(mtm));
     }
@@ -689,6 +699,12 @@ fn info_item(title: &str, mtm: MainThreadMarker) -> Retained<NSMenuItem> {
     };
     item.setEnabled(false);
     item
+}
+
+fn app_name(pid: ordo_core::Pid) -> Option<String> {
+    NSRunningApplication::runningApplicationWithProcessIdentifier(pid.0)
+        .and_then(|a| a.localizedName())
+        .map(|n| n.to_string())
 }
 
 /// "Safari, Slack, Terminal +2", most recently used first.

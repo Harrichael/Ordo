@@ -182,10 +182,14 @@ fn run(
     // The engine and all macOS handles live entirely on this one thread.
     let engine_intercepting = intercepting.clone();
     let world_intercepting = intercepting.clone();
+    let unreachable = ordo::platform::Unreachable::default();
+    let world_unreachable = unreachable.clone();
     // The restack worker outlives everything but the process (tap-thread
     // lifetime contract); it reports its telemetry back through the engine's
     // channel, so it needs a sender before the engine thread consumes rx.
     let restack = ordo::platform::restack_worker::spawn(tx.clone(), ws.signals());
+    let queues = ordo::platform::ax_queues();
+    let rescue_queues = queues.clone();
     let engine_ws = ws.clone();
     let engine_thread = std::thread::spawn(move || {
         let clock = SystemClock::new();
@@ -209,21 +213,25 @@ fn run(
                 let state_path = (!fresh && !observe)
                     .then(|| path.parent().map(|d| d.join("state.json")))
                     .flatten();
-                emulated_backend(workspaces, state_path)
+                emulated_backend(workspaces, state_path, queues.clone())
             }
         };
         let world = ordo::platform::ws_events::SubscribingWorld::new(
-            MacWorldSource::new(backend.clone(), world_intercepting, settle),
+            MacWorldSource::new(backend.clone(), world_intercepting, settle, world_unreachable),
             engine_ws,
         );
         let effector: Box<dyn Effector> = if observe {
             Box::new(NullEffector)
         } else {
-            Box::new(MacEffector::new(backend, engine_intercepting, restack))
+            Box::new(MacEffector::new(backend, engine_intercepting, restack, queues))
         };
         let mut engine = Engine::new(logger, Box::new(world), effector, Box::new(clock));
         if let Some(menubar) = menubar {
-            engine = engine.on_state(move |s| menubar.show(MenuBarView::of(s)));
+            engine = engine.on_state(move |s| {
+                let mut view = MenuBarView::of(s);
+                view.unreachable = unreachable.lock().unwrap().clone();
+                menubar.show(view);
+            });
         }
         engine.run(rx);
     });
@@ -243,9 +251,12 @@ fn run(
             // A SIGUSR1 (from `ordo rescue`) disengages interception
             // immediately — the same effect as the hotkey fast path — and
             // tells the core to go inert. The gather itself runs in the
-            // rescue CLI's own process.
+            // rescue CLI's own process, already under way: whatever the apps'
+            // queues still hold is dropped here rather than when the engine
+            // gets to the message, or it would land on top of the gather.
             if rescue_requested.swap(false, Ordering::Relaxed) {
                 intercepting.store(false, Ordering::Relaxed);
+                rescue_queues.abandon();
                 let _ = tx.send(Msg::Rescue);
             }
             if tx.send(Msg::Rescan(RescanTrigger::Periodic)).is_err() {

@@ -30,7 +30,7 @@ use ordo_core::{
 
 use crate::ledger::{Claim, Ledger, SwitchPlan};
 use crate::statefile::{self, PersistedState, PersistedWindow};
-use crate::trace::{HoldStat, ParkTrace, ParkTraceKind, SwitchCost};
+use crate::trace::{ParkTrace, ParkTraceKind, SwitchCost};
 use crate::{Desktop, Unhide};
 
 /// How much of a parked window stays on-screen. macOS refuses to keep a fully
@@ -209,7 +209,8 @@ pub struct EmulatedWorkspaces {
     /// screen): the next scan that does see them is still the replug's pass.
     replug_unseen: bool,
     /// When the apps left with nothing on screen are to be hidden: a switch
-    /// un-hides at once but hides only once the user settles.
+    /// asks for its un-hides straight away but hides only once the user
+    /// settles.
     hides_due: Option<Instant>,
     /// The apps hidden right now, as far as this model knows: the ones it
     /// hid, and ones found hidden with nothing on screen. Hiding is Ordo's
@@ -511,29 +512,17 @@ impl EmulatedWorkspaces {
             .iter()
             .map(|(pid, w, f)| (*pid, *w, Point { x: f.x, y: f.y }))
             .collect();
-        for app in d.move_windows(&moves) {
-            // Each write's own record was made when it was decided, just
-            // before this; the cost is only known now.
-            for (w, stat) in &app.writes {
-                if let Some(t) = self
-                    .trace
-                    .iter_mut()
-                    .rev()
-                    .find(|t| t.window == *w && t.requested.is_some() && t.write.is_none())
-                {
-                    t.write = Some(*stat);
-                }
-            }
-            self.note(ParkTrace::app(app.pid, ParkTraceKind::AppMoved).moves(app));
+        if !moves.is_empty() {
+            d.move_windows(&moves);
         }
     }
 
     /// Carry out a plan: park what left the screen, restore what entered it.
     /// Frames first, then visibility — a window must already be at the corner
     /// before its app is un-hidden, or the unhide reveals it where it still
-    /// stands. Whether that ordering is SUFFICIENT is the open question: it
-    /// cannot stop an app from restoring its own geometry in response to
-    /// being un-hidden, which is what the trace is here to show.
+    /// stands. The port keeps that order per app: each app's un-hide follows
+    /// its own moves. It cannot stop an app from restoring its own geometry
+    /// in response to being un-hidden; the un-hide's hold is for that.
     ///
     /// Stacking is NOT this backend's problem: the core follows every switch
     /// or view with a RestackWindows effect derived from the MRU history,
@@ -544,7 +533,7 @@ impl EmulatedWorkspaces {
             return;
         }
         let started = d.now();
-        let frames = current_frames(d);
+        let frames = current_frames(d, self.ledger.window_ws().into_keys());
         let g = Geometry::read(d);
         let read = d.now();
         let boundary_at = self.trace.len();
@@ -557,7 +546,7 @@ impl EmulatedWorkspaces {
         self.note_stack(d, "before");
         let mut writes = Vec::new();
         for w in plan.park {
-            writes.extend(self.park(w, None, &frames, &g));
+            writes.extend(self.park(w, None, &frames, &g, d.in_flight(w)));
         }
         for w in plan.restore {
             writes.extend(self.restore(w, &frames, &g));
@@ -567,22 +556,17 @@ impl EmulatedWorkspaces {
         }
         let persist_began = d.now();
         self.persist();
-        let moves_began = d.now();
+        let queue_began = d.now();
         self.move_windows(d, &writes);
-        let moved = d.now();
-        self.note_stack(d, "after moves");
-        let visibility_began = d.now();
         self.apply_app_visibility(d, &frames, &g);
         let ms = |a: std::time::Instant, b: std::time::Instant| (b - a).as_secs_f64() * 1000.0;
         if let Some(t) = self.trace.get_mut(boundary_at) {
             t.cost = Some(SwitchCost {
                 read_ms: ms(started, read),
-                moves_ms: ms(moves_began, moved),
-                persist_ms: ms(persist_began, moves_began),
-                visibility_ms: ms(visibility_began, d.now()),
+                persist_ms: ms(persist_began, queue_began),
+                queue_ms: ms(queue_began, d.now()),
             });
         }
-        self.note_stack(d, "after un-hides");
     }
 
     fn note_stack(&mut self, d: &dyn Desktop, moment: &str) {
@@ -787,7 +771,8 @@ impl EmulatedWorkspaces {
                 .as_ref()
                 .and_then(|p| statefile::load(p, self.boot_time));
             if let Some(ps) = file {
-                let frames = current_frames(d);
+                let known = self.ledger.window_ws().into_keys();
+                let frames = current_frames(d, known.chain(ps.windows.iter().map(|w| w.id)));
                 let g = Geometry::read(d);
                 let merged =
                     merge_fresh_session(&self.ledger.window_claims(), &self.saved, &ps, |id| {
@@ -966,6 +951,11 @@ impl EmulatedWorkspaces {
             let Some((pid, f)) = frames.get(&w) else {
                 continue;
             };
+            // This scan may predate our own write to it; judge it once that
+            // write has had its chance to land.
+            if d.in_flight(w) {
+                continue;
+            }
             if self.at_park(w, f) {
                 self.enforce_attempts.remove(&w);
                 self.pending_repark.remove(&w);
@@ -1076,7 +1066,8 @@ impl EmulatedWorkspaces {
                 }
                 writes.push((*pid, w, want));
             } else {
-                let write = self.park(w, self.enforce_attempts.get(&w).copied(), frames, &g);
+                let attempt = self.enforce_attempts.get(&w).copied();
+                let write = self.park(w, attempt, frames, &g, false);
                 newly_parked |= write.is_some();
                 writes.extend(write);
             }
@@ -1142,7 +1133,7 @@ impl EmulatedWorkspaces {
         // Claim it for the visible workspace and the anchor monitor, and bring
         // it back on-screen. No visibility pass here: rescue must only ever
         // reveal, and the gather already unhides every app up front.
-        let frames = current_frames(d);
+        let frames = current_frames(d, [window]);
         let viewed = self.ledger.monitors().viewed;
         self.ledger.assign_window(window, self.ledger.current());
         self.ledger.assign_monitor(window, viewed);
@@ -1254,12 +1245,20 @@ impl EmulatedWorkspaces {
     /// `attempt`: enforcement's charge count for this window, when the caller
     /// is enforcement. Carried only so the trace can show the countdown toward
     /// the limit on this path too — a switch's park has no such notion.
+    ///
+    /// `in_flight`: a write to this window is still on its way, so `frames`
+    /// may show where it stood before that write rather than where it is
+    /// going. Its promise, which that write was made from, is kept, and the
+    /// park is written whatever the frame says: skipping it because the
+    /// window read as parked would let the write on its way land and leave
+    /// the window on screen.
     fn park(
         &mut self,
         window: WindowId,
         attempt: Option<u8>,
         frames: &HashMap<WindowId, (Pid, Rect)>,
         g: &Geometry,
+        in_flight: bool,
     ) -> Option<(Pid, WindowId, Rect)> {
         // Save the real frame only on the transition onto-screen -> parked; a
         // window already parked keeps its original saved frame rather than
@@ -1268,6 +1267,7 @@ impl EmulatedWorkspaces {
             return None;
         }
         let (pid, f) = frames.get(&window)?;
+        let stale = in_flight && self.saved.contains_key(&window);
         // Never canonicalize a sliver as a window's real frame. Gaps in the
         // model (a partial scan dropping the ledger entry, R-mode
         // re-adoption at birth) can hand this path a window that is already
@@ -1276,7 +1276,7 @@ impl EmulatedWorkspaces {
         // position" becomes the corner artifact, and persist() writes it to
         // disk. A missing promise is recoverable (rescue); a lying one is
         // not.
-        if self.reads_parked(window, f, g) {
+        if !stale && self.reads_parked(window, f, g) {
             self.parked.insert(window);
             self.enforce_attempts.remove(&window);
             self.pending_repark.remove(&window);
@@ -1291,9 +1291,11 @@ impl EmulatedWorkspaces {
             return None;
         }
         let (pid, f) = (*pid, *f);
-        self.saved.insert(window, f);
-        if self.full_rig(g) {
-            self.home.insert(window, f);
+        if !stale {
+            self.saved.insert(window, f);
+            if self.full_rig(g) {
+                self.home.insert(window, f);
+            }
         }
         self.parked.insert(window);
         self.enforce_attempts.remove(&window);
@@ -1304,6 +1306,9 @@ impl EmulatedWorkspaces {
             .observed(f)
             .requested(want)
             .at_park(false);
+        if stale {
+            t = t.detail("a write to it is still on its way; promise kept");
+        }
         if let Some(n) = attempt {
             t = t.attempt(n);
         }
@@ -1515,38 +1520,19 @@ impl EmulatedWorkspaces {
             .collect();
         for u in &shows {
             self.hidden_apps(d, frames).remove(&u.pid);
-        }
-        // One call for every un-hide of this pass: they overlap in time rather
-        // than queueing, so a switch costs the slowest app's reveal.
-        let held: HashMap<Pid, HoldStat> = d
-            .show_apps(&shows)
-            .into_iter()
-            .map(|s| (s.pid, s))
-            .collect();
-        for u in shows {
-            let stat = held.get(&u.pid);
-            let detail = if let Some(s) = stat.filter(|s| !s.unhid) {
-                if s.writes == 0 {
-                    "already showing; left alone".to_string()
-                } else {
-                    format!(
-                        "already showing, but revealed: {} parked window(s) held back",
+            self.note(
+                ParkTrace::app(u.pid, ParkTraceKind::AppShown)
+                    .ws(current, current)
+                    .detail(format!(
+                        "un-hiding; holds {} window(s) parked for other workspaces",
                         u.hold.len()
-                    )
-                }
-            } else {
-                format!(
-                    "unhidden; also reveals {} window(s) parked for other workspaces",
-                    u.hold.len()
-                )
-            };
-            let mut t = ParkTrace::app(u.pid, ParkTraceKind::AppShown)
-                .ws(current, current)
-                .detail(detail);
-            if let Some(s) = stat {
-                t = t.hold(s.clone());
-            }
-            self.note(t);
+                    )),
+            );
+        }
+        // Each app's un-hide runs on its own queue, overlapping the others, so
+        // a switch costs the slowest app's reveal.
+        if !shows.is_empty() {
+            d.show_apps(&shows);
         }
         self.hides_due = Some(d.now() + HIDE_SETTLE);
     }
@@ -1573,22 +1559,14 @@ impl EmulatedWorkspaces {
             if has_window_here || Some(pid) == focused_app || hidden.contains(&pid) {
                 continue;
             }
-            let hold = elsewhere.get(&pid).cloned().unwrap_or_default();
+            let parked = elsewhere.get(&pid).map_or(0, |h| h.len());
             d.hide_app(pid);
             self.hidden_apps(d, frames).insert(pid);
-            let (read, off) = off_after_hide(d, pid, &hold);
             self.note(
                 ParkTrace::app(pid, ParkTraceKind::AppHidden)
                     .ws(current, current)
-                    .detail(format!(
-                        "hidden; {} window(s) parked, {read} read back, {} off their spot",
-                        hold.len(),
-                        off.len()
-                    )),
+                    .detail(format!("hidden; {parked} window(s) parked")),
             );
-            for t in off {
-                self.note(t.ws(current, current));
-            }
         }
     }
 
@@ -1667,23 +1645,17 @@ impl EmulatedWorkspaces {
         if shows.is_empty() {
             return;
         }
-        let held: HashMap<Pid, HoldStat> = d
-            .show_apps(&shows)
-            .into_iter()
-            .map(|s| (s.pid, s))
-            .collect();
-        for u in shows {
-            let mut t = ParkTrace::app(u.pid, ParkTraceKind::AppShown)
-                .ws(current, current)
-                .detail(format!(
-                    "hidden outside Ordo; shown again, {} parked window(s) held",
-                    u.hold.len()
-                ));
-            if let Some(s) = held.get(&u.pid) {
-                t = t.hold(s.clone());
-            }
-            self.note(t);
+        for u in &shows {
+            self.note(
+                ParkTrace::app(u.pid, ParkTraceKind::AppShown)
+                    .ws(current, current)
+                    .detail(format!(
+                        "hidden outside Ordo; shown again, {} parked window(s) held",
+                        u.hold.len()
+                    )),
+            );
         }
+        d.show_apps(&shows);
     }
 
     /// Per app: whether any of its ledger windows is on screen, and where
@@ -1728,31 +1700,12 @@ impl EmulatedWorkspaces {
     }
 }
 
-/// The app's parked windows as they stand the moment its hide returns, each one
-/// off its spot traced. Positions compare exactly because a park lands
-/// exactly (see [`park_frame`]).
-fn off_after_hide(d: &dyn Desktop, pid: Pid, hold: &[(WindowId, Point)]) -> (usize, Vec<ParkTrace>) {
-    if hold.is_empty() {
-        return (0, Vec::new());
-    }
-    let ids: Vec<WindowId> = hold.iter().map(|(w, _)| *w).collect();
-    let frames = d.window_frames(pid, &ids);
-    let off = frames
-        .iter()
-        .filter_map(|(w, f)| {
-            let (_, at) = hold.iter().find(|(h, _)| h == w)?;
-            (f.x != at.x || f.y != at.y).then(|| {
-                ParkTrace::new(*w, ParkTraceKind::OffAfterHide)
-                    .observed(*f)
-                    .requested(Rect { x: at.x, y: at.y, ..*f })
-            })
-        })
-        .collect();
-    (frames.len(), off)
-}
-
-fn current_frames(d: &dyn Desktop) -> HashMap<WindowId, (Pid, Rect)> {
-    d.windows()
+fn current_frames(
+    d: &dyn Desktop,
+    windows: impl IntoIterator<Item = WindowId>,
+) -> HashMap<WindowId, (Pid, Rect)> {
+    let ids: Vec<WindowId> = windows.into_iter().collect();
+    d.frames(&ids)
         .into_iter()
         .map(|(id, pid, frame)| (id, (pid, frame)))
         .collect()
@@ -1933,7 +1886,6 @@ fn merge_fresh_session(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::trace::AppMoveStat;
 
     fn w(n: u32) -> WindowId {
         WindowId(n)
@@ -2055,6 +2007,11 @@ mod tests {
         /// Times an app was asked whether it is hidden: a round trip to the
         /// app's main thread each, which a busy app is slow to answer.
         asked: std::cell::Cell<u32>,
+        /// While set, moves wait in `queue` until `land_queued`, as the real
+        /// port's writes wait on each app's thread; a queued window is in
+        /// flight.
+        queueing: std::cell::Cell<bool>,
+        queue: std::cell::RefCell<Vec<(Pid, WindowId, Point)>>,
     }
 
     impl FakeDesktop {
@@ -2073,6 +2030,8 @@ mod tests {
                 front: std::cell::Cell::new(None),
                 now: std::cell::Cell::new(Instant::now()),
                 asked: std::cell::Cell::new(0),
+                queueing: std::cell::Cell::new(false),
+                queue: std::cell::RefCell::new(Vec::new()),
             }
         }
 
@@ -2163,6 +2122,13 @@ mod tests {
             self.frozen.set(false);
         }
 
+        /// The apps get round to every queued move, in order.
+        fn land_queued(&self) {
+            self.queueing.set(false);
+            let queued = std::mem::take(&mut *self.queue.borrow_mut());
+            self.move_windows(&queued);
+        }
+
         /// The window really closes: gone from the window server too.
         fn close(&self, w: WindowId) {
             self.windows.borrow_mut().remove(&w);
@@ -2190,11 +2156,11 @@ mod tests {
     }
 
     impl Desktop for FakeDesktop {
-        fn windows(&self) -> Vec<(WindowId, Pid, Rect)> {
-            self.windows
-                .borrow()
+        fn frames(&self, windows: &[WindowId]) -> Vec<(WindowId, Pid, Rect)> {
+            let ws = self.windows.borrow();
+            windows
                 .iter()
-                .map(|(w, (p, f))| (*w, *p, *f))
+                .filter_map(|w| ws.get(w).map(|(p, f)| (*w, *p, *f)))
                 .collect()
         }
 
@@ -2208,9 +2174,13 @@ mod tests {
         /// size WOULD suffer is modelled in `write_whole_frame`; the ratchet
         /// that shrank the author's windows by 58pt lived in the gap between
         /// the two.
-        fn move_windows(&self, moves: &[(Pid, WindowId, Point)]) -> Vec<AppMoveStat> {
+        fn move_windows(&self, moves: &[(Pid, WindowId, Point)]) {
             if self.frozen.get() {
-                return Vec::new();
+                return;
+            }
+            if self.queueing.get() {
+                self.queue.borrow_mut().extend_from_slice(moves);
+                return;
             }
             for (pid, w, at) in moves {
                 let size_is_the_windows_own = self.windows.borrow()[w].1;
@@ -2224,29 +2194,10 @@ mod tests {
                     },
                 );
             }
-            // Every write costs a millisecond, one app after another.
-            let mut out: Vec<AppMoveStat> = Vec::new();
-            for (n, (pid, w, _)) in moves.iter().enumerate() {
-                let stat = crate::trace::WriteStat {
-                    ax_ms: 1.0,
-                    done_ms: n as f64 + 1.0,
-                };
-                match out.iter_mut().find(|a| a.pid == *pid) {
-                    Some(a) => {
-                        a.windows += 1;
-                        a.writes.push((*w, stat));
-                    }
-                    None => out.push(AppMoveStat {
-                        pid: *pid,
-                        windows: 1,
-                        list_ms: 0.0,
-                        enhanced_ui: false,
-                        total_ms: 0.0,
-                        writes: vec![(*w, stat)],
-                    }),
-                }
-            }
-            out
+        }
+
+        fn in_flight(&self, window: WindowId) -> bool {
+            self.queue.borrow().iter().any(|(_, w, _)| *w == window)
         }
 
         fn hide_app(&self, pid: Pid) {
@@ -2287,14 +2238,6 @@ mod tests {
             ids
         }
 
-        fn window_frames(&self, pid: Pid, windows: &[WindowId]) -> Vec<(WindowId, Rect)> {
-            let ws = self.windows.borrow();
-            windows
-                .iter()
-                .filter_map(|w| ws.get(w).filter(|(p, _)| *p == pid).map(|(_, f)| (*w, *f)))
-                .collect()
-        }
-
         /// The un-hide, modelled as the measurements found it — because the
         /// defect lives entirely in what a no-op `set_app_hidden` did not say.
         ///
@@ -2309,8 +2252,7 @@ mod tests {
         ///
         /// Un-hiding an app that was never hidden orders nothing in and moves
         /// nothing: no re-home here either.
-        fn show_apps(&self, apps: &[Unhide]) -> Vec<HoldStat> {
-            let mut out = Vec::new();
+        fn show_apps(&self, apps: &[Unhide]) {
             for a in apps {
                 // The port asks each app before deciding to un-hide it.
                 self.asked.set(self.asked.get() + 1);
@@ -2348,26 +2290,7 @@ mod tests {
                         );
                     }
                 }
-                let escaped = a
-                    .hold
-                    .iter()
-                    .filter(|(w, at)| {
-                        let f = self.windows.borrow()[w].1;
-                        !same_position(
-                            &f,
-                            &Rect {
-                                x: at.x,
-                                y: at.y,
-                                ..f
-                            },
-                        )
-                    })
-                    .map(|(w, _)| *w)
-                    .collect();
-                let writes = if unhid || revealed { a.hold.len() as u32 } else { 0 };
-                out.push(HoldStat::new(a.pid, unhid, a.hold.len(), writes, 0, escaped));
             }
-            out
         }
 
         fn focused_window(&self) -> Option<WindowId> {
@@ -2434,64 +2357,6 @@ mod tests {
     /// — the app unhide that reveals a straddling app's OTHER windows. That
     /// unhide is the prime suspect for the flash on arriving at a workspace, so
     /// it has to be attributable to a moment.
-    /// AppKit was caught pulling a hidden app's parked windows to the left
-    /// edge. Reading them back as the hide returns tells a pull made by the
-    /// hide itself from one that comes later, so the trace says which.
-    #[test]
-    fn a_hide_that_pulls_parked_windows_back_is_traced_as_it_returns() {
-        let d = FakeDesktop::new(&[
-            (w(1), Pid(10), rect(100.0, 100.0)),
-            (w(2), Pid(20), rect(300.0, 200.0)),
-        ]);
-        let mut b = EmulatedWorkspaces::new(3);
-        b.note_scan(&d, &d.scan());
-        b.assign_window_to_workspace(w(2), ws(2)).unwrap();
-        d.yank_on_hide.set(true);
-        b.take_trace();
-
-        b.switch_workspace(&d, ws(2));
-        d.settle(&mut b);
-
-        let trace = b.take_trace();
-        let off: Vec<_> = trace.iter().filter(|t| t.kind == ParkTraceKind::OffAfterHide).collect();
-        assert_eq!(off.len(), 1);
-        assert_eq!(off[0].window, w(1));
-        assert_eq!(off[0].observed.map(|f| f.x), Some(MAIN.x));
-        let hidden = trace
-            .iter()
-            .find(|t| t.kind == ParkTraceKind::AppHidden && t.pid == Some(Pid(10)))
-            .expect("the hide is traced");
-        assert!(hidden.detail.as_deref().unwrap().ends_with("1 off their spot"));
-    }
-
-    /// Hides and un-hides reorder windows behind the stacking worker's back,
-    /// so a switch records the order it started from, the one its moves
-    /// left, and the one its un-hides left — a hidden app's windows are
-    /// missing until un-hidden.
-    #[test]
-    fn a_switch_traces_the_stack_before_it_and_after_its_unhides() {
-        let d = FakeDesktop::new(&[
-            (w(1), Pid(10), rect(100.0, 100.0)),
-            (w(2), Pid(20), rect(300.0, 200.0)),
-        ]);
-        let mut b = EmulatedWorkspaces::new(3);
-        b.note_scan(&d, &d.scan());
-        b.assign_window_to_workspace(w(2), ws(2)).unwrap();
-        b.switch_workspace(&d, ws(2));
-        d.settle(&mut b);
-        b.take_trace();
-
-        b.switch_workspace(&d, ws(1));
-
-        let stacks: Vec<_> = b
-            .take_trace()
-            .into_iter()
-            .filter(|t| t.kind == ParkTraceKind::Stack)
-            .filter_map(|t| t.detail)
-            .collect();
-        assert_eq!(stacks, ["before: 2", "after moves: 2", "after un-hides: 1 2"]);
-    }
-
     /// A parked window found off its park says whether its app was still
     /// hidden — nothing showed — or had come back, which is the flash.
     #[test]
@@ -2552,17 +2417,7 @@ mod tests {
             &parked.requested.expect("with the frame asked for"),
             &geo()
         ));
-        // With what each write cost, the app's share of the batch, and where
-        // the switch's own time went.
-        assert!(parked.write.is_some());
-        let app = trace
-            .iter()
-            .find(|t| t.kind == ParkTraceKind::AppMoved)
-            .expect("the app's share of the moves");
-        assert_eq!(
-            (app.pid, app.moves.as_ref().map(|m| m.windows)),
-            (Some(Pid(10)), Some(1))
-        );
+        // And where the switch's own time went.
         assert!(sw.cost.is_some());
 
         // The app owns a window here and Ordo never hid it, so it is left
@@ -2620,17 +2475,6 @@ mod tests {
             d.frame(w(2))
         );
         assert!(!d.is_hidden(Pid(10)));
-
-        // And the un-hide says what it cost, because a hold that quietly stops
-        // working looks exactly like one that works.
-        let trace = b.take_trace();
-        let shown = trace
-            .iter()
-            .find(|t| t.kind == ParkTraceKind::AppShown && t.pid == Some(Pid(10)))
-            .expect("the unhide is attributable");
-        let hold = shown.hold.as_ref().expect("with its hold on the record");
-        assert_eq!((hold.windows, hold.converged), (1, true));
-        assert!(hold.escaped.is_empty());
     }
 
     /// The trace exists because every other channel is laundered: the core is
@@ -2683,11 +2527,7 @@ mod tests {
         b.note_scan(&d, &d.scan());
         b.move_window_to_workspace(&d, w(1), ws(2)).unwrap(); // parks w1
 
-        let frames: HashMap<WindowId, (Pid, Rect)> = d
-            .windows()
-            .into_iter()
-            .map(|(id, p, f)| (id, (p, f)))
-            .collect();
+        let frames = d.scan();
         let believed = b.believed_frames(&d, &frames);
         // The parked window reads as its promise, not the corner artifact…
         assert_eq!(believed.get(&w(1)), Some(&rect(100.0, 100.0)));
@@ -2700,11 +2540,7 @@ mod tests {
         // exactly why `saved` outlives the parked flag.
         d.freeze();
         b.switch_workspace(&d, ws(2));
-        let frames: HashMap<WindowId, (Pid, Rect)> = d
-            .windows()
-            .into_iter()
-            .map(|(id, p, f)| (id, (p, f)))
-            .collect();
+        let frames = d.scan();
         let believed = b.believed_frames(&d, &frames);
         assert_eq!(believed.get(&w(1)), Some(&rect(100.0, 100.0)));
     }
@@ -2751,13 +2587,13 @@ mod tests {
         // clamp, or either retired corner: bookkept as parked, but its
         // (unknown) real frame is never fabricated from the artifact.
         for id in [w(1), w(3), w(4), w(5)] {
-            assert_eq!(b.park(id, None, &frames, &geo()), None, "{id:?}");
+            assert_eq!(b.park(id, None, &frames, &geo(), false), None, "{id:?}");
             assert!(b.parked.contains(&id));
             assert!(!b.saved.contains_key(&id), "{id:?} captured an artifact");
         }
 
         // A window at a real position parks normally.
-        let write = b.park(w(2), None, &frames, &geo()).unwrap();
+        let write = b.park(w(2), None, &frames, &geo(), false).unwrap();
         assert_eq!(b.saved[&w(2)], rect(50.0, 60.0));
         assert_eq!(write.2, park_frame(rect(50.0, 60.0), &geo()));
     }
@@ -2974,10 +2810,7 @@ mod tests {
     }
 
     fn frames_of(d: &FakeDesktop) -> HashMap<WindowId, (Pid, Rect)> {
-        d.windows()
-            .into_iter()
-            .map(|(id, p, f)| (id, (p, f)))
-            .collect()
+        d.scan()
     }
 
     #[test]
@@ -3400,6 +3233,85 @@ mod tests {
         b.enforce_placement(d, &frames_of(d));
     }
 
+    /// Writes land after the switch that asked for them. Going there and
+    /// straight back, the second switch parks a window whose restore hasn't
+    /// landed: it still reads as parked. Skipping its park on that reading
+    /// let the restore land afterwards and leave it on the wrong workspace,
+    /// and saving the sliver it read would have lost where it belongs.
+    #[test]
+    fn a_window_whose_restore_is_still_on_its_way_is_parked_when_the_user_turns_back() {
+        let d = FakeDesktop::new(&[
+            (w(1), Pid(10), rect(100.0, 100.0)),
+            (w(2), Pid(20), rect(300.0, 200.0)),
+        ]);
+        let mut b = EmulatedWorkspaces::new(3);
+        rescan(&d, &mut b);
+        b.assign_window_to_workspace(w(2), ws(2)).unwrap();
+        b.switch_workspace(&d, ws(2));
+        rescan(&d, &mut b);
+
+        d.queueing.set(true);
+        b.switch_workspace(&d, ws(1));
+        b.switch_workspace(&d, ws(2));
+        d.land_queued();
+
+        assert!(in_park_corner(&d.frame(w(1)), &geo()), "{:?}", d.frame(w(1)));
+        assert_eq!(d.frame(w(2)), rect(300.0, 200.0));
+        assert_eq!(b.saved[&w(1)], rect(100.0, 100.0), "the promise, not the sliver");
+    }
+
+    /// The mirror: leave and turn straight back before the parks land. The
+    /// restore is decided while the window still reads where it stands, and
+    /// must be written anyway, after the park, or the park lands last and
+    /// strands the window off screen on the workspace the user is on.
+    #[test]
+    fn a_window_whose_park_is_still_on_its_way_comes_back_when_the_user_turns_back() {
+        let d = FakeDesktop::new(&[
+            (w(1), Pid(10), rect(100.0, 100.0)),
+            (w(2), Pid(20), rect(300.0, 200.0)),
+        ]);
+        let mut b = EmulatedWorkspaces::new(3);
+        rescan(&d, &mut b);
+        b.assign_window_to_workspace(w(2), ws(2)).unwrap();
+        b.switch_workspace(&d, ws(2));
+        b.switch_workspace(&d, ws(1));
+        rescan(&d, &mut b);
+
+        d.queueing.set(true);
+        b.switch_workspace(&d, ws(2));
+        b.switch_workspace(&d, ws(1));
+        d.land_queued();
+        rescan(&d, &mut b);
+
+        assert_eq!(d.frame(w(1)), rect(100.0, 100.0));
+        assert!(in_park_corner(&d.frame(w(2)), &geo()), "{:?}", d.frame(w(2)));
+        assert!(!b.parked.contains(&w(1)));
+    }
+
+    /// A scan taken while our own park is on its way shows the window where
+    /// it was. That is not the app fighting the park: no second write, and
+    /// nothing charged against the window.
+    #[test]
+    fn a_scan_older_than_our_own_park_neither_re_parks_nor_charges_the_window() {
+        let d = FakeDesktop::new(&[(w(1), Pid(10), rect(100.0, 100.0))]);
+        let mut b = EmulatedWorkspaces::new(3);
+        rescan(&d, &mut b);
+        d.queueing.set(true);
+        b.move_window_to_workspace(&d, w(1), ws(2)).unwrap();
+        b.take_trace();
+
+        rescan(&d, &mut b);
+
+        assert_eq!(d.queue.borrow().len(), 1, "the one park, not a second");
+        assert!(b.enforce_attempts.is_empty());
+        assert!(!b.take_trace().iter().any(|t| matches!(
+            t.kind,
+            ParkTraceKind::Reassert | ParkTraceKind::Suppressed
+        )));
+        d.land_queued();
+        assert!(in_park_corner(&d.frame(w(1)), &geo()));
+    }
+
     #[test]
     fn unplugging_parks_the_hidden_monitor_and_viewing_it_swaps_the_screen() {
         let (d, mut b) = rig();
@@ -3521,12 +3433,6 @@ mod tests {
 
         assert_eq!(d.frame(w(1)), rect(100.0, 100.0));
         assert!(in_park_corner(&d.frame(w(2)), &geo()), "{:?}", d.frame(w(2)));
-        let shown = b
-            .take_trace()
-            .into_iter()
-            .find(|t| t.kind == ParkTraceKind::AppShown && t.pid == Some(Pid(10)))
-            .expect("the visibility pass is attributable");
-        assert!(shown.detail.unwrap().contains("revealed"));
     }
 
     /// Hiding is Ordo's alone. Cmd+H on an app with a window on screen is

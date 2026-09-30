@@ -263,9 +263,8 @@ fn push_desktop(s: &mut State, display: MonitorId, now_ns: u64, fx: &mut Vec<Eff
 /// The monitor a focus target needs viewed, if it sits on a hidden one —
 /// nobody can type into a parked window — with the projection the world will
 /// be under once that view lands, for restacking and warping against. The
-/// caller emits the focus grant BEFORE the view, as a switch hands focus
-/// before it parks: the window being revealed should already be key when its
-/// app is un-hidden, and the app being hidden must not still hold focus.
+/// caller emits the focus grant AFTER the view, as a switch does: the grant
+/// must follow the moves and un-hide that reveal the window.
 fn view_for(s: &State, target: WindowId) -> (Option<VirtualMonitorId>, Projection) {
     let vm = s.windows[&target].vmonitor;
     let proj = s.projection();
@@ -502,12 +501,13 @@ fn resolve(s: &State, action: HotkeyAction) -> Option<Command> {
 fn execute(s: &mut State, cmd: Command, now_ns: u64, fx: &mut Vec<Effect>) -> FocusIntent {
     match cmd {
         Command::Switch { target } => {
-            // Hand focus to the destination's MRU window BEFORE switching —
-            // otherwise the keyboard keeps typing into a window that just got
-            // parked off-screen, and the backend's app dimming (which spares
-            // the focused app) could never dim the workspace being left. No
-            // mouse warp: the core's frame belief for that window is its
-            // parked sliver position, so a warp would aim at the corner.
+            // Hand focus to the destination's MRU window, emitted AFTER the
+            // switch: fronting an app that is still hidden un-hides it with
+            // nothing holding its parked windows, so the grant has to follow
+            // that app's moves and un-hide, and the shell carries out each
+            // app's writes in the order they were emitted. No mouse warp: the
+            // core's frame belief for that window is its parked sliver
+            // position, so a warp would aim at the corner.
             //
             // The focus target IS the head of the restack order — one list
             // feeds both. The restack's physics require its designated top to
@@ -524,19 +524,6 @@ fn execute(s: &mut State, cmd: Command, now_ns: u64, fx: &mut Vec<Effect>) -> Fo
             // destination is empty here, and is treated as any empty one.
             let stack = mru_stack(s, target);
             let head = stack.first().copied();
-            if let Some(fw) = head {
-                let op = s.mint_op();
-                fx.push(Effect::FocusWindow { op, window: fw });
-                // Re-asserting focus the belief already holds produces no
-                // delta, so there is nothing to attribute to an expectation.
-                if s.focused != Some(fw) {
-                    s.pending.push(PendingOp {
-                        op,
-                        expect: Expectation::Focused(fw),
-                        issued_ns: now_ns,
-                    });
-                }
-            }
             // An empty workspace (here) is still a place to be: the desktop
             // takes focus, as on an empty monitor — the anchor's display, the one
             // a desktop declaration holds and new windows are corralled onto.
@@ -550,9 +537,6 @@ fn execute(s: &mut State, cmd: Command, now_ns: u64, fx: &mut Vec<Effect>) -> Fo
                     .and_then(|v| s.host_of(v.viewed))
                     .or_else(|| s.focused_monitor()),
             };
-            if let Some(display) = desktop {
-                push_desktop(s, display, now_ns, fx);
-            }
             let op = s.mint_op();
             fx.push(Effect::SwitchWorkspace { op, target });
             s.pending.push(PendingOp {
@@ -560,6 +544,25 @@ fn execute(s: &mut State, cmd: Command, now_ns: u64, fx: &mut Vec<Effect>) -> Fo
                 expect: Expectation::AllMonitorsOn(target),
                 issued_ns: now_ns,
             });
+            if let Some(fw) = head {
+                let focus = s.mint_op();
+                fx.push(Effect::FocusWindow {
+                    op: focus,
+                    window: fw,
+                });
+                // Re-asserting focus the belief already holds produces no
+                // delta, so there is nothing to attribute to an expectation.
+                if s.focused != Some(fw) {
+                    s.pending.push(PendingOp {
+                        op: focus,
+                        expect: Expectation::Focused(fw),
+                        issued_ns: now_ns,
+                    });
+                }
+            }
+            if let Some(display) = desktop {
+                push_desktop(s, display, now_ns, fx);
+            }
             // Even a lone window goes to the stacking worker: it owns the top,
             // and takes focus back if an un-hide in this switch stole it.
             if !stack.is_empty() {
@@ -622,10 +625,13 @@ fn execute(s: &mut State, cmd: Command, now_ns: u64, fx: &mut Vec<Effect>) -> Fo
         }
 
         Command::Focus { target } => {
-            // A target on a hidden monitor gets its monitor viewed right after
+            // A target on a hidden monitor gets its monitor viewed just before
             // the grant, and the newly visible set restacked with it on top.
             let (view, proj) = view_for(s, target);
             let center = s.projected_frame_in(&s.windows[&target], &proj).center();
+            if let Some(vm) = view {
+                push_view(s, vm, now_ns, fx);
+            }
             let op = s.mint_op();
             fx.push(Effect::FocusWindow { op, window: target });
             // Warp optimistically off our own belief of the frame rather than
@@ -639,8 +645,7 @@ fn execute(s: &mut State, cmd: Command, now_ns: u64, fx: &mut Vec<Effect>) -> Fo
                 expect: Expectation::Focused(target),
                 issued_ns: now_ns,
             });
-            if let Some(vm) = view {
-                push_view(s, vm, now_ns, fx);
+            if view.is_some() {
                 if let Some(ws) = s.current_workspace() {
                     let mut order = vec![target];
                     order.extend(visible_stack(s, ws, &proj).into_iter().filter(|w| *w != target));
@@ -664,12 +669,12 @@ fn execute(s: &mut State, cmd: Command, now_ns: u64, fx: &mut Vec<Effect>) -> Fo
             s.focus_history.demote(root);
             let (view, proj) = view_for(s, to);
             let center = s.projected_frame_in(&s.windows[&to], &proj).center();
-            let op = s.mint_op();
-            fx.push(Effect::FocusWindow { op, window: to });
-            fx.push(Effect::WarpMouse { to: center });
             if let Some(vm) = view {
                 push_view(s, vm, now_ns, fx);
             }
+            let op = s.mint_op();
+            fx.push(Effect::FocusWindow { op, window: to });
+            fx.push(Effect::WarpMouse { to: center });
             // Bury it visually too, AFTER the focus: restacking raises
             // everything above the demoted window, and raises land below the
             // key window — so the new focus must already be key. The history
@@ -749,8 +754,9 @@ fn execute(s: &mut State, cmd: Command, now_ns: u64, fx: &mut Vec<Effect>) -> Fo
 
         Command::View { target } => {
             // The monitor twin of a workspace switch: focus goes to the
-            // target monitor's MRU window on the current workspace before the
-            // view moves, and the newly visible set is restacked under it.
+            // target monitor's MRU window on the current workspace once the
+            // view has moved (emitted after it, for the switch's reason), and
+            // the newly visible set is restacked under it.
             // A monitor with nothing on it gets its display's desktop instead:
             // an empty monitor is still a place to be.
             let ws = s.current_workspace().expect("resolved against a workspace");
@@ -760,12 +766,16 @@ fn execute(s: &mut State, cmd: Command, now_ns: u64, fx: &mut Vec<Effect>) -> Fo
                     .get(w)
                     .is_some_and(|r| r.workspace == ws && r.vmonitor == target)
             });
+            let op = push_view(s, target, now_ns, fx);
             if let Some(fw) = head {
-                let op = s.mint_op();
-                fx.push(Effect::FocusWindow { op, window: fw });
+                let focus = s.mint_op();
+                fx.push(Effect::FocusWindow {
+                    op: focus,
+                    window: fw,
+                });
                 if s.focused != Some(fw) {
                     s.pending.push(PendingOp {
-                        op,
+                        op: focus,
                         expect: Expectation::Focused(fw),
                         issued_ns: now_ns,
                     });
@@ -786,7 +796,6 @@ fn execute(s: &mut State, cmd: Command, now_ns: u64, fx: &mut Vec<Effect>) -> Fo
                     });
                 }
             }
-            let op = push_view(s, target, now_ns, fx);
             let mut order: Vec<WindowId> = head.into_iter().collect();
             order.extend(visible_stack(s, ws, &proj).into_iter().filter(|w| Some(*w) != head));
             if order.len() >= 2 {

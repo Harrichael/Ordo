@@ -20,6 +20,10 @@ pub struct MenuBarView {
     pub engaged: bool,
     /// None under a backend with no virtual layer (native Spaces).
     pub monitors: Option<MonitorsView>,
+    /// Apps that refuse Ordo's Accessibility requests, so their windows can
+    /// be neither seen nor parked. Not the core's belief: the scan's, which
+    /// the core never hears of.
+    pub unreachable: Vec<Pid>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -86,6 +90,7 @@ impl MenuBarView {
             current: s.current_workspace(),
             engaged: s.mode == Mode::Active,
             monitors: MonitorsView::of(s),
+            unreachable: Vec::new(),
         }
     }
 }

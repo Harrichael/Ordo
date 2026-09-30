@@ -496,6 +496,7 @@ pub fn reassert(
     let violated_end = layout.violators().count_ones();
     Some(RestackStats {
         total_ms: ms(ws.now() - t0),
+        landing_wait_ms: 0,
         presence_wait_ms,
         handoff_wait_ms,
         desired: desired.len() as u32,

@@ -5,9 +5,12 @@
 //! the Accessibility API ([`ax`]), and workspace assignment from the backend
 //! ([`native_backend`] over [`skylight`], or [`emulated_backend`] adapting the
 //! `ordo-emulated` crate). The backend is shared with the
-//! effector (later milestones) via `Rc<RefCell<…>>`; that is sound because the
-//! entire platform layer lives on the single engine thread — none of these
-//! handles are `Send`, and none ever leave it.
+//! effector via `Rc<RefCell<…>>`; that is sound because the backend, the
+//! world source and the effector live on the single engine thread — none of
+//! these handles are `Send`, and none ever leave it. What does cross threads
+//! is plain data behind locks: the apps' queues ([`crate::app_queue`], each
+//! app's `ax::AxApp` living on that app's thread), the restack worker's slot,
+//! and the menu bar's list of unreachable apps.
 //!
 //! NOTE: the FFI here compiles and follows each API's documented shape, but the
 //! private SkyLight schema parsing in particular wants validation on-device
@@ -48,10 +51,15 @@ use ordo_core::{
 
 use ordo_emulated::{ParkTrace, ParkTraceKind};
 
+use crate::app_queue::AppQueues;
 use crate::backend::WorkspaceBackend;
 use crate::ports::{SnapshotStats, WorldSource};
 
 pub type SharedBackend = Rc<RefCell<dyn WorkspaceBackend>>;
+
+/// The apps the last scan found refusing Ordo ([`ax::Walk::refused`]), for
+/// the menu bar, which draws on another thread.
+pub type Unreachable = Arc<std::sync::Mutex<Vec<Pid>>>;
 
 pub fn native_backend() -> SharedBackend {
     Rc::new(RefCell::new(native_backend::NativeBackend::new()))
@@ -59,11 +67,20 @@ pub fn native_backend() -> SharedBackend {
 
 /// `state_path`: where the ledger's promises persist across restarts;
 /// `None` (e.g. `--fresh`) starts empty and stays ephemeral.
-pub fn emulated_backend(workspaces: u8, state_path: Option<std::path::PathBuf>) -> SharedBackend {
+pub fn emulated_backend(
+    workspaces: u8,
+    state_path: Option<std::path::PathBuf>,
+    queues: AppQueues,
+) -> SharedBackend {
     Rc::new(RefCell::new(match state_path {
-        Some(p) => emulated_backend::EmulatedBackend::with_persistence(workspaces, p),
-        None => emulated_backend::EmulatedBackend::new(workspaces),
+        Some(p) => emulated_backend::EmulatedBackend::with_persistence(workspaces, p, queues),
+        None => emulated_backend::EmulatedBackend::new(workspaces, queues),
     }))
+}
+
+/// The apps' queues, each app's thread working through Accessibility.
+pub fn ax_queues() -> AppQueues {
+    AppQueues::new(|pid| Box::new(ax::AxApp::open(pid)))
 }
 
 /// Builds a full snapshot each call: displays + AX windows + backend workspace
@@ -90,6 +107,7 @@ pub struct MacWorldSource {
     /// are fixed at creation, and the asking costs a few milliseconds a
     /// snapshot that re-asking every window would pay forever.
     facts: HashMap<WindowId, zorder::ServerFacts>,
+    unreachable: Unreachable,
 }
 
 impl MacWorldSource {
@@ -97,11 +115,13 @@ impl MacWorldSource {
         backend: SharedBackend,
         intercepting: Arc<AtomicBool>,
         settle: display_watch::DisplaySettle,
+        unreachable: Unreachable,
     ) -> Self {
         MacWorldSource {
             backend,
             intercepting,
             settle,
+            unreachable,
             last_raw: HashMap::new(),
             trace: Vec::new(),
             stats: None,
@@ -238,6 +258,16 @@ impl WorldSource for MacWorldSource {
             assignments: topo.window_ws.iter().map(|(w, ws)| (*w, *ws)).collect(),
             virtual_monitors: topo.virtual_monitors.clone(),
         };
+
+        let mut unreachable = self.unreachable.lock().unwrap();
+        for pid in scan.walk.refused.iter().filter(|p| !unreachable.contains(p)) {
+            eprintln!(
+                "ordo: app {} refuses Accessibility (API disabled); its windows can't be seen or parked until it is reopened",
+                pid.0
+            );
+        }
+        *unreachable = scan.walk.refused.clone();
+        drop(unreachable);
 
         self.stats = Some(SnapshotStats {
             total: started.elapsed(),

@@ -5,9 +5,11 @@
 //! and handles go stale. Two habits from the research are baked in here:
 //!   - a short messaging timeout on every app element, so one hung app stalls
 //!     us for 0.2s, not indefinitely;
-//!   - no persistent handle cache — enumeration is done fresh each time and
-//!     writes re-find their target by window id, sidestepping the entire class
-//!     of stale-`AXUIElement` bugs at the cost of an O(windows) walk per write.
+//!   - no handle cache shared across threads or kept past a failure:
+//!     enumeration is done fresh, and one-off writes re-find their target by
+//!     window id. The one cache is [`AxApp`]'s, private to an app's queue
+//!     thread, re-read when a window is missing from it or a write through
+//!     it fails, which keeps the stale-`AXUIElement` class of bugs out.
 //!
 //! Window identity is the CGWindowID, obtained from the private
 //! `_AXUIElementGetWindow`; elements without one (sheets, transient overlays)
@@ -22,7 +24,7 @@ use objc2_app_kit::{NSApplicationActivationPolicy, NSWorkspace};
 use objc2_application_services::{AXError, AXUIElement, AXValue, AXValueType};
 use objc2_core_foundation::{CFBoolean, CFString, CFType, CGPoint, CGSize};
 use ordo_core::{Pid, Point, Rect, WindowId};
-use ordo_emulated::{AppMoveStat, WriteStat};
+use ordo_emulated::HoldStat;
 use ordo_skylight_sys as sys;
 
 /// A quarter second: long enough for a healthy app to answer, short enough that
@@ -56,6 +58,11 @@ pub struct Walk {
     pub elapsed: Duration,
     pub apps: usize,
     pub slowest: Option<(Pid, Duration)>,
+    /// Apps that answered "API disabled": they refuse this process outright,
+    /// though macOS calls it trusted, so none of their windows are seen and
+    /// none can be moved. Measured once for Outlook, running for weeks,
+    /// against an Ordo started from a different terminal than the last.
+    pub refused: Vec<Pid>,
 }
 
 /// Enumerate every standard window of every regular (Dock-visible) app, plus
@@ -91,7 +98,7 @@ fn walk() -> (Vec<AxWindow>, Walk) {
         .map(|a| (a.processIdentifier(), a.bundleIdentifier().map(|b| b.to_string())))
         .filter(|(pid, _)| *pid > 0)
         .collect();
-    let per_app: Vec<(Vec<AxWindow>, Duration)> = std::thread::scope(|scope| {
+    let per_app: Vec<(Vec<AxWindow>, Duration, bool)> = std::thread::scope(|scope| {
         let handles: Vec<_> = apps
             .iter()
             .map(|(pid, bundle_id)| scope.spawn(move || app_windows(*pid, bundle_id)))
@@ -104,18 +111,27 @@ fn walk() -> (Vec<AxWindow>, Walk) {
     let slowest = apps
         .iter()
         .zip(&per_app)
-        .max_by_key(|(_, (_, took))| *took)
-        .map(|((pid, _), (_, took))| (Pid(*pid), *took));
-    let windows = per_app.into_iter().flat_map(|(w, _)| w).collect();
+        .max_by_key(|(_, (_, took, _))| *took)
+        .map(|((pid, _), (_, took, _))| (Pid(*pid), *took));
+    let refused = apps
+        .iter()
+        .zip(&per_app)
+        .filter(|(_, (_, _, refused))| *refused)
+        .map(|((pid, _), _)| Pid(*pid))
+        .collect();
+    let windows = per_app.into_iter().flat_map(|(w, _, _)| w).collect();
     let walk = Walk {
         elapsed: started.elapsed(),
         apps: apps.len(),
         slowest,
+        refused,
     };
     (windows, walk)
 }
 
-fn app_windows(pid: i32, bundle_id: &Option<String>) -> (Vec<AxWindow>, Duration) {
+/// The app's windows, how long asking took, and whether it refused to answer
+/// at all (see [`Walk::refused`]).
+fn app_windows(pid: i32, bundle_id: &Option<String>) -> (Vec<AxWindow>, Duration, bool) {
     let started = Instant::now();
     let mut windows = Vec::new();
     let el = unsafe { AXUIElement::new_application(pid) };
@@ -125,7 +141,9 @@ fn app_windows(pid: i32, bundle_id: &Option<String>) -> (Vec<AxWindow>, Duration
     // happen before it's released — releasing first would leave dangling
     // AXUIElement pointers (a use-after-free that only surfaces once the
     // app actually has windows to enumerate).
-    if let Some(raw) = unsafe { copy_attr(&el, "AXWindows") } {
+    let listed = unsafe { copy_attr_or_error(&el, "AXWindows") };
+    let refused = matches!(listed, Err(AXError::APIDisabled));
+    if let Ok(raw) = listed {
         unsafe {
             for i in 0..super::cf::array_len(raw) {
                 let win = super::cf::array_get(raw, i) as *const AXUIElement;
@@ -139,7 +157,7 @@ fn app_windows(pid: i32, bundle_id: &Option<String>) -> (Vec<AxWindow>, Duration
             sys::CFRelease(raw);
         }
     }
-    (windows, started.elapsed())
+    (windows, started.elapsed(), refused)
 }
 
 fn read_window(win: *const AXUIElement, app: Pid, bundle_id: Option<String>) -> Option<AxWindow> {
@@ -256,13 +274,17 @@ fn window_id(el: *const AXUIElement) -> Option<WindowId> {
 /// Copy an attribute, returning the owned CF value as a raw pointer (caller
 /// releases). `None` on any AX error or a null result.
 unsafe fn copy_attr(el: &AXUIElement, name: &str) -> Option<*const c_void> {
+    copy_attr_or_error(el, name).ok()
+}
+
+unsafe fn copy_attr_or_error(el: &AXUIElement, name: &str) -> Result<*const c_void, AXError> {
     let attr = CFString::from_str(name);
     let mut out: *const CFType = std::ptr::null();
     let err = el.copy_attribute_value(&attr, NonNull::from(&mut out));
-    if err == AXError::Success && !out.is_null() {
-        Some(out as *const c_void)
-    } else {
-        None
+    match err {
+        AXError::Success if !out.is_null() => Ok(out as *const c_void),
+        AXError::Success => Err(AXError::NoValue),
+        e => Err(e),
     }
 }
 
@@ -330,23 +352,19 @@ fn make_key_window(psn: &sys::ProcessSerialNumber, wid: u32) {
 /// window without ever moving keyboard focus — cross-app Alt+Tab looked like
 /// "Slack pops up but focus stays put".
 pub fn focus(target: WindowId) -> bool {
-    with_window(target, |_app, win, pid| {
-        unsafe {
-            let mut psn = sys::ProcessSerialNumber::default();
-            if sys::GetProcessForPID(pid, &mut psn) == 0 {
-                let _ = sys::SLPSSetFrontProcessWithOptions(&psn, target.0, sys::kCPSUserGenerated);
-                make_key_window(&psn, target.0);
-            }
-        }
-        let win = unsafe { &*win };
-        unsafe {
-            set_bool(win, "AXMain", true);
-            set_bool(win, "AXFocused", true);
-            let raise = CFString::from_str("AXRaise");
-            let _ = win.perform_action(&raise);
-        }
-    })
-    .is_some()
+    with_window(target, |_app, win, pid| unsafe { focus_element(pid, target, &*win) }).is_some()
+}
+
+unsafe fn focus_element(pid: i32, target: WindowId, win: &AXUIElement) {
+    let mut psn = sys::ProcessSerialNumber::default();
+    if sys::GetProcessForPID(pid, &mut psn) == 0 {
+        let _ = sys::SLPSSetFrontProcessWithOptions(&psn, target.0, sys::kCPSUserGenerated);
+        make_key_window(&psn, target.0);
+    }
+    set_bool(win, "AXMain", true);
+    set_bool(win, "AXFocused", true);
+    let raise = CFString::from_str("AXRaise");
+    let _ = win.perform_action(&raise);
 }
 
 /// Key the desktop of the display at `display`, the way a click on empty
@@ -412,43 +430,6 @@ pub fn app_hidden(pid: Pid) -> Option<bool> {
     Some(hidden)
 }
 
-/// The frames of these windows of one app, read from the app itself — the
-/// only source for a hidden app, whose windows the window server's list
-/// drops. One AXWindows walk; windows not found are left out.
-pub fn window_frames(pid: Pid, windows: &[WindowId]) -> Vec<(WindowId, Rect)> {
-    let el = unsafe { AXUIElement::new_application(pid.0) };
-    unsafe { el.set_messaging_timeout(MESSAGING_TIMEOUT_SECS) };
-    let Some(raw) = (unsafe { copy_attr(&el, "AXWindows") }) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    unsafe {
-        for i in 0..super::cf::array_len(raw) {
-            let win = super::cf::array_get(raw, i) as *const AXUIElement;
-            let Some(id) = window_id(win).filter(|id| windows.contains(id)) else {
-                continue;
-            };
-            let (Some(pos), Some(size)) = (
-                copy_point(&*win, "AXPosition", AXValueType::CGPoint),
-                copy_size(&*win, "AXSize"),
-            ) else {
-                continue;
-            };
-            out.push((
-                id,
-                Rect {
-                    x: pos.x,
-                    y: pos.y,
-                    w: size.width,
-                    h: size.height,
-                },
-            ));
-        }
-        sys::CFRelease(raw);
-    }
-    out
-}
-
 /// How long ONE un-hide may spend holding its parked windows at the corner
 /// before it gives up and lets the next enforcement pass clean up.
 ///
@@ -459,7 +440,9 @@ pub fn window_frames(pid: Pid, windows: &[WindowId]) -> Vec<(WindowId, Rect)> {
 /// never converges, since the loop exits the moment the window server agrees.
 /// The cost of exceeding it is bounded too: the un-hide simply reverts to
 /// today's behaviour (the window sits visible until enforcement re-parks it),
-/// which is why a generous bound is cheaper than a clever one.
+/// which is why a generous bound is cheaper than a clever one. That relies on
+/// the queues reporting an escaped window as not in flight (`app_queue`'s
+/// `refused` on escape), or enforcement would wait on it.
 const HOLD_BUDGET: Duration = Duration::from_millis(250);
 
 /// What one un-hide's hold cost. `escaped` is the fact worth watching: a
@@ -482,29 +465,13 @@ pub struct HoldOutcome {
     pub stacks: Vec<(&'static str, Vec<WindowId>)>,
 }
 
-/// Un-hide these apps, holding each one's listed windows at the given origins
-/// through the reveal.
+/// Un-hide one app and keep writing `hold`'s origins until the window server
+/// reports the windows there.
 ///
 /// An un-hide is not the mirror of a hide. As the app's windows order back in,
 /// AppKit runs `constrainFrameRect:toScreen:` over each one and drags every
 /// window parked off the left edge fully back onto a display — measured
 /// deterministic (96/96), and the flash on every workspace switch.
-///
-/// Threaded per app for the same reason [`move_windows`] is: a switch un-hides
-/// several apps at once and must cost the slowest app's reveal, not the sum of
-/// them.
-pub fn show_apps(apps: &[(Pid, &[(WindowId, Point)])]) -> Vec<HoldOutcome> {
-    std::thread::scope(|scope| {
-        let running: Vec<_> = apps
-            .iter()
-            .map(|(pid, hold)| scope.spawn(move || show_app_holding(*pid, hold)))
-            .collect();
-        running.into_iter().filter_map(|h| h.join().ok()).collect()
-    })
-}
-
-/// Un-hide one app and keep writing `hold`'s origins until the window server
-/// reports the windows there.
 ///
 /// The chase must VERIFY, never assume. Issuing the re-park once, immediately
 /// after the un-hide, was measured to end correctly parked in only 1-4 trials
@@ -513,7 +480,11 @@ pub fn show_apps(apps: &[(Pid, &[(WindowId, Point)])]) -> Vec<HoldOutcome> {
 /// returned success, so nothing but the window server's own answer can settle
 /// whether the position stuck — which is exactly what a future "simplify this
 /// loop into one write" would throw away.
-fn show_app_holding(pid: Pid, hold: &[(WindowId, Point)]) -> HoldOutcome {
+pub fn show_app_holding(
+    pid: Pid,
+    hold: &[(WindowId, Point)],
+    cancel: &dyn Fn() -> bool,
+) -> HoldOutcome {
     let started = Instant::now();
     let mut stacks = Vec::new();
     let tracing = crate::debug::enabled();
@@ -526,9 +497,9 @@ fn show_app_holding(pid: Pid, hold: &[(WindowId, Point)]) -> HoldOutcome {
     unsafe { el.set_messaging_timeout(MESSAGING_TIMEOUT_SECS) };
     // See `Desktop::show_apps`: an un-hide sent to a showing app brings all
     // its windows forward, so a showing app is never sent one. But showing
-    // is not proof its parked windows stayed parked: the switch's own focus
-    // request un-hides the destination's app before this runs, with nothing
-    // holding them. So they are checked, and held if any left its spot. An
+    // is not proof its parked windows stayed parked: any focus un-hides an
+    // app, the restack worker's included, with nothing holding them. So
+    // they are checked, and held if any left its spot. An
     // app that doesn't answer is un-hidden anyway — skipping a hidden one
     // would leave its windows invisible.
     let showing = app_hidden(pid) == Some(false);
@@ -599,7 +570,7 @@ fn show_app_holding(pid: Pid, hold: &[(WindowId, Point)]) -> HoldOutcome {
         // the full list `existing_windows` uses, which keeps them), so the
         // first read cannot report success before the order-in has happened.
         chase.retain(|(w, at, _)| !holds_at(*w, *at));
-        if chase.is_empty() || Instant::now() >= deadline {
+        if chase.is_empty() || Instant::now() >= deadline || cancel() {
             break;
         }
         // No sleep between rounds — each write is a synchronous round trip to
@@ -796,121 +767,223 @@ pub fn set_frame(target: WindowId, frame: Rect) -> bool {
     .is_some()
 }
 
-/// Move a batch of windows to new origins, grouped by owning app, one thread
-/// per app. Sizes are never touched: unlike [`set_frame`]'s cross-display move,
-/// this is the emulated backend's park/restore path, where a window's size is
-/// the window's own business and a size write is only an opportunity for the
-/// WindowServer to cap it (see `ordo_emulated::Desktop::move_windows`).
-///
-/// The batching exists because a switch is only as instant as its slowest
-/// serialization: one `set_frame` per window re-walks every app's window list
-/// per write, so a multi-window switch rippled visibly across the screen (and
-/// across monitors, one after the other). Grouping gives one walk per app; the
-/// per-app threads make the whole batch land in the time of the slowest *app*,
-/// not the sum of all writes. AX is just Mach IPC and safe off the main thread —
-/// each thread builds its own app element rather than sharing one.
-pub fn move_windows(moves: &[(Pid, WindowId, Point)]) -> Vec<AppMoveStat> {
-    let mut by_app: HashMap<i32, Vec<(WindowId, Point)>> = HashMap::new();
-    for (pid, w, p) in moves {
-        by_app.entry(pid.0).or_default().push((*w, *p));
-    }
-    let batch = Instant::now();
-    std::thread::scope(|scope| {
-        let threads: Vec<_> = by_app
-            .into_iter()
-            .map(|(pid, wins)| scope.spawn(move || move_app_windows(pid, &wins, batch)))
-            .collect();
-        threads.into_iter().filter_map(|t| t.join().ok()).collect()
-    })
+/// One app's handles, kept by that app's queue thread between jobs: the app
+/// element, and its window elements, read once and re-read when a window is
+/// missing from them or a write through one fails. A queue works through
+/// many jobs for one app, and each fresh window-list read was a round trip
+/// to an app that, mid-switch, is busy with the jobs before it.
+pub struct AxApp {
+    pid: i32,
+    el: objc2_core_foundation::CFRetained<AXUIElement>,
+    /// The app's AXWindows array; the elements below are borrowed from it,
+    /// so it lives exactly as long as they are used.
+    windows: Option<*const c_void>,
+    by_id: HashMap<WindowId, *const AXUIElement>,
 }
 
-fn move_app_windows(pid: i32, wins: &[(WindowId, Point)], batch: Instant) -> AppMoveStat {
-    let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
-    let started = Instant::now();
-    let mut stat = AppMoveStat {
-        pid: Pid(pid),
-        windows: wins.len(),
-        list_ms: 0.0,
-        enhanced_ui: false,
-        total_ms: 0.0,
-        writes: Vec::new(),
-    };
-    let el = unsafe { AXUIElement::new_application(pid) };
-    unsafe { el.set_messaging_timeout(MESSAGING_TIMEOUT_SECS) };
-    let raw = unsafe { copy_attr(&el, "AXWindows") };
-    stat.list_ms = ms(started.elapsed());
-    let Some(raw) = raw else {
-        stat.total_ms = stat.list_ms;
-        return stat;
-    };
-    // One EUI bracket around the whole app's batch, not one per window.
-    stat.enhanced_ui = unsafe { disable_enhanced_ui(&el) };
-    unsafe {
-        for i in 0..super::cf::array_len(raw) {
-            let win = super::cf::array_get(raw, i) as *const AXUIElement;
-            let Some(id) = window_id(win) else { continue };
-            let Some((_, at)) = wins.iter().find(|(w, _)| *w == id) else {
-                continue;
-            };
+impl AxApp {
+    pub fn open(pid: Pid) -> Self {
+        let el = unsafe { AXUIElement::new_application(pid.0) };
+        unsafe { el.set_messaging_timeout(MESSAGING_TIMEOUT_SECS) };
+        AxApp {
+            pid: pid.0,
+            el,
+            windows: None,
+            by_id: HashMap::new(),
+        }
+    }
+
+    fn reread(&mut self) {
+        self.by_id.clear();
+        if let Some(raw) = self.windows.take() {
+            unsafe { sys::CFRelease(raw) };
+        }
+        let Some(raw) = (unsafe { copy_attr(&self.el, "AXWindows") }) else {
+            return;
+        };
+        unsafe {
+            for i in 0..super::cf::array_len(raw) {
+                let win = super::cf::array_get(raw, i) as *const AXUIElement;
+                if let Some(id) = window_id(win) {
+                    self.by_id.insert(id, win);
+                }
+            }
+        }
+        self.windows = Some(raw);
+    }
+
+    /// The window's element, and whether the elements were just re-read to
+    /// find it. An element is only trusted while it still names its window:
+    /// ids are recycled, and a cached element can outlive its window.
+    fn element(&mut self, w: WindowId) -> (Option<*const AXUIElement>, bool) {
+        if let Some(win) = self.by_id.get(&w).copied() {
+            if window_id(win) == Some(w) {
+                return (Some(win), false);
+            }
+        }
+        self.reread();
+        (self.by_id.get(&w).copied(), true)
+    }
+
+    /// Run `write` through the window's element, re-reading the elements and
+    /// trying once more if it fails: the element may be stale while the
+    /// window lives on. Never a second re-read: against a hung app each one
+    /// costs a messaging timeout.
+    fn through(&mut self, w: WindowId, write: impl Fn(&AXUIElement) -> bool) -> bool {
+        let (win, fresh) = self.element(w);
+        if let Some(win) = win {
+            if write(unsafe { &*win }) {
+                return true;
+            }
+        }
+        if fresh {
+            return false;
+        }
+        self.reread();
+        self.by_id
+            .get(&w)
+            .is_some_and(|win| write(unsafe { &**win }))
+    }
+}
+
+impl Drop for AxApp {
+    fn drop(&mut self) {
+        if let Some(raw) = self.windows.take() {
+            unsafe { sys::CFRelease(raw) };
+        }
+    }
+}
+
+impl crate::app_queue::AppSession for AxApp {
+    fn move_windows(
+        &mut self,
+        moves: &[(WindowId, Point)],
+        cancel: &dyn Fn() -> bool,
+    ) -> Vec<(WindowId, bool, f64)> {
+        // One enhanced-UI bracket around the whole batch, not one per window:
+        // without it Chromium/Electron windows move slowly and land wrong.
+        let restore_eui = unsafe { disable_enhanced_ui(&self.el) };
+        let mut out = Vec::with_capacity(moves.len());
+        for (w, to) in moves {
+            if cancel() {
+                break;
+            }
             let t = Instant::now();
-            let _ = set_point(&*win, "AXPosition", at.x, at.y);
-            stat.writes.push((
-                id,
-                WriteStat {
-                    ax_ms: ms(t.elapsed()),
-                    done_ms: ms(batch.elapsed()),
-                },
-            ));
+            let took = self.through(*w, |win| unsafe {
+                set_point(win, "AXPosition", to.x, to.y) == AXError::Success
+            });
+            out.push((*w, took, t.elapsed().as_secs_f64() * 1000.0));
         }
-        if stat.enhanced_ui {
-            set_bool(&el, "AXEnhancedUserInterface", true);
+        if restore_eui {
+            unsafe { set_bool(&self.el, "AXEnhancedUserInterface", true) };
         }
-        sys::CFRelease(raw);
+        out
     }
-    stat.total_ms = ms(started.elapsed());
-    stat
+
+    /// The position -> size -> position idiom of [`set_frame`], for the same
+    /// reason: apps clamp a size to the current screen before a cross-display
+    /// move lands.
+    fn set_frame(&mut self, window: WindowId, to: Rect) -> bool {
+        let restore_eui = unsafe { disable_enhanced_ui(&self.el) };
+        let found = self.through(window, |win| unsafe {
+            let first = set_point(win, "AXPosition", to.x, to.y) == AXError::Success;
+            set_size_attr(win, to.w, to.h);
+            let _ = set_point(win, "AXPosition", to.x, to.y);
+            first
+        });
+        if restore_eui {
+            unsafe { set_bool(&self.el, "AXEnhancedUserInterface", true) };
+        }
+        found
+    }
+
+    fn show(&mut self, hold: &[(WindowId, Point)], cancel: &dyn Fn() -> bool) -> HoldStat {
+        let o = show_app_holding(Pid(self.pid), hold, cancel);
+        if !o.escaped.is_empty() {
+            eprintln!(
+                "ordo: un-hiding pid {} left {} window(s) off the corner after {}ms",
+                o.pid.0,
+                o.escaped.len(),
+                o.elapsed_ms
+            );
+        }
+        HoldStat::new(o.pid, o.unhid, hold.len(), o.writes, o.elapsed_ms, o.escaped).with_steps(
+            o.enhanced_ui,
+            o.stacks
+                .into_iter()
+                .map(|(step, ids)| (step.to_string(), ids))
+                .collect(),
+        )
+    }
+
+    fn hide(&mut self) {
+        unsafe { set_bool(&self.el, "AXHidden", true) };
+    }
+
+    fn focus(&mut self, window: WindowId) -> bool {
+        let Some(win) = self.element(window).0 else {
+            return false;
+        };
+        unsafe { focus_element(self.pid, window, &*win) };
+        true
+    }
 }
 
-/// Walk regular apps, and when the window whose id is `target` is found, run
-/// `f(app_element, window_ptr, pid)` while both handles are live. `None` if the
-/// window isn't found (gone, or an app with no AX tree).
+/// Find the window whose id is `target` and run `f(app_element, window_ptr,
+/// pid)` while both handles are live. `None` if the window isn't found (gone,
+/// or an app with no AX tree).
+///
+/// The window server names the owner, so normally one app is asked. Asking
+/// every app in turn is kept only as the fallback: each ask is a round trip
+/// to an app's main thread, and mid-switch those are busy.
 fn with_window<T>(
     target: WindowId,
     f: impl FnOnce(&AXUIElement, *const AXUIElement, i32) -> T,
 ) -> Option<T> {
+    let owner = super::zorder::owner_of(target);
+    let mut f = Some(f);
+    if let Some(pid) = owner {
+        if let Some(out) = with_window_of(pid, target, &mut f) {
+            return Some(out);
+        }
+    }
     let apps = NSWorkspace::sharedWorkspace().runningApplications();
     for app in apps.iter() {
         if app.activationPolicy() != NSApplicationActivationPolicy::Regular {
             continue;
         }
         let pid = app.processIdentifier();
-        if pid <= 0 {
+        if pid <= 0 || Some(pid) == owner {
             continue;
         }
-        let el = unsafe { AXUIElement::new_application(pid) };
-        unsafe { el.set_messaging_timeout(MESSAGING_TIMEOUT_SECS) };
-
-        let Some(raw) = (unsafe { copy_attr(&el, "AXWindows") }) else {
-            continue;
-        };
-        let mut found = None;
-        unsafe {
-            for i in 0..super::cf::array_len(raw) {
-                let win = super::cf::array_get(raw, i) as *const AXUIElement;
-                if window_id(win) == Some(target) {
-                    found = Some((win, pid));
-                    break;
-                }
-            }
-        }
-        if let Some((win, pid)) = found {
-            let out = f(&el, win, pid);
-            unsafe { sys::CFRelease(raw) };
+        if let Some(out) = with_window_of(pid, target, &mut f) {
             return Some(out);
         }
-        unsafe { sys::CFRelease(raw) };
     }
     None
+}
+
+/// `f` is taken only when the window is found, so a miss leaves it for the
+/// next app.
+fn with_window_of<T, F>(pid: i32, target: WindowId, f: &mut Option<F>) -> Option<T>
+where
+    F: FnOnce(&AXUIElement, *const AXUIElement, i32) -> T,
+{
+    let el = unsafe { AXUIElement::new_application(pid) };
+    unsafe { el.set_messaging_timeout(MESSAGING_TIMEOUT_SECS) };
+    let raw = unsafe { copy_attr(&el, "AXWindows") }?;
+    let mut out = None;
+    unsafe {
+        for i in 0..super::cf::array_len(raw) {
+            let win = super::cf::array_get(raw, i) as *const AXUIElement;
+            if window_id(win) == Some(target) {
+                out = f.take().map(|f| f(&el, win, pid));
+                break;
+            }
+        }
+        sys::CFRelease(raw);
+    }
+    out
 }
 
 unsafe fn set_bool(el: &AXUIElement, name: &str, value: bool) {

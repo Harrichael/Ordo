@@ -10,7 +10,9 @@ use std::path::PathBuf;
 use ordo_core::{
     MonitorId, Pid, Point, Rect, VirtualMonitorId, VirtualMonitorsWord, WindowId, WorkspaceId,
 };
-use ordo_emulated::{AppMoveStat, Desktop, EmulatedWorkspaces, HoldStat, Unhide};
+use ordo_emulated::{Desktop, EmulatedWorkspaces, ParkTrace, ParkTraceKind, Unhide};
+
+use crate::app_queue::AppQueues;
 
 use crate::backend::{
     BackendError, BackendTopology, Capabilities, MonitorWorkspace, Result, WorkspaceBackend,
@@ -18,23 +20,30 @@ use crate::backend::{
 
 use super::{ax, display, zorder};
 
-/// The AX/CG implementation of the emulated crate's `Desktop` port.
-struct AxDesktop;
+/// The AX/CG implementation of the emulated crate's `Desktop` port. Writes
+/// go onto the apps' queues.
+struct AxDesktop {
+    queues: AppQueues,
+}
 
 impl Desktop for AxDesktop {
-    fn windows(&self) -> Vec<(WindowId, Pid, Rect)> {
-        ax::windows()
+    fn frames(&self, windows: &[WindowId]) -> Vec<(WindowId, Pid, Rect)> {
+        zorder::describe(windows)
             .into_iter()
-            .map(|w| (w.id, w.app, w.frame))
+            .map(|(w, pid, f)| (w, Pid(pid), f))
             .collect()
     }
 
-    fn move_windows(&self, moves: &[(Pid, WindowId, Point)]) -> Vec<AppMoveStat> {
-        ax::move_windows(moves)
+    fn move_windows(&self, moves: &[(Pid, WindowId, Point)]) {
+        self.queues.move_windows(moves);
+    }
+
+    fn in_flight(&self, window: WindowId) -> bool {
+        self.queues.in_flight(window, std::time::Instant::now())
     }
 
     fn hide_app(&self, pid: Pid) {
-        ax::set_app_hidden(pid, true);
+        self.queues.hide(pid);
     }
 
     fn app_hidden(&self, pid: Pid) -> Option<bool> {
@@ -53,43 +62,10 @@ impl Desktop for AxDesktop {
         std::time::Instant::now()
     }
 
-    fn window_frames(&self, pid: Pid, windows: &[WindowId]) -> Vec<(WindowId, Rect)> {
-        ax::window_frames(pid, windows)
-    }
-
-    fn show_apps(&self, apps: &[Unhide]) -> Vec<HoldStat> {
-        let holds: Vec<(Pid, &[(WindowId, Point)])> =
-            apps.iter().map(|u| (u.pid, u.hold.as_slice())).collect();
-        ax::show_apps(&holds)
-            .into_iter()
-            .map(|o| {
-                if !o.escaped.is_empty() {
-                    eprintln!(
-                        "ordo: un-hiding pid {} left {} window(s) off the corner after {}ms",
-                        o.pid.0,
-                        o.escaped.len(),
-                        o.elapsed_ms
-                    );
-                }
-                HoldStat::new(
-                    o.pid,
-                    o.unhid,
-                    apps.iter()
-                        .find(|u| u.pid == o.pid)
-                        .map_or(0, |u| u.hold.len()),
-                    o.writes,
-                    o.elapsed_ms,
-                    o.escaped,
-                )
-                .with_steps(
-                    o.enhanced_ui,
-                    o.stacks
-                        .into_iter()
-                        .map(|(step, ids)| (step.to_string(), ids))
-                        .collect(),
-                )
-            })
-            .collect()
+    fn show_apps(&self, apps: &[Unhide]) {
+        for u in apps {
+            self.queues.show(u.pid, u.hold.clone());
+        }
     }
 
     fn focused_window(&self) -> Option<WindowId> {
@@ -132,17 +108,17 @@ pub struct EmulatedBackend {
 }
 
 impl EmulatedBackend {
-    pub fn new(count: u8) -> Self {
+    pub fn new(count: u8, queues: AppQueues) -> Self {
         EmulatedBackend {
             model: EmulatedWorkspaces::new(count),
-            desktop: AxDesktop,
+            desktop: AxDesktop { queues },
         }
     }
 
-    pub fn with_persistence(count: u8, path: PathBuf) -> Self {
+    pub fn with_persistence(count: u8, path: PathBuf, queues: AppQueues) -> Self {
         EmulatedBackend {
             model: EmulatedWorkspaces::with_persistence(count, path),
-            desktop: AxDesktop,
+            desktop: AxDesktop { queues },
         }
     }
 }
@@ -243,8 +219,16 @@ impl WorkspaceBackend for EmulatedBackend {
         self.model.believed_frames(&self.desktop, frames)
     }
 
-    fn take_park_trace(&mut self) -> Vec<ordo_emulated::ParkTrace> {
-        self.model.take_trace()
+    fn take_park_trace(&mut self) -> Vec<ParkTrace> {
+        let mut trace = self.model.take_trace();
+        trace.extend(
+            self.desktop
+                .queues
+                .take_chains()
+                .into_iter()
+                .map(|c| ParkTrace::app(c.pid, ParkTraceKind::AppChain).chain(c)),
+        );
+        trace
     }
 
     fn capabilities(&self) -> Capabilities {

@@ -34,7 +34,7 @@ pub mod statefile;
 pub mod trace;
 pub mod workspaces;
 
-pub use trace::{AppMoveStat, HoldStat, ParkTrace, ParkTraceKind, WriteStat};
+pub use trace::{ChainStat, FocusStat, HoldStat, ParkTrace, ParkTraceKind, WriteStat};
 pub use workspaces::{EmulatedWorkspaces, MonitorOutOfRange, WorkspaceOutOfRange};
 
 use std::time::Instant;
@@ -57,8 +57,10 @@ pub struct Unhide {
 /// windows, move them, hide apps, and know where the main display is. Defined
 /// here (the port belongs to the domain); implemented by the shell with AX.
 pub trait Desktop {
-    /// Every on-screen window: id, owning app, current frame.
-    fn windows(&self) -> Vec<(WindowId, Pid, Rect)>;
+    /// Where these windows are and which app owns each, per the window
+    /// server: no round trip to any app, and a hidden app's windows answer
+    /// too. Windows that no longer exist are left out.
+    fn frames(&self, windows: &[WindowId]) -> Vec<(WindowId, Pid, Rect)>;
 
     /// Send each window to a new origin, leaving its size alone.
     ///
@@ -73,21 +75,19 @@ pub trait Desktop {
     /// cross-display `SetWindowFrame`) does not come through this port.
     ///
     /// Batched because a switch parks the outgoing workspace and restores the
-    /// incoming one in a single breath, and an implementation that has to walk
-    /// each app's window list should walk it once for both.
-    /// What each app's share cost, one entry per app.
-    fn move_windows(&self, moves: &[(Pid, WindowId, Point)]) -> Vec<AppMoveStat>;
+    /// incoming one in a single breath.
+    ///
+    /// The moves may land after this returns; see [`Desktop::in_flight`].
+    fn move_windows(&self, moves: &[(Pid, WindowId, Point)]);
+
+    /// Whether a write to this window may not show yet in what the desktop
+    /// reports: asked for and not yet seen through. What this port reports
+    /// stays what the screen shows; this is what says whether to trust it.
+    fn in_flight(&self, window: WindowId) -> bool;
 
     /// Hide an app, the Cmd+H way. Fire-and-forget: the hide itself needs no
-    /// confirming. It is not always quiet, though — its windows parked at the
-    /// corner have been found pulled to the display's left edge soon after,
-    /// which is why [`Desktop::window_frames`] is asked right behind it.
+    /// confirming, and like a move it may land after this returns.
     fn hide_app(&self, pid: Pid);
-
-    /// Where these windows of one app are, asked of the app itself: the
-    /// window server's list can't answer for a hidden app, whose windows drop
-    /// out of it. Windows the app doesn't report are left out.
-    fn window_frames(&self, pid: Pid, windows: &[WindowId]) -> Vec<(WindowId, Rect)>;
 
     /// Whether the app is hidden right now, asked of the app itself; None when
     /// it doesn't answer.
@@ -118,21 +118,18 @@ pub trait Desktop {
     /// they are made to stick is the port's business — the model knows where a
     /// window belongs, not how to win a race with an app's main thread.
     ///
-    /// Batched for the same reason [`Desktop::move_windows`] is: a switch
-    /// un-hides several apps and must cost the slowest, not the sum.
+    /// Batched for the same reason [`Desktop::move_windows`] is, and like
+    /// it, may land after this returns: each app's un-hide follows that app's
+    /// moves already asked for, and its held windows are in flight until the
+    /// hold is done.
     ///
     /// An app already showing is not un-hidden: an un-hide sent to it brings
     /// every window it owns forward, parked ones included (measured 8 of 8,
     /// and 0 of 8 without it), which reorders the windows of both the
     /// workspace left and the one arrived at. Its held windows are still
     /// checked, and held if any left its spot: an app can be revealed behind
-    /// this call's back — focusing a window of a hidden app un-hides it, and
-    /// a switch focuses before it un-hides. Asked per app alongside the
-    /// un-hides themselves, so it costs the slowest app's answer, not the sum.
-    ///
-    /// The returned stats are telemetry only — the model reads nothing back
-    /// into its beliefs from them.
-    fn show_apps(&self, apps: &[Unhide]) -> Vec<HoldStat>;
+    /// this call's back — focusing a window of a hidden app un-hides it.
+    fn show_apps(&self, apps: &[Unhide]);
 
     fn focused_window(&self) -> Option<WindowId>;
     /// The active app, whether or not a window of it is key — Finder holding

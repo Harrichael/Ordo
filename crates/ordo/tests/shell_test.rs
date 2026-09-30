@@ -1038,18 +1038,21 @@ fn the_menu_bar_shows_every_workspace_and_follows_a_pick_from_its_menu() {
                 current: Some(WorkspaceId(1)),
                 engaged: true,
                 monitors: Some(on_1),
+                unreachable: Vec::new(),
             },
             MenuBarView {
                 workspaces: workspaces.clone(),
                 current: Some(WorkspaceId(2)),
                 engaged: true,
                 monitors: Some(on_2.clone()),
+                unreachable: Vec::new(),
             },
             MenuBarView {
                 workspaces,
                 current: Some(WorkspaceId(2)),
                 engaged: false,
                 monitors: Some(on_2),
+                unreachable: Vec::new(),
             },
         ]
     );

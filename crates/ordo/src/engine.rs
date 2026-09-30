@@ -3,11 +3,12 @@
 //! External inputs (hotkeys from the tap thread, observations from the
 //! observer thread, the rescue signal) arrive as [`Event`]s over a channel.
 //! For each, the engine runs the pure core, logs the whole step, and carries
-//! out the resulting effects *inline on this thread*. Running effects here —
-//! rather than on yet another thread — is deliberate: AX writes must be
-//! serialized anyway, and keeping them off the event-tap thread (which must
-//! never block) is the only hard constraint. A stuck app can stall this loop
-//! for one messaging timeout; it can never wedge the keyboard.
+//! out the resulting effects on this thread, in order. Carrying one out is
+//! mostly handing it on: writes to apps go onto each app's own queue
+//! ([`crate::app_queue`]) and restacks to the restack worker, so a slow app
+//! never holds up the loop through a write. Reads still run here — the
+//! snapshot's AX walk — and a stuck app can stall one for a messaging
+//! timeout; it can never wedge the keyboard, whose tap thread never blocks.
 //!
 //! An effect that asks to look again ([`Effect::RequestRescan`]) is answered by
 //! this thread taking a fresh snapshot and feeding it back as the next thing to

@@ -63,13 +63,10 @@ pub enum ParkTraceKind {
     AppShown,
     /// Dock dimming hid an app: all its windows live on hidden workspaces.
     AppHidden,
-    /// Read right after its app was hidden, a parked window was already off
-    /// its park spot. Says whether the hide itself moves parked windows, or
-    /// they move later (then the next scan's `Reassert` is the first sign).
-    OffAfterHide,
-    /// One app's share of a batch of moves: what reaching its windows, and
-    /// writing them, cost. The batch lands in the time of its slowest app.
-    AppMoved,
+    /// One app's share of the work queued for it, as that app's own thread
+    /// carried it out: its moves, its un-hide, its focus, and when each
+    /// finished. A switch lands in the time of its slowest app's chain.
+    AppChain,
     /// The stacking order of the ledger's on-screen windows, front to back,
     /// at a named moment of a switch. A switch's hides and un-hides reorder
     /// windows as a side effect, and nothing else records the order they
@@ -161,15 +158,9 @@ pub struct ParkTrace {
     pub at_park: Option<bool>,
     /// Enforcement attempts charged to this window so far.
     pub attempt: Option<u8>,
-    /// On an [`ParkTraceKind::AppShown`]: what it cost to keep that app's
-    /// parked windows at the corner while its windows ordered back in.
-    pub hold: Option<HoldStat>,
-    /// On a write record: what the write cost once it was made.
+    /// On an [`ParkTraceKind::AppChain`] record.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub write: Option<WriteStat>,
-    /// On an [`ParkTraceKind::AppMoved`] record.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub moves: Option<AppMoveStat>,
+    pub chain: Option<ChainStat>,
     /// On a [`ParkTraceKind::Switch`] or [`ParkTraceKind::View`] record: where
     /// the switch's own time went.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -181,37 +172,78 @@ pub struct ParkTrace {
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct WriteStat {
     pub ax_ms: f64,
-    /// When it finished, from the start of the whole batch: moves run on one
-    /// thread per app, so this is what says whether a write waited.
+    /// When it finished, from the start of its app's chain.
     pub done_ms: f64,
 }
 
-/// One app's part of a batch of moves.
+/// One app's chain: from the first job queued for it to its queue running
+/// empty. Every `done_ms` is measured from when that first job was queued.
 #[derive(Debug, Clone, Serialize)]
-pub struct AppMoveStat {
+pub struct ChainStat {
     #[serde(skip)]
     pub pid: Pid,
-    pub windows: usize,
-    /// Reading the app's window list, before any write could start.
-    pub list_ms: f64,
-    /// Whether `AXEnhancedUserInterface` was toggled around the writes.
-    pub enhanced_ui: bool,
-    pub total_ms: f64,
-    #[serde(skip)]
+    /// Wall-clock ms when the first job was queued: the row is written when
+    /// the chain ends, often after the next switch has begun, and this is
+    /// what ties it to the switch that queued it.
+    pub queued_wall_ms: i64,
+    /// From the first job being queued to the app's thread starting on it.
+    pub wait_ms: f64,
+    pub moves: usize,
+    /// Time spent inside the position writes.
+    pub moves_ms: f64,
+    /// Moves dropped before they were sent, replaced by newer ones for the
+    /// same window.
+    pub replaced: usize,
     pub writes: Vec<(WindowId, WriteStat)>,
+    pub show: Option<HoldStat>,
+    pub show_done_ms: Option<f64>,
+    pub focus: Option<FocusStat>,
+    pub done_ms: f64,
 }
 
-/// Where a switch's time went, on the engine thread. The focus request that
-/// precedes it and the rescan after it are timed elsewhere.
+impl ChainStat {
+    pub fn new(pid: Pid, queued_wall_ms: i64, wait: std::time::Duration) -> Self {
+        ChainStat {
+            pid,
+            queued_wall_ms,
+            wait_ms: wait.as_secs_f64() * 1000.0,
+            moves: 0,
+            moves_ms: 0.0,
+            replaced: 0,
+            writes: Vec::new(),
+            show: None,
+            show_done_ms: None,
+            focus: None,
+            done_ms: 0.0,
+        }
+    }
+
+    /// Nothing worth a row: only hides or markers ran.
+    pub fn is_empty(&self) -> bool {
+        self.moves == 0 && self.replaced == 0 && self.show.is_none() && self.focus.is_none()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct FocusStat {
+    pub window: WindowId,
+    /// A newer focus was queued before this one's turn came.
+    pub skipped: bool,
+    pub found: bool,
+    pub done_ms: f64,
+}
+
+/// Where a switch's time went, on the engine thread. The writes themselves
+/// run on each app's own thread, recorded in [`ParkTraceKind::AppChain`]
+/// rows; the rescan after the switch is timed elsewhere.
 #[derive(Debug, Clone, Copy, Default, Serialize)]
 pub struct SwitchCost {
     /// Reading every window's frame and the display geometry.
     pub read_ms: f64,
-    pub moves_ms: f64,
     /// Writing the ledger to disk, before any window moves.
     pub persist_ms: f64,
-    /// Un-hiding and holding the destination's apps.
-    pub visibility_ms: f64,
+    /// Handing the moves and un-hides to the apps' queues.
+    pub queue_ms: f64,
 }
 
 impl ParkTrace {
@@ -227,9 +259,7 @@ impl ParkTrace {
             requested: None,
             at_park: None,
             attempt: None,
-            hold: None,
-            write: None,
-            moves: None,
+            chain: None,
             cost: None,
             detail: None,
         }
@@ -273,13 +303,8 @@ impl ParkTrace {
         self
     }
 
-    pub fn hold(mut self, h: HoldStat) -> Self {
-        self.hold = Some(h);
-        self
-    }
-
-    pub fn moves(mut self, m: AppMoveStat) -> Self {
-        self.moves = Some(m);
+    pub fn chain(mut self, c: ChainStat) -> Self {
+        self.chain = Some(c);
         self
     }
 

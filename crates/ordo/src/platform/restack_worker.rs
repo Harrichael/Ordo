@@ -34,12 +34,18 @@ use crossbeam_channel::Sender;
 use ordo_core::WindowId;
 
 use super::ws_events::{RaiseSignals, WaitOutcome};
+use crate::app_queue::Landing;
 use crate::engine::Msg;
 
 /// How long a converged reassert stays listening for a late landing. Covers
 /// the observed straggler tail (Ghostty/kitty raises confirmed up to ~1.6s
 /// late) without holding the watch across unrelated activity.
 const GHOST_WATCH_MS: u64 = 1800;
+
+/// The longest a restack waits for its apps to land what was queued before
+/// it. Past this it plans against the screen as it stands, as it did before
+/// writes were queued: an app that slow will be raised around, not waited on.
+const LANDING_WAIT: Duration = Duration::from_millis(600);
 
 struct Shared {
     /// Bumped by every submit; a running reassert compares its own generation
@@ -56,6 +62,9 @@ struct Job {
     order: Vec<WindowId>,
     attached: Vec<(WindowId, WindowId)>,
     focus_top: bool,
+    /// The switch's writes to the apps of `order`; raises only mean
+    /// something once the windows are where they are going and showing.
+    landing: Landing,
 }
 
 #[derive(Clone)]
@@ -69,6 +78,7 @@ impl RestackHandle {
         order: Vec<WindowId>,
         attached: Vec<(WindowId, WindowId)>,
         focus_top: bool,
+        landing: Landing,
     ) {
         let generation = self.shared.generation.fetch_add(1, Ordering::SeqCst) + 1;
         let mut slot = self.shared.slot.lock().unwrap();
@@ -77,6 +87,7 @@ impl RestackHandle {
             order,
             attached,
             focus_top,
+            landing,
         });
         self.shared.wake.notify_one();
     }
@@ -112,6 +123,7 @@ pub fn spawn(tx: Sender<Msg>, signals: Arc<RaiseSignals>) -> RestackHandle {
                 order,
                 attached,
                 focus_top,
+                landing,
             } = {
                 let mut slot = shared.slot.lock().unwrap();
                 loop {
@@ -122,13 +134,19 @@ pub fn spawn(tx: Sender<Msg>, signals: Arc<RaiseSignals>) -> RestackHandle {
                 }
             };
             let cancel = || shared.generation.load(Ordering::SeqCst) != generation;
-            let stats = super::zorder::reassert_stack(
+            let waited = Instant::now();
+            landing.wait(waited + LANDING_WAIT, &cancel);
+            let landing_wait_ms = waited.elapsed().as_millis() as u64;
+            let mut stats = super::zorder::reassert_stack(
                 &order,
                 &attached,
                 focus_top,
                 &cancel,
                 Some(&signals),
             );
+            if let Some(s) = &mut stats {
+                s.landing_wait_ms = landing_wait_ms;
+            }
             let issued = stats.as_ref().is_some_and(|s| !s.raises.is_empty());
             let watch = stats
                 .as_ref()

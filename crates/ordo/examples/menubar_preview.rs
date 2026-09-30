@@ -52,6 +52,7 @@ fn main() {
         current: Some(WorkspaceId(3)),
         engaged: !paused,
         monitors: Some(monitors(enabled)),
+        unreachable: Vec::new(),
     };
 
     let (tx, rx) = crossbeam_channel::unbounded::<Msg>();

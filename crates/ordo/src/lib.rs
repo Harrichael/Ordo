@@ -7,6 +7,8 @@
 //!
 //! Module map:
 //! - [`engine`] — the single serial loop: event in, core, log, effects out.
+//! - [`app_queue`] — one queue and thread per app for every write Ordo makes
+//!   to it, and the record of writes still on their way.
 //! - [`logger`] / [`replay`] — the structured log and its replay checker.
 //! - [`schema`] — the log's schema and the migration chain that grows it.
 //! - [`ports`] — the two traits the engine talks to the world through.
@@ -21,6 +23,7 @@
 //! - [`restack`] — which windows must be raised to put the stack in order,
 //!   and raising them, against a narrow window-server port.
 
+pub mod app_queue;
 pub mod backend;
 pub mod clock;
 pub mod debug;

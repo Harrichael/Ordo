@@ -1,19 +1,22 @@
 //! Carrying out core effects against macOS.
 //!
 //! The engine calls this synchronously on its own thread. Each result is the
-//! executor's view of the *attempt* — "the AX write returned success", "the
+//! executor's view of the *attempt* — "the write is queued for its app", "the
 //! backend posted the gesture" — never a claim about the world, which is
-//! confirmed only by the next snapshot.
+//! confirmed only by the next snapshot. Writes to an app go onto that app's
+//! queue ([`AppQueues`]), behind whatever the same effect list queued for it
+//! before: a switch's focus lands after its app's moves and un-hide.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use ordo_core::{Effect, OpOutcome, Pid};
 
+use crate::app_queue::AppQueues;
 use crate::ports::Effector;
 
 use super::restack_worker::RestackHandle;
-use super::{ax, display, mouse, SharedBackend};
+use super::{ax, display, mouse, zorder, SharedBackend};
 
 pub struct MacEffector {
     backend: SharedBackend,
@@ -23,6 +26,7 @@ pub struct MacEffector {
     /// Z-order is enforced off-thread: submitting is instant, and a newer
     /// order preempts an in-flight one instead of queueing behind it.
     restack: RestackHandle,
+    queues: AppQueues,
 }
 
 impl MacEffector {
@@ -30,11 +34,13 @@ impl MacEffector {
         backend: SharedBackend,
         intercepting: Arc<AtomicBool>,
         restack: RestackHandle,
+        queues: AppQueues,
     ) -> Self {
         MacEffector {
             backend,
             intercepting,
             restack,
+            queues,
         }
     }
 }
@@ -69,7 +75,11 @@ impl Effector for MacEffector {
         }
         match effect {
             Effect::FocusWindow { window, .. } => {
-                Some(found_outcome(ax::focus(*window), "focus: window not found"))
+                let owner = zorder::owner_of(*window);
+                if let Some(pid) = owner {
+                    self.queues.focus(Pid(pid), *window);
+                }
+                Some(found_outcome(owner.is_some(), "focus: window not found"))
             }
             Effect::FocusDesktop { display, .. } => {
                 let frame = display::active_displays()
@@ -81,10 +91,13 @@ impl Effector for MacEffector {
                     "focus_desktop: no desktop window on that display",
                 ))
             }
-            Effect::SetWindowFrame { window, frame, .. } => Some(found_outcome(
-                ax::set_frame(*window, *frame),
-                "set_frame: window not found",
-            )),
+            Effect::SetWindowFrame { window, frame, .. } => {
+                let owner = zorder::owner_of(*window);
+                if let Some(pid) = owner {
+                    self.queues.set_frame(Pid(pid), *window, *frame);
+                }
+                Some(found_outcome(owner.is_some(), "set_frame: window not found"))
+            }
             Effect::SwitchWorkspace { target, .. } => Some(result_outcome(
                 self.backend.borrow_mut().switch_workspace(*target),
             )),
@@ -124,12 +137,24 @@ impl Effector for MacEffector {
                 attached,
                 focus_top,
             } => {
+                let mut apps: Vec<Pid> = zorder::describe(order)
+                    .into_iter()
+                    .map(|(_, pid, _)| Pid(pid))
+                    .collect();
+                apps.sort_by_key(|p| p.0);
+                apps.dedup();
+                let landing = self.queues.marker(&apps);
                 self.restack
-                    .submit(order.clone(), attached.clone(), *focus_top);
+                    .submit(order.clone(), attached.clone(), *focus_top, landing);
                 None
             }
             Effect::SetIntercepting { enabled } => {
                 self.intercepting.store(*enabled, Ordering::Relaxed);
+                // Letting go of the screen (rescue, pause): anything still
+                // queued would land on top of whatever takes over.
+                if !*enabled {
+                    self.queues.abandon();
+                }
                 None
             }
             // The engine interprets this one itself (it owns the world source).

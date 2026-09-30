@@ -33,7 +33,7 @@
 use rusqlite::{Connection, Transaction};
 
 /// The schema version this build writes and understands.
-pub const CURRENT_VERSION: i32 = 7;
+pub const CURRENT_VERSION: i32 = 8;
 
 type Migration = fn(&Transaction) -> rusqlite::Result<()>;
 
@@ -45,6 +45,7 @@ const MIGRATIONS: &[Migration] = &[
     m5_restack_refocused,
     m6_restack_start_order,
     m7_overlap_restacks,
+    m8_restack_landing_wait,
 ];
 
 /// Read the version of an existing log, refusing one written by a newer Ordo.
@@ -197,6 +198,10 @@ fn m7_overlap_restacks(tx: &Transaction) -> rusqlite::Result<()> {
          ALTER TABLE raises ADD COLUMN lane INTEGER NOT NULL DEFAULT 0;
          ALTER TABLE raises ADD COLUMN ax_ms INTEGER NOT NULL DEFAULT 0;",
     )
+}
+
+fn m8_restack_landing_wait(tx: &Transaction) -> rusqlite::Result<()> {
+    tx.execute_batch("ALTER TABLE restacks ADD COLUMN landing_wait_ms INTEGER NOT NULL DEFAULT 0;")
 }
 
 /// Version 1: the schema as it first shipped. Frozen — see the module rules.

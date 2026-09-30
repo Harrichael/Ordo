@@ -35,6 +35,73 @@ const EXCLUDE_DESKTOP: u32 = 1 << 4;
 #[cfg_attr(target_os = "macos", link(name = "CoreGraphics", kind = "framework"))]
 extern "C" {
     fn CGWindowListCopyWindowInfo(option: u32, relative_to: u32) -> sys::CFArrayRef;
+    fn CGWindowListCreateDescriptionFromArray(windows: sys::CFArrayRef) -> sys::CFArrayRef;
+}
+
+/// These windows' owners and frames, on screen or not. Naming the windows
+/// matters: the list of every window runs to hundreds of helper windows and
+/// costs ten times as much (examples/frames_probe.rs, which also found these
+/// frames equal to the apps' own AX frames, to the point).
+pub fn describe(windows: &[WindowId]) -> Vec<(WindowId, i32, Rect)> {
+    let mut out = Vec::new();
+    // Raw window ids, not CF numbers, hence no callbacks.
+    let raw: Vec<*const std::ffi::c_void> =
+        windows.iter().map(|w| w.0 as usize as *const _).collect();
+    unsafe {
+        let ids = sys::CFArrayCreate(
+            std::ptr::null(),
+            raw.as_ptr(),
+            raw.len() as isize,
+            std::ptr::null(),
+        );
+        if ids.is_null() {
+            return out;
+        }
+        let arr = CGWindowListCreateDescriptionFromArray(ids);
+        sys::CFRelease(ids);
+        if arr.is_null() {
+            return out;
+        }
+        for i in 0..cf::array_len(arr) {
+            let d = cf::array_get(arr, i) as sys::CFDictionaryRef;
+            let b = cf::dict_get(d, "kCGWindowBounds");
+            let seen = (|| {
+                Some((
+                    WindowId(cf::number_i64(cf::dict_get(d, "kCGWindowNumber"))? as u32),
+                    cf::number_i64(cf::dict_get(d, "kCGWindowOwnerPID"))? as i32,
+                    Rect {
+                        x: cf::number_f64(cf::dict_get(b, "X"))?,
+                        y: cf::number_f64(cf::dict_get(b, "Y"))?,
+                        w: cf::number_f64(cf::dict_get(b, "Width"))?,
+                        h: cf::number_f64(cf::dict_get(b, "Height"))?,
+                    },
+                ))
+            })();
+            out.extend(seen);
+        }
+        sys::CFRelease(arr);
+    }
+    out
+}
+
+/// The pid that owns this window, on screen or not (a hidden app's windows
+/// included).
+pub fn owner_of(w: WindowId) -> Option<i32> {
+    const INCLUDING_WINDOW: u32 = 1 << 3;
+    unsafe {
+        let arr = CGWindowListCopyWindowInfo(INCLUDING_WINDOW, w.0);
+        if arr.is_null() {
+            return None;
+        }
+        let pid = (cf::array_len(arr) > 0)
+            .then(|| {
+                let d = cf::array_get(arr, 0) as sys::CFDictionaryRef;
+                cf::number_i64(cf::dict_get(d, "kCGWindowOwnerPID"))
+            })
+            .flatten();
+        sys::CFRelease(arr);
+        pid.map(|p| p as i32)
+    }
 }
 
 /// On-screen normal (layer-0) windows with their owning pids, front to back.

@@ -13,9 +13,9 @@ Handoff notes for whoever picks this up next. Each item is open: what is known, 
 | 33 | 1790639352913 | Only-hidden un-hides, before the revealed-app hold |
 | 35 | 1790678196817 | With the revealed-app hold (3e936ef) |
 
-**Queries:** the analysis scripts were ad hoc and aren't saved. The tables to read are `events`, `effects`, `notes`, `park_trace`, `restacks` + `raises`, `hotkey_batches`, `snapshots`.
+**Queries:** the switch-speed scripts are in `scripts/log-analysis/` (see `docs/switch-speed.md`); older analyses were ad hoc and aren't saved. The tables to read are `events`, `effects`, `notes`, `park_trace`, `restacks` + `raises`, `hotkey_batches`, `snapshots`.
 - Time ordering inside one engine step: `park_trace.wall_ms` is stamped when the trace is drained, so use `rowid` for order.
-- Stack reads at each step of a switch (`park_trace.kind = 'Stack'`, and `hold.stacks` on `AppShown`) are only logged in debug mode (menu bar Settings, off at every launch).
+- Stack reads at each step of a switch (`park_trace.kind = 'Stack'`, and `chain.show.stacks` on `AppChain`) are only logged in debug mode (menu bar Settings, off at every launch).
 
 ## 1. Hide/un-hide races with macOS
 
@@ -31,6 +31,7 @@ A race here is Ordo against the app's main thread, AppKit and the window server,
 - **How it could happen:** `hide_idle_apps` sends `AXHidden = true` and moves on. If a switch back reads the app as showing before the hide has taken effect, the app is left alone and then finishes hiding. It stays invisible on its own workspace.
 - **Why nothing fixes it:** `hide_idle_apps` skips apps with a window here, and `enforce_placement` has no "hidden, but should be showing" check.
 - **Evidence it hasn't happened:** the shortest hide→un-hide gaps in the log (Chrome 211ms and 361ms, Finder 499ms) all read hidden correctly.
+- **Partly addressed (53dbd9e):** the ledger now tracks which apps are hidden and hears every app's hide and show notifications. A hidden app with a window on screen is shown again at the next pass, and a switch catches unheard hides from the window list. The race above is narrower, not gone: a late hide after the switch's un-hide is heard, and undone at the next pass.
 
 **1c. A deferred hide can fire just as the user switches.** Seen.
 - **What happens:** the periodic rescan runs the due hides, and a hotkey can land milliseconds later, so the apps are hidden and then un-hidden at once.
@@ -59,7 +60,7 @@ Some apps move their parked windows to the display's left edge (x=0, keeping y) 
 
 **Proposed:** observe `AXApplicationShown` per app and immediately hold that app's parked windows (reuse the `show_apps` hold), instead of waiting for the next scan.
 - Don't re-hide such an app blindly: the reminder case shows the app came back to show a window that belongs on screen.
-- The post-hide read-back (`off_after_hide` in `workspaces.rs`) has answered its question: 0 windows off their spot at every hide in runs 29–33. It costs one AX round trip per hidden app and can be removed.
+- The post-hide read-back is gone: it found 0 windows off their spot at every hide in runs 29–33, and with hides queued it would have read before the hide landed.
 
 ## 3. Notifications and app-initiated windows need a window role
 
@@ -69,41 +70,27 @@ Some apps move their parked windows to the display's left edge (x=0, keeping y) 
 - **Popups are clean.** Chrome and OneNote popups report `AXUnknown` or no subrole (about 150×22). They are currently managed as windows.
 - **Chrome's find bar,** window 44863, lived 226 snapshots inside its Chrome window and holds its own ledger claim.
 
-**Deployed (9585ccd):** snapshots record each window's `layer` and `parent`, from the window server, asked once per window. No window had a parent at deploy time. Collect cases before choosing rules: Chrome Cmd+F, tab and link hovers, an Outlook reminder, dialogs, call popups.
+**Deployed (9585ccd):** snapshots record each window's `layer` and `parent`, from the window server, asked once per window. Run 38 saw 14 attached Chrome windows (address-bar suggestions, link-hover bubbles). Still to collect: Chrome Cmd+F, an Outlook reminder, dialogs, call popups.
 
 **Proposed shape:**
-1. **Attached popups** (have a parent): follow the parent, no workspace of their own.
+1. **Attached popups** (have a parent): follow the parent, no workspace of their own. Done for stacking and the MRU order (3e5d609: the history holds root windows, and a restack carries each root's attached windows as part of its footprint). Parking and workspace placement still treat them as windows of their own.
 2. **Independent transients** (born without focus while their app wasn't frontmost; reminders, PiP): follow the user across workspaces until touched.
 3. **Normal windows:** as today.
 4. **Per-app override rules** as an escape hatch.
 
 AeroSpace for comparison: popups go in a global container; there's no sticky support (their issue #2); their dialog heuristic keeps misfiring.
 
-## 4. Stack ordering: overlapping windows only
+## 4. The settled-move restack enforces MRU on the whole workspace
 
-**The problem:** the worker imposes one total order across every visible window, one raise at a time. So it re-raises windows already in the right place, and a slow raise holds up the one the user can see.
-- **Flicker:** run 29, restacks 2223 and 2228 re-raised 8 Preview windows that were already in order on the main display, because windows on the other display sat between them in the order. That's about 850–925ms of visible restacking per arrival.
-- **Slow cross-display raises:** run 25, restack 1557 made Slack wait behind a 360ms Chrome raise that only ordered Chrome against Outlook on the other display.
-
-**Design, not built:** `docs/stack-order-design.md` (2026-09-29). Its main points:
-- Keep the core's MRU order, but enforce it only between overlapping windows. The MRU is the only stored structure; overlap groups are rebuilt at each restack, not kept.
-- The shell computes the overlaps from the same window-list read that gives the stack. Measured: the bounds parse and overlap math add about 2 µs to a 0.26 ms read.
-- Geometry changes should trigger a restack check: the core emits `RestackWindows` when a visible window's frame change settles, and the shell's plan is empty when nothing is violated.
-- Raise the unique minimal set, bottom-up.
-- Independent overlap groups raise in parallel.
-- Overlap detection is brute force: fixed arrays and a bitset, more than 2pt of overlap on both axes.
-- Ignore the "Displays have separate Spaces" setting; geometry alone is correct in both modes.
-
-Replayed on the log: restack 2228 goes from 20 raises to 2, and all 99 restacks of run 29 from 421 to 182.
-
-**Open decision:** the user described not remembering the order of windows that don't overlap at all. The design keeps it but doesn't enforce it.
+When a window moved by a hand that isn't Ordo's holds still, the core asks for a restack (`restack_settled_moves` in `update.rs`). The restack enforces the MRU order on every overlapping pair on the workspace, not just the pairs that include the window that moved.
+- **Seen:** run 45, restacks 3384 and 3385. A Chrome popup resized on the right monitor, and the left monitor was reordered.
+- **Proposed:** the effect carries the moved roots, and the planner (`restack.rs`) filters its edges to pairs touching them. Switch restacks stay whole-workspace.
 
 ## 5. Unconverged restacks with no timeout
 
-Run 25: 4 restacks ended `converged = 0`, `restack_id` 1279, 1307, 1310, 1322. All had kitty as top and none timed out.
-- **Likely cause:** the final focus check runs just before the last read-back, widening the window for a late landing.
-- **Consequence:** an unconverged restack gets no ghost watch (`restack_worker.rs`: the watch requires `converged`), so a wrong order can stay until the next switch.
-- **Proposed:** if the final `take_focus` refocused, re-read the order and run one more `raise_pass` if it's off. Let the ghost watch run after an unconverged pass too. Revisit after item 4, which replaces the raise pass.
+Run 25 (old planner): 4 restacks ended `converged = 0`, `restack_id` 1279, 1307, 1310, 1322, all with kitty as top. With the overlap-only planner (2c92712): the 8 in run 37 were the Chrome popup fight, fixed by 3e5d609; 1 in run 39; none in runs 38 and 45.
+- **Consequence, still true:** an unconverged restack gets no ghost watch (`restack_worker.rs`: the watch requires `converged`), so a wrong order can stay until the next switch.
+- **Proposed:** watch the rate. If it stays near zero, drop this item. Otherwise let the ghost watch run after an unconverged pass too.
 
 ## 6. Snapshot cost leftovers
 
