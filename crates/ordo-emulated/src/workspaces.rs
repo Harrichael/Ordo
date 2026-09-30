@@ -210,7 +210,7 @@ pub struct EmulatedWorkspaces {
     replug_unseen: bool,
     /// When the apps left with nothing on screen are to be hidden: a switch
     /// asks for its un-hides straight away but hides only once the user
-    /// settles.
+    /// settles, and the apps are done with the switches' writes.
     hides_due: Option<Instant>,
     /// The apps hidden right now, as far as this model knows: the ones it
     /// hid, and ones found hidden with nothing on screen. Hiding is Ordo's
@@ -929,7 +929,7 @@ impl EmulatedWorkspaces {
             }
         }
         self.reconcile_visibility(d, frames, &g);
-        if self.hides_due.is_some_and(|due| d.now() >= due) {
+        if self.hides_due.is_some_and(|due| d.now() >= due) && !d.busy() {
             self.hides_due = None;
             self.hide_idle_apps(d, frames, &g);
         }
@@ -1599,6 +1599,29 @@ impl EmulatedWorkspaces {
         self.hidden_apps.as_mut().unwrap()
     }
 
+    /// The shell is about to bring this app to the front, which un-hides it.
+    /// If this model hid it, it's no longer hidden, and here are its parked
+    /// windows to hold through the reveal. The desktop is the case: focusing
+    /// an empty workspace fronts Finder, which may have been hidden with a
+    /// window parked elsewhere.
+    pub fn reveal_for_focus(&mut self, d: &dyn Desktop, pid: Pid) -> Option<Vec<(WindowId, Point)>> {
+        if !self.hidden_apps.as_ref().is_some_and(|h| h.contains(&pid)) {
+            return None;
+        }
+        let frames = current_frames(d, self.ledger.window_ws().into_keys());
+        let g = Geometry::read(d);
+        let (_, elsewhere) = self.apps_on_screen(&frames, &g);
+        self.hidden_apps(d, &frames).remove(&pid);
+        let current = self.ledger.current();
+        let hold = elsewhere.get(&pid).cloned().unwrap_or_default();
+        self.note(
+            ParkTrace::app(pid, ParkTraceKind::AppShown)
+                .ws(current, current)
+                .detail(format!("un-hiding to focus it; holds {} parked window(s)", hold.len())),
+        );
+        Some(hold)
+    }
+
     /// An app was hidden or shown, by anyone: Ordo's own hides and un-hides
     /// arrive here too. Acted on at the next pass, which has the frames.
     pub fn note_app_visibility(&mut self, pid: Pid, hidden: bool) {
@@ -2205,6 +2228,10 @@ mod tests {
 
         fn in_flight(&self, window: WindowId) -> bool {
             self.queue.borrow().iter().any(|m| m.window == window)
+        }
+
+        fn busy(&self) -> bool {
+            !self.queue.borrow().is_empty()
         }
 
         fn hide_app(&self, pid: Pid) {
@@ -3294,6 +3321,56 @@ mod tests {
         assert_eq!(d.frame(w(1)), rect(100.0, 100.0));
         assert!(in_park_corner(&d.frame(w(2)), &geo()), "{:?}", d.frame(w(2)));
         assert!(!b.parked.contains(&w(1)));
+    }
+
+    /// A burst through one app's workspaces, faster than its writes land:
+    /// once they have, each window is where the last press put it.
+    #[test]
+    fn a_burst_leaves_each_window_where_the_last_press_put_it() {
+        let d = FakeDesktop::new(&[
+            (w(1), Pid(10), rect(100.0, 100.0)),
+            (w(2), Pid(10), rect(300.0, 200.0)),
+            (w(3), Pid(10), rect(500.0, 300.0)),
+        ]);
+        let mut b = EmulatedWorkspaces::new(3);
+        rescan(&d, &mut b);
+        b.assign_window_to_workspace(w(2), ws(2)).unwrap();
+        b.assign_window_to_workspace(w(3), ws(3)).unwrap();
+        b.switch_workspace(&d, ws(2));
+        b.switch_workspace(&d, ws(1));
+        rescan(&d, &mut b);
+
+        d.queueing.set(true);
+        b.switch_workspace(&d, ws(2));
+        b.switch_workspace(&d, ws(3));
+        b.switch_workspace(&d, ws(2));
+        d.land_queued();
+        rescan(&d, &mut b);
+
+        assert_eq!(d.frame(w(2)), rect(300.0, 200.0));
+        assert!(in_park_corner(&d.frame(w(1)), &geo()), "{:?}", d.frame(w(1)));
+        assert!(in_park_corner(&d.frame(w(3)), &geo()), "{:?}", d.frame(w(3)));
+    }
+
+    /// Focusing an empty workspace fronts the desktop's owner, which un-hides
+    /// it if Ordo hid it. The model hands over what to hold through that, once.
+    #[test]
+    fn fronting_a_hidden_app_hands_over_its_parked_windows_once() {
+        let d = FakeDesktop::new(&[
+            (w(1), Pid(10), rect(100.0, 100.0)),
+            (w(2), Pid(20), rect(300.0, 200.0)),
+        ]);
+        let mut b = EmulatedWorkspaces::new(3);
+        rescan(&d, &mut b);
+        b.assign_window_to_workspace(w(2), ws(2)).unwrap();
+        b.switch_workspace(&d, ws(2));
+        d.settle(&mut b);
+        assert!(d.is_hidden(Pid(10)));
+
+        let hold = b.reveal_for_focus(&d, Pid(10)).expect("Ordo hid it");
+        assert_eq!(hold.iter().map(|(w, _)| *w).collect::<Vec<_>>(), [w(1)]);
+        assert!(b.reveal_for_focus(&d, Pid(10)).is_none(), "no longer hidden");
+        assert!(b.reveal_for_focus(&d, Pid(20)).is_none(), "never hidden");
     }
 
     /// The port is told which moves park, so an un-hide still to come can

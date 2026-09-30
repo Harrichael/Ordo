@@ -42,6 +42,10 @@ impl Desktop for AxDesktop {
         self.queues.in_flight(window, std::time::Instant::now())
     }
 
+    fn busy(&self) -> bool {
+        !self.queues.idle()
+    }
+
     fn hide_app(&self, pid: Pid) {
         self.queues.hide(pid);
     }
@@ -209,6 +213,10 @@ impl WorkspaceBackend for EmulatedBackend {
 
     fn note_app_visibility(&mut self, pid: Pid, hidden: bool) {
         self.model.note_app_visibility(pid, hidden);
+    }
+
+    fn reveal_for_focus(&mut self, pid: Pid) -> Option<Vec<(WindowId, ordo_core::Point)>> {
+        self.model.reveal_for_focus(&self.desktop, pid)
     }
 
     fn enforce_placement(&mut self, frames: &HashMap<WindowId, (Pid, Rect)>) {

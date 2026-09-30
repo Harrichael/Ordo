@@ -18,7 +18,9 @@
 
 use std::collections::HashMap;
 
-use ordo_core::{MonitorId, Pid, Rect, VirtualMonitorId, VirtualMonitorsWord, WindowId, WorkspaceId};
+use ordo_core::{
+    MonitorId, Pid, Point, Rect, VirtualMonitorId, VirtualMonitorsWord, WindowId, WorkspaceId,
+};
 use ordo_emulated::ParkTrace;
 
 pub type Result<T> = std::result::Result<T, BackendError>;
@@ -151,6 +153,14 @@ pub trait WorkspaceBackend {
     /// An app was hidden or shown, by anyone. Native leaves hiding to the
     /// user; default no-op.
     fn note_app_visibility(&mut self, _pid: Pid, _hidden: bool) {}
+
+    /// About to bring this app to the front, which un-hides it: if this
+    /// backend hid it, the windows it has parked and where, to hold through
+    /// the reveal. `None` when it isn't hidden (or the backend hides
+    /// nothing, as native doesn't).
+    fn reveal_for_focus(&mut self, _pid: Pid) -> Option<Vec<(WindowId, Point)>> {
+        None
+    }
 
     /// Assert this backend's placement declarations, given the frames the
     /// enumerator already read (no backend re-enumerates on its own).

@@ -64,6 +64,11 @@ pub enum Note {
     OpLost { op: OpId },
     /// The executor reported failure; the pending expectation was dropped.
     OpFailed { op: OpId, detail: String },
+    /// A newer op of the same kind made this one moot before it was seen to
+    /// land: a switch replaced by the next press of a burst, a focus grant by
+    /// the next grant (the app queues skip the older one), a window's move by
+    /// its next move. Its expectation was dropped.
+    OpSuperseded { op: OpId, by: OpId },
     /// A change we didn't cause. Belief absorbed it.
     External { delta: Delta },
     /// The verdict `handle_gesture` reached on a witnessed gesture: whether
@@ -143,7 +148,7 @@ pub fn update(state: &State, event: &Event) -> Step {
         Event::Hotkey { at, action } => {
             s.menu_open = false;
             if s.mode == Mode::Active {
-                handle_hotkey(&mut s, *action, at.mono_ns, &mut effects);
+                handle_hotkey(&mut s, *action, at.mono_ns, &mut effects, &mut notes);
             }
         }
         Event::WorldObserved { at, trigger, snap } => {
@@ -165,6 +170,7 @@ pub fn update(state: &State, event: &Event) -> Step {
             // Ops in flight will never be verified or retried again; keeping
             // them would only misattribute their late echoes.
             s.pending.clear();
+            s.workspace_intent = None;
             // The desktop is the user's again, focus included.
             s.declare_focus(FocusIntent::Deferred);
             // The tap already stopped intercepting on its own fast path; this
@@ -247,9 +253,16 @@ fn push_view(s: &mut State, target: VirtualMonitorId, now_ns: u64, fx: &mut Vec<
 /// Hand focus to a display's desktop, with its expectation. The single
 /// emitter, shared by the command that moves onto an empty monitor and the
 /// enforcement that holds it there.
-fn push_desktop(s: &mut State, display: MonitorId, now_ns: u64, fx: &mut Vec<Effect>) -> OpId {
+fn push_desktop(
+    s: &mut State,
+    display: MonitorId,
+    now_ns: u64,
+    fx: &mut Vec<Effect>,
+    notes: &mut Vec<Note>,
+) -> OpId {
     let op = s.mint_op();
     fx.push(Effect::FocusDesktop { op, display });
+    supersede(s, op, is_focus_grant, notes);
     if s.focused.is_some() {
         s.pending.push(PendingOp {
             op,
@@ -258,6 +271,111 @@ fn push_desktop(s: &mut State, display: MonitorId, now_ns: u64, fx: &mut Vec<Eff
         });
     }
     op
+}
+
+/// Hand focus to `window`. The single emitter with `push_desktop`: each app
+/// queue skips a focus once a newer one is queued anywhere, so every older
+/// grant is moot the moment this one is issued. `expect` is false where the
+/// belief already holds this focus, so no delta will need explaining.
+fn push_focus(
+    s: &mut State,
+    window: WindowId,
+    expect: bool,
+    now_ns: u64,
+    fx: &mut Vec<Effect>,
+    notes: &mut Vec<Note>,
+) -> OpId {
+    let op = s.mint_op();
+    fx.push(Effect::FocusWindow { op, window });
+    supersede(s, op, is_focus_grant, notes);
+    if expect {
+        s.pending.push(PendingOp {
+            op,
+            expect: Expectation::Focused(window),
+            issued_ns: now_ns,
+        });
+    }
+    op
+}
+
+fn is_focus_grant(e: &Expectation) -> bool {
+    matches!(e, Expectation::Focused(_) | Expectation::DesktopFocused)
+}
+
+/// Switch every monitor to `target`. The single emitter, because a switch is
+/// also Ordo's word on where the user is going: it replaces the workspace
+/// intent, and the switch it overtakes can never be confirmed now.
+fn push_switch(
+    s: &mut State,
+    target: WorkspaceId,
+    now_ns: u64,
+    fx: &mut Vec<Effect>,
+    notes: &mut Vec<Note>,
+) -> OpId {
+    let op = s.mint_op();
+    fx.push(Effect::SwitchWorkspace { op, target });
+    supersede(
+        s,
+        op,
+        |e| matches!(e, Expectation::AllMonitorsOn(_)),
+        notes,
+    );
+    s.pending.push(PendingOp {
+        op,
+        expect: Expectation::AllMonitorsOn(target),
+        issued_ns: now_ns,
+    });
+    s.workspace_intent = Some((op, target));
+    op
+}
+
+/// Wait to see `expect` come true. A window's older move to a workspace is
+/// moot once a newer one is issued; left pending, it would pass for where the
+/// window is going (`State::declared_workspace_of`), and be retried over the
+/// newer move once it expired.
+fn expect(
+    s: &mut State,
+    op: OpId,
+    expect: Expectation,
+    now_ns: u64,
+    notes: &mut Vec<Note>,
+) {
+    if let Expectation::WindowOn { window, .. } = expect {
+        supersede(
+            s,
+            op,
+            |e| matches!(e, Expectation::WindowOn { window: w, .. } if *w == window),
+            notes,
+        );
+    }
+    s.pending.push(PendingOp {
+        op,
+        expect,
+        issued_ns: now_ns,
+    });
+}
+
+fn supersede(
+    s: &mut State,
+    by: OpId,
+    moot: impl Fn(&Expectation) -> bool,
+    notes: &mut Vec<Note>,
+) {
+    s.pending.retain(|p| {
+        let keep = !moot(&p.expect);
+        if !keep {
+            notes.push(Note::OpSuperseded { op: p.op, by });
+        }
+        keep
+    });
+}
+
+/// An op left `pending` for good. The workspace intent is its switch's for
+/// exactly as long as that switch is under way.
+fn op_ended(s: &mut State, op: OpId) {
+    if s.workspace_intent.is_some_and(|(o, _)| o == op) {
+        s.workspace_intent = None;
+    }
 }
 
 /// The monitor a focus target needs viewed, if it sits on a hidden one —
@@ -349,13 +467,19 @@ enum Command {
     AddMonitor,
 }
 
-fn handle_hotkey(s: &mut State, action: HotkeyAction, now_ns: u64, fx: &mut Vec<Effect>) {
+fn handle_hotkey(
+    s: &mut State,
+    action: HotkeyAction,
+    now_ns: u64,
+    fx: &mut Vec<Effect>,
+    notes: &mut Vec<Note>,
+) {
     // A hotkey that resolves to nothing (clamped at an edge, nothing focused)
     // touched neither the world nor the declaration.
     let Some(cmd) = resolve(s, action) else {
         return;
     };
-    let focus = execute(s, cmd, now_ns, fx);
+    let focus = execute(s, cmd, now_ns, fx, notes);
     s.declare_focus(focus);
 }
 
@@ -364,7 +488,7 @@ fn resolve(s: &State, action: HotkeyAction) -> Option<Command> {
         HotkeyAction::WorkspacePrev
         | HotkeyAction::WorkspaceNext
         | HotkeyAction::WorkspaceSwitchTo(_) => {
-            let cur = s.current_workspace()?;
+            let cur = s.declared_workspace()?;
             let target = match action {
                 HotkeyAction::WorkspacePrev if cur.0 > 1 => WorkspaceId(cur.0 - 1),
                 HotkeyAction::WorkspaceNext if cur.0 < s.workspace_count => WorkspaceId(cur.0 + 1),
@@ -380,12 +504,13 @@ fn resolve(s: &State, action: HotkeyAction) -> Option<Command> {
 
         HotkeyAction::CarryFocusedToWorkspacePrev | HotkeyAction::CarryFocusedToWorkspaceNext => {
             let window = s.declared_focus()?;
-            let cur = s.current_workspace()?;
+            let cur = s.declared_workspace()?;
             // You carry what's with you: dragging a window over from a hidden
             // workspace would materialize it from nowhere. Read against the
             // DECLARATION, so a fling onto a parked sibling between two chords
-            // cannot make the second one do nothing (run 51 seq 22484).
-            if s.windows.get(&window)?.workspace != cur {
+            // cannot make the second one do nothing (run 51 seq 22484), and
+            // a second carry before the first is confirmed carries it on.
+            if s.declared_workspace_of(window)? != cur {
                 return None;
             }
             let target = match action {
@@ -498,7 +623,13 @@ fn resolve(s: &State, action: HotkeyAction) -> Option<Command> {
 
 /// Carry out a resolved command and return the focus declaration it leaves
 /// behind. Total over `Command` by construction — see the type's doc.
-fn execute(s: &mut State, cmd: Command, now_ns: u64, fx: &mut Vec<Effect>) -> FocusIntent {
+fn execute(
+    s: &mut State,
+    cmd: Command,
+    now_ns: u64,
+    fx: &mut Vec<Effect>,
+    notes: &mut Vec<Note>,
+) -> FocusIntent {
     match cmd {
         Command::Switch { target } => {
             // Hand focus to the destination's MRU window, emitted AFTER the
@@ -537,31 +668,18 @@ fn execute(s: &mut State, cmd: Command, now_ns: u64, fx: &mut Vec<Effect>) -> Fo
                     .and_then(|v| s.host_of(v.viewed))
                     .or_else(|| s.focused_monitor()),
             };
-            let op = s.mint_op();
-            fx.push(Effect::SwitchWorkspace { op, target });
-            s.pending.push(PendingOp {
-                op,
-                expect: Expectation::AllMonitorsOn(target),
-                issued_ns: now_ns,
-            });
+            let op = push_switch(s, target, now_ns, fx, notes);
             if let Some(fw) = head {
-                let focus = s.mint_op();
-                fx.push(Effect::FocusWindow {
-                    op: focus,
-                    window: fw,
-                });
                 // Re-asserting focus the belief already holds produces no
                 // delta, so there is nothing to attribute to an expectation.
-                if s.focused != Some(fw) {
-                    s.pending.push(PendingOp {
-                        op: focus,
-                        expect: Expectation::Focused(fw),
-                        issued_ns: now_ns,
-                    });
-                }
+                // Both halves of the belief must hold it: mid-burst the seen
+                // focus is a look behind, and a quick 1 -> 2 -> 1 finds it
+                // still on this window while a grant to 2's is in flight.
+                let unheld = s.focused != Some(fw) || s.declared_focus() != Some(fw);
+                push_focus(s, fw, unheld, now_ns, fx, notes);
             }
             if let Some(display) = desktop {
-                push_desktop(s, display, now_ns, fx);
+                push_desktop(s, display, now_ns, fx, notes);
             }
             // Even a lone window goes to the stacking worker: it owns the top,
             // and takes focus back if an un-hide in this switch stole it.
@@ -590,24 +708,17 @@ fn execute(s: &mut State, cmd: Command, now_ns: u64, fx: &mut Vec<Effect>) -> Fo
                 window,
                 target,
             });
-            s.pending.push(PendingOp {
-                op: move_op,
-                expect: Expectation::WindowOn {
+            expect(
+                s,
+                move_op,
+                Expectation::WindowOn {
                     window,
                     workspace: target,
                 },
-                issued_ns: now_ns,
-            });
-            let switch_op = s.mint_op();
-            fx.push(Effect::SwitchWorkspace {
-                op: switch_op,
-                target,
-            });
-            s.pending.push(PendingOp {
-                op: switch_op,
-                expect: Expectation::AllMonitorsOn(target),
-                issued_ns: now_ns,
-            });
+                now_ns,
+                notes,
+            );
+            let switch_op = push_switch(s, target, now_ns, fx, notes);
             // The carried window rides on top. Its assignment is only pending,
             // so the destination's MRU stack does not contain it yet — and a
             // restack headed by a resident sibling makes AppKit key THAT
@@ -632,19 +743,13 @@ fn execute(s: &mut State, cmd: Command, now_ns: u64, fx: &mut Vec<Effect>) -> Fo
             if let Some(vm) = view {
                 push_view(s, vm, now_ns, fx);
             }
-            let op = s.mint_op();
-            fx.push(Effect::FocusWindow { op, window: target });
+            let op = push_focus(s, target, true, now_ns, fx, notes);
             // Warp optimistically off our own belief of the frame rather than
             // waiting for the focus to be observed — a mouse that lags its
             // window by a rescan round-trip feels broken. The mouse follows
             // Ordo-initiated switches only; warping on external focus changes
             // (the user clicking a window!) would fight the pointer.
             fx.push(Effect::WarpMouse { to: center });
-            s.pending.push(PendingOp {
-                op,
-                expect: Expectation::Focused(target),
-                issued_ns: now_ns,
-            });
             if view.is_some() {
                 if let Some(ws) = s.current_workspace() {
                     let mut order = vec![target];
@@ -672,8 +777,7 @@ fn execute(s: &mut State, cmd: Command, now_ns: u64, fx: &mut Vec<Effect>) -> Fo
             if let Some(vm) = view {
                 push_view(s, vm, now_ns, fx);
             }
-            let op = s.mint_op();
-            fx.push(Effect::FocusWindow { op, window: to });
+            let op = push_focus(s, to, true, now_ns, fx, notes);
             fx.push(Effect::WarpMouse { to: center });
             // Bury it visually too, AFTER the focus: restacking raises
             // everything above the demoted window, and raises land below the
@@ -684,11 +788,6 @@ fn execute(s: &mut State, cmd: Command, now_ns: u64, fx: &mut Vec<Effect>) -> Fo
                 let focus_top = order.first() == Some(&to);
                 fx.push(restack(s, order, focus_top));
             }
-            s.pending.push(PendingOp {
-                op,
-                expect: Expectation::Focused(to),
-                issued_ns: now_ns,
-            });
             fx.push(Effect::RequestRescan {
                 reason: RescanTrigger::PostEffect { op },
             });
@@ -768,18 +867,8 @@ fn execute(s: &mut State, cmd: Command, now_ns: u64, fx: &mut Vec<Effect>) -> Fo
             });
             let op = push_view(s, target, now_ns, fx);
             if let Some(fw) = head {
-                let focus = s.mint_op();
-                fx.push(Effect::FocusWindow {
-                    op: focus,
-                    window: fw,
-                });
-                if s.focused != Some(fw) {
-                    s.pending.push(PendingOp {
-                        op: focus,
-                        expect: Expectation::Focused(fw),
-                        issued_ns: now_ns,
-                    });
-                }
+                let unheld = s.focused != Some(fw) || s.declared_focus() != Some(fw);
+                push_focus(s, fw, unheld, now_ns, fx, notes);
                 fx.push(Effect::WarpMouse {
                     to: s.projected_frame_in(&s.windows[&fw], &proj).center(),
                 });
@@ -789,7 +878,7 @@ fn execute(s: &mut State, cmd: Command, now_ns: u64, fx: &mut Vec<Effect>) -> Fo
                 None => s.host_in(target, &proj),
             };
             if let Some(display) = desktop {
-                push_desktop(s, display, now_ns, fx);
+                push_desktop(s, display, now_ns, fx, notes);
                 if let Some(m) = s.monitors.get(&display) {
                     fx.push(Effect::WarpMouse {
                         to: m.frame.center(),
@@ -920,7 +1009,7 @@ pub fn coalesce_hotkeys(s: &State, actions: &[HotkeyAction]) -> Vec<HotkeyAction
     if actions.len() <= 1 {
         return actions.to_vec();
     }
-    let Some(cur) = s.current_workspace() else {
+    let Some(cur) = s.declared_workspace() else {
         return actions.to_vec();
     };
     let mut out = Vec::new();
@@ -1001,6 +1090,7 @@ fn handle_snapshot(
     for p in std::mem::take(&mut s.pending) {
         if expectation_satisfied(&p.expect, s) {
             notes.push(Note::SelfConfirmed { op: p.op });
+            op_ended(s, p.op);
             // The world accepted this placement: this axis's fight is over.
             // Reset only the matching axis so a confirmed workspace move doesn't
             // wipe the budget an in-progress frame fight has accrued.
@@ -1014,6 +1104,7 @@ fn handle_snapshot(
             }
         } else if now_ns.saturating_sub(p.issued_ns) >= EXPECTATION_TTL_NS {
             notes.push(Note::OpLost { op: p.op });
+            op_ended(s, p.op);
             expired.push(p);
         } else {
             still_pending.push(p);
@@ -1259,13 +1350,7 @@ fn handle_snapshot(
                 .current_workspace()
                 .filter(|t| t.0 >= 1 && t.0 <= s.workspace_count);
             if let Some(target) = reachable {
-                let op = s.mint_op();
-                fx.push(Effect::SwitchWorkspace { op, target });
-                s.pending.push(PendingOp {
-                    op,
-                    expect: Expectation::AllMonitorsOn(target),
-                    issued_ns: now_ns,
-                });
+                let op = push_switch(s, target, now_ns, fx, notes);
                 notes.push(Note::TearDetected { target });
                 s.tear_corrections += 1;
                 last_op = Some(op);
@@ -1563,14 +1648,7 @@ fn enforce_focus(
             let target = rec.workspace;
             let mut op = None;
             if target != here {
-                let o = s.mint_op();
-                fx.push(Effect::SwitchWorkspace { op: o, target });
-                s.pending.push(PendingOp {
-                    op: o,
-                    expect: Expectation::AllMonitorsOn(target),
-                    issued_ns: now_ns,
-                });
-                op = Some(o);
+                op = Some(push_switch(s, target, now_ns, fx, notes));
             }
             let mut proj = s.projection();
             let mut monitor = None;
@@ -1652,13 +1730,7 @@ fn enforce_focus(
         return;
     }
     s.focus_corrections += 1;
-    let op = s.mint_op();
-    fx.push(Effect::FocusWindow { op, window: w });
-    s.pending.push(PendingOp {
-        op,
-        expect: Expectation::Focused(w),
-        issued_ns: now_ns,
-    });
+    let op = push_focus(s, w, true, now_ns, fx, notes);
     notes.push(Note::FocusReasserted { window: w });
     *last_op = Some(op);
 }
@@ -1697,7 +1769,7 @@ fn enforce_desktop(
         return;
     }
     s.focus_corrections += 1;
-    let op = push_desktop(s, display, now_ns, fx);
+    let op = push_desktop(s, display, now_ns, fx, notes);
     notes.push(Note::DesktopReasserted { display, from });
     *last_op = Some(op);
 }
@@ -1734,11 +1806,7 @@ fn correct_window(
     let op = s.mint_op();
     let (effect, expect) = build(op);
     fx.push(effect);
-    s.pending.push(PendingOp {
-        op,
-        expect,
-        issued_ns: now_ns,
-    });
+    self::expect(s, op, expect, now_ns, notes);
     if let Some(r) = s.windows.get_mut(&window) {
         match axis {
             CorrectionAxis::Workspace => r.ws_corrections += 1,
@@ -1757,6 +1825,7 @@ fn handle_effect_result(s: &mut State, op: OpId, outcome: &OpOutcome, notes: &mu
     if let Some(i) = s.pending.iter().position(|p| p.op == op) {
         s.pending.remove(i);
     }
+    op_ended(s, op);
     notes.push(Note::OpFailed { op, detail });
 }
 

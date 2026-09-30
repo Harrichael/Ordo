@@ -194,6 +194,9 @@ pub struct ChainStat {
     /// Moves dropped before they were sent, replaced by newer ones for the
     /// same window.
     pub replaced: usize,
+    /// Round trips dropped: a restore and a park of one window, both queued,
+    /// neither sent. Each is one pair, not two moves.
+    pub cancelled: usize,
     pub writes: Vec<(WindowId, WriteStat)>,
     pub show: Option<HoldStat>,
     pub show_done_ms: Option<f64>,
@@ -210,6 +213,7 @@ impl ChainStat {
             moves: 0,
             moves_ms: 0.0,
             replaced: 0,
+            cancelled: 0,
             writes: Vec::new(),
             show: None,
             show_done_ms: None,
@@ -220,7 +224,11 @@ impl ChainStat {
 
     /// Nothing worth a row: only hides or markers ran.
     pub fn is_empty(&self) -> bool {
-        self.moves == 0 && self.replaced == 0 && self.show.is_none() && self.focus.is_none()
+        self.moves == 0
+            && self.replaced == 0
+            && self.cancelled == 0
+            && self.show.is_none()
+            && self.focus.is_none()
     }
 }
 

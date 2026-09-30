@@ -356,34 +356,29 @@ pub fn focus(target: WindowId) -> bool {
 }
 
 unsafe fn focus_element(pid: i32, target: WindowId, win: &AXUIElement) {
-    let mut psn = sys::ProcessSerialNumber::default();
-    if sys::GetProcessForPID(pid, &mut psn) == 0 {
-        let _ = sys::SLPSSetFrontProcessWithOptions(&psn, target.0, sys::kCPSUserGenerated);
-        make_key_window(&psn, target.0);
+    front_process(pid, target.0);
+    make_element_key(win);
+}
+
+/// The window server half of a focus: this app in front, with this window
+/// key. Works for any window of the app, the desktop included.
+fn front_process(pid: i32, window: u32) {
+    unsafe {
+        let mut psn = sys::ProcessSerialNumber::default();
+        if sys::GetProcessForPID(pid, &mut psn) == 0 {
+            let _ = sys::SLPSSetFrontProcessWithOptions(&psn, window, sys::kCPSUserGenerated);
+            make_key_window(&psn, window);
+        }
     }
+}
+
+/// The Accessibility half: the app's own idea of its main and focused
+/// window, and the window raised.
+unsafe fn make_element_key(win: &AXUIElement) {
     set_bool(win, "AXMain", true);
     set_bool(win, "AXFocused", true);
     let raise = CFString::from_str("AXRaise");
     let _ = win.perform_action(&raise);
-}
-
-/// Key the desktop of the display at `display`, the way a click on empty
-/// desktop does: the desktop window's owner (Finder) comes frontmost with that
-/// window key, by the same private handoff as [`focus`]. The desktop is no AX
-/// window, so there is nothing to raise.
-pub fn focus_desktop(display: Rect) -> bool {
-    let Some((wid, pid)) = super::zorder::desktop_window_on(display) else {
-        return false;
-    };
-    unsafe {
-        let mut psn = sys::ProcessSerialNumber::default();
-        if sys::GetProcessForPID(pid, &mut psn) != 0 {
-            return false;
-        }
-        let _ = sys::SLPSSetFrontProcessWithOptions(&psn, wid, sys::kCPSUserGenerated);
-        make_key_window(&psn, wid);
-    }
-    true
 }
 
 /// Raise `target` in the global z-order without touching focus or app
@@ -920,12 +915,22 @@ impl crate::app_queue::AppSession for AxApp {
         unsafe { set_bool(&self.el, "AXHidden", true) };
     }
 
-    fn focus(&mut self, window: WindowId) -> bool {
-        let Some(win) = self.element(window).0 else {
-            return false;
-        };
-        unsafe { focus_element(self.pid, window, &*win) };
-        true
+    fn find(&mut self, window: WindowId) -> bool {
+        self.element(window).0.is_some()
+    }
+
+    fn front(&mut self, window: WindowId) {
+        front_process(self.pid, window.0);
+    }
+
+    fn make_key(&mut self, window: WindowId) {
+        if let Some(win) = self.element(window).0 {
+            unsafe { make_element_key(&*win) };
+        }
+    }
+
+    fn front_desktop(&mut self, window: u32) {
+        front_process(self.pid, window);
     }
 }
 

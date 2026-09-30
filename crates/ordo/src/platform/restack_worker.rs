@@ -34,7 +34,7 @@ use crossbeam_channel::Sender;
 use ordo_core::WindowId;
 
 use super::ws_events::{RaiseSignals, WaitOutcome};
-use crate::app_queue::Landing;
+use crate::app_queue::{AppQueues, Landing};
 use crate::engine::Msg;
 
 /// How long a converged reassert stays listening for a late landing. Covers
@@ -65,6 +65,9 @@ struct Job {
     /// The switch's writes to the apps of `order`; raises only mean
     /// something once the windows are where they are going and showing.
     landing: Landing,
+    /// The newest focus when this order was decided: a take-back on its
+    /// behalf is dropped once a newer one has been asked for.
+    focus_gen: u64,
 }
 
 #[derive(Clone)]
@@ -79,6 +82,7 @@ impl RestackHandle {
         attached: Vec<(WindowId, WindowId)>,
         focus_top: bool,
         landing: Landing,
+        focus_gen: u64,
     ) {
         let generation = self.shared.generation.fetch_add(1, Ordering::SeqCst) + 1;
         let mut slot = self.shared.slot.lock().unwrap();
@@ -88,6 +92,7 @@ impl RestackHandle {
             attached,
             focus_top,
             landing,
+            focus_gen,
         });
         self.shared.wake.notify_one();
     }
@@ -103,7 +108,7 @@ impl RestackHandle {
 /// contract as the tap thread). AX and CG calls are plain Mach IPC and safe
 /// off the main thread — the reassert builds its own elements per pass and
 /// holds nothing between passes.
-pub fn spawn(tx: Sender<Msg>, signals: Arc<RaiseSignals>) -> RestackHandle {
+pub fn spawn(tx: Sender<Msg>, signals: Arc<RaiseSignals>, queues: AppQueues) -> RestackHandle {
     let shared = Arc::new(Shared {
         generation: AtomicU64::new(0),
         slot: Mutex::new(None),
@@ -124,6 +129,7 @@ pub fn spawn(tx: Sender<Msg>, signals: Arc<RaiseSignals>) -> RestackHandle {
                 attached,
                 focus_top,
                 landing,
+                focus_gen,
             } = {
                 let mut slot = shared.slot.lock().unwrap();
                 loop {
@@ -134,6 +140,10 @@ pub fn spawn(tx: Sender<Msg>, signals: Arc<RaiseSignals>) -> RestackHandle {
                 }
             };
             let cancel = || shared.generation.load(Ordering::SeqCst) != generation;
+            let focus = |w: WindowId| {
+                super::zorder::owner_of(w)
+                    .is_some_and(|pid| queues.focus_if_current(ordo_core::Pid(pid), w, focus_gen))
+            };
             let waited = Instant::now();
             landing.wait(waited + LANDING_WAIT, &cancel);
             let landing_wait_ms = waited.elapsed().as_millis() as u64;
@@ -143,6 +153,7 @@ pub fn spawn(tx: Sender<Msg>, signals: Arc<RaiseSignals>) -> RestackHandle {
                 focus_top,
                 &cancel,
                 Some(&signals),
+                &focus,
             );
             if let Some(s) = &mut stats {
                 s.landing_wait_ms = landing_wait_ms;
@@ -187,6 +198,7 @@ pub fn spawn(tx: Sender<Msg>, signals: Arc<RaiseSignals>) -> RestackHandle {
                             false,
                             &cancel,
                             Some(&signals),
+                            &focus,
                         ) {
                             stats.ghost_pass = true;
                             if tx.send(Msg::RestackStats(stats)).is_err() {

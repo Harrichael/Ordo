@@ -52,12 +52,12 @@ fn main() {
     // core always focuses it before restacking (a key window inside the rest
     // of the order would be physically impossible to stack under).
     ax::focus(reversed[0]);
-    let stats = zorder::reassert_stack(&reversed, &[], false, &|| false, None);
+    let stats = zorder::reassert_stack(&reversed, &[], false, &|| false, None, &ordo::platform::ax::focus);
     println!("\nreverse stats: {stats:#?}");
     let ok1 = check("reversed", &reversed);
 
     ax::focus(original[0]);
-    let stats = zorder::reassert_stack(&original, &[], false, &|| false, None);
+    let stats = zorder::reassert_stack(&original, &[], false, &|| false, None, &ordo::platform::ax::focus);
     println!("\nrestore stats: {stats:#?}");
     let ok2 = check("restored", &original);
 

@@ -97,6 +97,11 @@ pub trait Desktop {
     /// stays what the screen shows; this is what says whether to trust it.
     fn in_flight(&self, window: WindowId) -> bool;
 
+    /// Whether writes already asked for are still being carried out. A burst
+    /// keeps this true, and the deferred hides wait it out rather than hide
+    /// an app that the switch still coming may show again.
+    fn busy(&self) -> bool;
+
     /// Hide an app, the Cmd+H way. Fire-and-forget: the hide itself needs no
     /// confirming, and like a move it may land after this returns.
     fn hide_app(&self, pid: Pid);

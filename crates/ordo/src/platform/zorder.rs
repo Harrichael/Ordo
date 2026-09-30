@@ -363,6 +363,9 @@ pub fn read_stack(out: &mut Vec<Seen>) {
 /// a sibling of the key window raises ABOVE it, and raising the key window
 /// again freezes the siblings beneath it.
 ///
+/// `focus` makes a window key: through the apps' queues for the worker, so a
+/// take-back can't land after a newer focus; straight to the app for probes.
+///
 /// `signals`, when present, is the WindowServer's push stream (808/815): a
 /// gate sleeps until a hint instead of a fixed tick, and wakes read back
 /// exactly as before — events cut the latency between a landing and our
@@ -374,10 +377,12 @@ pub fn reassert_stack(
     focus_top: bool,
     cancel: &dyn Fn() -> bool,
     signals: Option<&RaiseSignals>,
+    focus: &dyn Fn(WindowId) -> bool,
 ) -> Option<RestackStats> {
     let mut live = Live {
         gate: Gate::new(signals),
         raiser: ax::Raiser::default(),
+        focus,
     };
     restack::reassert(&mut live, desired, attached, focus_top, cancel)
 }
@@ -385,6 +390,7 @@ pub fn reassert_stack(
 struct Live<'a> {
     gate: Gate<'a>,
     raiser: ax::Raiser,
+    focus: &'a dyn Fn(WindowId) -> bool,
 }
 
 impl WindowServer for Live<'_> {
@@ -412,7 +418,7 @@ impl WindowServer for Live<'_> {
     }
 
     fn focus(&mut self, w: WindowId) -> bool {
-        ax::focus(w)
+        (self.focus)(w)
     }
 
     fn raise(&mut self, w: WindowId, pid: i32) -> bool {

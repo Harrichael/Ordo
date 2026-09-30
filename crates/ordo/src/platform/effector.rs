@@ -16,7 +16,7 @@ use crate::app_queue::AppQueues;
 use crate::ports::Effector;
 
 use super::restack_worker::RestackHandle;
-use super::{ax, display, mouse, zorder, SharedBackend};
+use super::{display, mouse, zorder, SharedBackend};
 
 pub struct MacEffector {
     backend: SharedBackend,
@@ -55,6 +55,10 @@ impl Effector for MacEffector {
     }
 
     fn note_app_visibility(&mut self, pid: Pid, hidden: bool) {
+        // An app shown, by Ordo or by itself, has re-homed its windows.
+        if !hidden {
+            self.queues.forget_landed(pid);
+        }
         self.backend.borrow_mut().note_app_visibility(pid, hidden);
     }
 
@@ -82,12 +86,20 @@ impl Effector for MacEffector {
                 Some(found_outcome(owner.is_some(), "focus: window not found"))
             }
             Effect::FocusDesktop { display, .. } => {
-                let frame = display::active_displays()
+                let desktop = display::active_displays()
                     .into_iter()
                     .find(|d| d.id == *display)
-                    .map(|d| d.frame);
+                    .and_then(|d| zorder::desktop_window_on(d.frame));
+                if let Some((wid, pid)) = desktop {
+                    // Fronting Finder un-hides it: its parked windows are
+                    // held through that first, on its own queue.
+                    if let Some(hold) = self.backend.borrow_mut().reveal_for_focus(Pid(pid)) {
+                        self.queues.show(Pid(pid), hold);
+                    }
+                    self.queues.focus_desktop(Pid(pid), wid);
+                }
                 Some(found_outcome(
-                    frame.is_some_and(ax::focus_desktop),
+                    desktop.is_some(),
                     "focus_desktop: no desktop window on that display",
                 ))
             }
@@ -144,8 +156,13 @@ impl Effector for MacEffector {
                 apps.sort_by_key(|p| p.0);
                 apps.dedup();
                 let landing = self.queues.marker(&apps);
-                self.restack
-                    .submit(order.clone(), attached.clone(), *focus_top, landing);
+                self.restack.submit(
+                    order.clone(),
+                    attached.clone(),
+                    *focus_top,
+                    landing,
+                    self.queues.focus_generation(),
+                );
                 None
             }
             Effect::SetIntercepting { enabled } => {

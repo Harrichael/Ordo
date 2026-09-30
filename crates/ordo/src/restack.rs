@@ -291,6 +291,8 @@ pub trait WindowServer {
     fn is_key(&mut self, w: WindowId, pid: i32) -> bool;
     /// The key window, whichever app holds it: asks every app.
     fn focused_window(&mut self) -> Option<WindowId>;
+    /// Ask for `w` to be made key; whether that was asked. It may land
+    /// later, which the handoff wait below allows for.
     fn focus(&mut self, w: WindowId) -> bool;
     /// Issue a raise. Its landing is only ever confirmed by a later read.
     fn raise(&mut self, w: WindowId, pid: i32) -> bool;
@@ -483,7 +485,8 @@ pub fn reassert(
         );
     }
     // An activation that landed late is taken back here rather than left for
-    // the core's focus expectation to time out.
+    // the core's focus expectation to time out: asked for, and counted in
+    // `refocused`, though it lands after this returns.
     refocused += take_focus(ws);
 
     if layout.len() <= 1 && refocused == 0 {

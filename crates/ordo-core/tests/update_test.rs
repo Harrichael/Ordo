@@ -586,6 +586,127 @@ fn workspace_next_switches_and_prev_clamps_at_the_edge() {
     assert!(clamped.effects.is_empty(), "already at workspace 1");
 }
 
+/// A burst runs faster than the looks that confirm each switch. Every
+/// "next" steps from where the last press went, not from the workspace the
+/// last look saw, or the burst would switch to workspace 2 over and over.
+#[test]
+fn a_burst_steps_from_each_unconfirmed_switch() {
+    let mut s = booted(&[1]);
+    let mut targets = Vec::new();
+    for press in [
+        HotkeyAction::WorkspaceNext,
+        HotkeyAction::WorkspaceNext,
+        HotkeyAction::WorkspacePrev,
+    ] {
+        let step = update(&s, &hotkey(press));
+        targets.extend(step.effects.iter().filter_map(|e| match e {
+            Effect::SwitchWorkspace { target, .. } => Some(*target),
+            _ => None,
+        }));
+        s = step.state;
+    }
+    assert_eq!(targets, [ws(2), ws(3), ws(2)]);
+}
+
+/// A look can confirm the newest switch of a burst while older ones are
+/// still waiting to be seen. They never will be: the newest one superseded
+/// them. The next press steps from where the user is, not from a switch
+/// already overtaken (run 48: five "previous" presses in a row went nowhere).
+#[test]
+fn a_press_after_a_look_confirms_the_burst_steps_from_where_it_landed() {
+    let s = booted(&[1]);
+    let first = update(&s, &hotkey(HotkeyAction::WorkspaceNext));
+    let second = update(&first.state, &hotkey(HotkeyAction::WorkspaceNext));
+    let mut on_3 = std_windows();
+    for w in &mut on_3 {
+        w.workspace = ws(3);
+    }
+    let seen = update(
+        &second.state,
+        &observed(vec![mon_a(3), mon_b(3)], on_3, Some(1), RescanTrigger::Periodic),
+    );
+    let back = update(&seen.state, &hotkey(HotkeyAction::WorkspacePrev));
+    let targets: Vec<WorkspaceId> = back
+        .effects
+        .iter()
+        .filter_map(|e| match e {
+            Effect::SwitchWorkspace { target, .. } => Some(*target),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(targets, [ws(2)]);
+}
+
+/// The carry twin: a look confirms the second of two carries while the
+/// first still waits. The window is where the second carry took it.
+#[test]
+fn a_carry_after_a_look_confirms_two_carries_steps_from_where_they_landed() {
+    let s = booted(&[1]);
+    let first = update(&s, &hotkey(HotkeyAction::CarryFocusedToWorkspaceNext));
+    let second = update(&first.state, &hotkey(HotkeyAction::CarryFocusedToWorkspaceNext));
+    let mut wins = std_windows();
+    wins[0].workspace = ws(3);
+    let seen = update(
+        &second.state,
+        &observed(vec![mon_a(3), mon_b(3)], wins, Some(1), RescanTrigger::Periodic),
+    );
+    let back = update(&seen.state, &hotkey(HotkeyAction::CarryFocusedToWorkspacePrev));
+    let moved: Vec<WorkspaceId> = back
+        .effects
+        .iter()
+        .filter_map(|e| match e {
+            Effect::AssignWindowToWorkspace { window, target, .. } if *window == wid(1) => {
+                Some(*target)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(moved, [ws(2)]);
+}
+
+/// Carrying a window on before the first carry is confirmed: it is still
+/// the window the user has with them.
+#[test]
+fn a_second_carry_before_the_first_is_confirmed_carries_the_window_on() {
+    let s = booted(&[1]);
+    let first = update(&s, &hotkey(HotkeyAction::CarryFocusedToWorkspaceNext));
+    let second = update(&first.state, &hotkey(HotkeyAction::CarryFocusedToWorkspaceNext));
+    let moved: Vec<WorkspaceId> = second
+        .effects
+        .iter()
+        .filter_map(|e| match e {
+            Effect::AssignWindowToWorkspace { window, target, .. } if *window == wid(1) => {
+                Some(*target)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(moved, [ws(3)]);
+}
+
+/// Out and straight back, before any look: the seen focus is still on the
+/// window the second switch returns to, but a grant elsewhere was issued in
+/// between. The return's grant must be expected, or the look that shows it
+/// landing reads as someone else moving focus.
+#[test]
+fn a_quick_return_still_expects_its_own_focus_grant() {
+    let mut wins = std_windows();
+    wins[1].workspace = ws(2);
+    let s = update(
+        &booted(&[2, 1]),
+        &observed(vec![mon_a(1), mon_b(1)], wins, Some(1), RescanTrigger::Periodic),
+    )
+    .state;
+    let out = update(&s, &hotkey(HotkeyAction::WorkspaceNext));
+    let back = update(&out.state, &hotkey(HotkeyAction::WorkspacePrev));
+    assert_eq!(focus_targets(&back.effects), vec![wid(1)]);
+    assert!(back
+        .state
+        .pending
+        .iter()
+        .any(|p| p.expect == Expectation::Focused(wid(1))));
+}
+
 #[test]
 fn switching_to_an_empty_workspace_gives_focus_to_the_desktop_and_holds_it() {
     // The sliver on workspace 7: switching away from Chrome to an empty

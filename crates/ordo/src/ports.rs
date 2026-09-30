@@ -8,8 +8,20 @@
 
 use std::time::Duration;
 
-use ordo_core::{Effect, OpOutcome, Pid, Rect, WindowId, WorldSnapshot};
+use ordo_core::{Effect, OpOutcome, Pid, Rect, RescanTrigger, WindowId, WorldSnapshot};
 use ordo_emulated::ParkTrace;
+
+/// Where the engine sends a look at the screen it shouldn't take yet. An
+/// Accessibility read waits behind every write already sent to that app, so
+/// a look taken while the apps are busy with Ordo's own writes costs as long
+/// as the writes themselves.
+pub trait LookGate {
+    /// Whether the apps have nothing of Ordo's in hand.
+    fn idle(&self) -> bool;
+    /// Hand this look back, to be asked for again once they have, or at
+    /// `until` whatever they're doing.
+    fn defer(&self, trigger: RescanTrigger, until: std::time::Instant);
+}
 
 /// Produces a full observation of the world on demand. The engine never trusts
 /// incremental hints — a hint only prompts a call to this.

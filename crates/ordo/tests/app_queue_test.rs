@@ -78,7 +78,18 @@ impl World {
 
     fn reached(&self, pid: Pid) -> Vec<String> {
         let log = self.log.lock().unwrap();
-        log.iter().filter(|(p, _)| *p == pid).map(|(_, s)| s.clone()).collect()
+        log.iter()
+            .filter(|(p, s)| *p == pid && !s.starts_with("fronted"))
+            .map(|(_, s)| s.clone())
+            .collect()
+    }
+
+    /// Where in the whole log, across apps, this entry of this app first is.
+    fn when(&self, pid: Pid, what: &str) -> usize {
+        let log = self.log.lock().unwrap();
+        log.iter()
+            .position(|(p, s)| *p == pid && s == what)
+            .unwrap_or_else(|| panic!("{pid:?} never saw {what}"))
     }
 
     /// Wait until the app has started on something, so what is queued next
@@ -157,9 +168,19 @@ impl AppSession for FakeApp {
         self.arrive("hide".into());
     }
 
-    fn focus(&mut self, window: WindowId) -> bool {
-        self.arrive(format!("focus {}", window.0));
+    fn find(&mut self, _window: WindowId) -> bool {
         true
+    }
+
+    fn front(&mut self, window: WindowId) {
+        self.arrive(format!("focus {}", window.0));
+        self.world.log.lock().unwrap().push((self.pid, format!("fronted {}", window.0)));
+    }
+
+    fn make_key(&mut self, _window: WindowId) {}
+
+    fn front_desktop(&mut self, window: u32) {
+        self.arrive(format!("desktop {window}"));
     }
 }
 
@@ -205,6 +226,7 @@ fn a_slow_app_does_not_hold_up_another() {
     world.close(A);
     q.move_windows(&restores(&[(A, w(1), at(1.0)), (A, w(2), at(2.0)), (B, w(4), at(4.0))]));
     landed(&q, &[B]);
+    world.busy(A);
     assert_eq!(world.reached(B), ["move 4 to 4"]);
     assert_eq!(world.reached(A), ["move 1 to 1"], "A is still on its first write");
     world.open(A);
@@ -408,4 +430,223 @@ fn an_unsent_unhide_holds_what_is_parked_by_the_time_it_runs() {
         world.reached(A),
         ["hide", "show holding [1]", "move 1 to -900", "move 3 to 300"]
     );
+}
+
+/// Passing a workspace queues a restore of its window, and passing the next
+/// queues its park. If the window's last write is known to have put it at
+/// that park, neither needs making.
+#[test]
+fn a_restore_and_park_before_either_is_sent_cancel() {
+    let (q, world) = queues();
+    q.move_windows(&[park(A, w(1), -900.0)]);
+    landed(&q, &[A]);
+    world.close(A);
+    q.hide(A);
+    world.busy(A);
+    q.move_windows(&restores(&[(A, w(1), at(100.0))]));
+    q.move_windows(&[park(A, w(1), -900.0)]);
+    world.open(A);
+    landed(&q, &[A]);
+    assert_eq!(world.reached(A), ["move 1 to -900", "hide"]);
+    assert!(!q.in_flight(w(1), Instant::now()));
+    let cancelled: usize = q.take_chains().iter().map(|c| c.cancelled).sum();
+    assert_eq!(cancelled, 1);
+}
+
+/// An un-hide re-homes windows without telling us, so after one the queue no
+/// longer knows where a window it didn't hold is, and a round trip back to
+/// its old spot is written after all.
+#[test]
+fn after_an_unhide_a_round_trip_is_written() {
+    let (q, world) = queues();
+    q.move_windows(&[park(A, w(1), -900.0)]);
+    q.show(A, Vec::new());
+    landed(&q, &[A]);
+    world.close(A);
+    q.hide(A);
+    world.busy(A);
+    q.move_windows(&restores(&[(A, w(1), at(100.0))]));
+    q.move_windows(&[park(A, w(1), -900.0)]);
+    world.open(A);
+    landed(&q, &[A]);
+    assert_eq!(
+        world.reached(A),
+        ["move 1 to -900", "show holding []", "hide", "move 1 to -900"]
+    );
+}
+
+/// A move to where the window already is, with nothing to replace, may be
+/// putting back a window the app moved itself: it is always made.
+#[test]
+fn a_move_with_nothing_to_replace_is_always_made() {
+    let (q, world) = queues();
+    q.move_windows(&[park(A, w(1), -900.0)]);
+    landed(&q, &[A]);
+    q.move_windows(&[park(A, w(1), -900.0)]);
+    landed(&q, &[A]);
+    assert_eq!(world.reached(A), ["move 1 to -900", "move 1 to -900"]);
+}
+
+/// A focus goes after its app's un-hide still to come, and after its own
+/// window's move, but ahead of the app's other moves.
+#[test]
+fn a_focus_goes_as_early_as_is_safe() {
+    let (q, world) = queues();
+    world.close(A);
+    q.hide(A);
+    world.busy(A);
+    q.move_windows(&restores(&[(A, w(1), at(1.0)), (A, w(2), at(2.0))]));
+    q.focus(A, w(1));
+    world.open(A);
+    landed(&q, &[A]);
+    assert_eq!(world.reached(A), ["hide", "move 1 to 1", "focus 1", "move 2 to 2"]);
+
+    let (q, world) = queues();
+    world.close(A);
+    q.hide(A);
+    world.busy(A);
+    q.move_windows(&restores(&[(A, w(2), at(3.0))]));
+    q.show(A, Vec::new());
+    q.move_windows(&restores(&[(A, w(3), at(4.0))]));
+    q.focus(A, w(1));
+    world.open(A);
+    landed(&q, &[A]);
+    assert_eq!(
+        world.reached(A),
+        ["hide", "move 2 to 3", "show holding []", "focus 1", "move 3 to 4"]
+    );
+}
+
+/// Two apps, two focuses: the second is not fronted until the first is,
+/// or the first could land last and win.
+#[test]
+fn focuses_on_two_apps_are_fronted_in_the_order_asked() {
+    let (q, world) = queues();
+    world.close(A);
+    q.focus(A, w(1));
+    world.busy(A);
+    q.focus(B, w(2));
+    std::thread::sleep(Duration::from_millis(20));
+    world.open(A);
+    landed(&q, &[A, B]);
+    // B's focus, asked for later, overtook A's while A's was being made:
+    // A's still finishes fronting first, and B's comes after it.
+    assert!(world.when(A, "fronted 1") < world.when(B, "focus 2"));
+}
+
+/// A take-back decided before a newer focus was asked for is dropped.
+#[test]
+fn a_focus_decided_before_a_newer_one_is_dropped() {
+    let (q, world) = queues();
+    let gen = q.focus_generation();
+    q.focus(B, w(2));
+    assert!(!q.focus_if_current(A, w(1), gen));
+    landed(&q, &[A, B]);
+    assert!(world.reached(A).is_empty());
+    let gen = q.focus_generation();
+    assert!(q.focus_if_current(A, w(1), gen));
+    landed(&q, &[A]);
+    assert_eq!(world.reached(A), ["focus 1"]);
+}
+
+/// The desktop is a focus like any other: an older window focus still
+/// queued doesn't land after it.
+#[test]
+fn a_desktop_focus_overtakes_an_older_window_focus() {
+    let (q, world) = queues();
+    world.close(A);
+    q.hide(A);
+    world.busy(A);
+    q.focus(A, w(1));
+    q.focus_desktop(B, 77);
+    world.open(A);
+    landed(&q, &[A, B]);
+    assert_eq!(world.reached(A), ["hide"]);
+    assert_eq!(world.reached(B), ["desktop 77"]);
+}
+
+#[test]
+fn idle_is_every_queue_drained() {
+    let (q, world) = queues();
+    assert!(q.idle());
+    world.close(A);
+    q.move_windows(&restores(&[(A, w(1), at(1.0))]));
+    assert!(!q.wait_idle(Instant::now() + Duration::from_millis(20)));
+    world.open(A);
+    assert!(q.wait_idle(Instant::now() + Duration::from_secs(2)));
+}
+
+/// A burst cancels round trips on the engine's thread while the app's own
+/// thread is recording its writes landing. Neither may wait on the other.
+#[test]
+fn cancelling_while_writes_land_never_deadlocks() {
+    let (q, _world) = queues();
+    q.move_windows(&[park(A, w(1), -900.0)]);
+    landed(&q, &[A]);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let burst = q.clone();
+    std::thread::spawn(move || {
+        for i in 0..20_000 {
+            // Writes to other windows keep the app's thread recording
+            // landings, taking the record, while the round trip is cancelled.
+            burst.move_windows(&restores(&[(A, w(2 + i % 3), at(i as f64))]));
+            burst.move_windows(&restores(&[(A, w(1), at(100.0))]));
+            burst.move_windows(&[park(A, w(1), -900.0)]);
+        }
+        let drained = burst
+            .marker(&[A])
+            .wait(Instant::now() + Duration::from_secs(5), &|| false);
+        let _ = tx.send(drained);
+    });
+    assert_eq!(rx.recv_timeout(Duration::from_secs(10)), Ok(true), "deadlocked");
+}
+
+/// A hide decided before the app was wanted in front would fling the focus
+/// away: a focus drops it.
+#[test]
+fn a_focus_drops_a_hide_of_its_app_still_to_come() {
+    let (q, world) = queues();
+    world.close(A);
+    q.move_windows(&restores(&[(A, w(9), at(9.0))]));
+    world.busy(A);
+    q.hide(A);
+    q.focus(A, w(1));
+    world.open(A);
+    landed(&q, &[A]);
+    assert_eq!(world.reached(A), ["move 9 to 9", "focus 1"]);
+}
+
+/// A frame the core asked for is waited on by the core: a round trip made
+/// of it and a move is not cancelled.
+#[test]
+fn a_frame_is_never_cancelled_as_half_of_a_round_trip() {
+    let (q, world) = queues();
+    q.move_windows(&[park(A, w(1), -900.0)]);
+    landed(&q, &[A]);
+    world.close(A);
+    q.hide(A);
+    world.busy(A);
+    q.set_frame(A, w(1), Rect { x: 50.0, y: 0.0, w: 10.0, h: 10.0 });
+    q.move_windows(&[park(A, w(1), -900.0)]);
+    world.open(A);
+    landed(&q, &[A]);
+    assert_eq!(world.reached(A)[1..], ["hide", "move 1 to -900"]);
+}
+
+/// An app that shows itself has re-homed its windows: where Ordo last put
+/// them is no longer known, and a round trip is written after all.
+#[test]
+fn after_an_app_shows_itself_a_round_trip_is_written() {
+    let (q, world) = queues();
+    q.move_windows(&[park(A, w(1), -900.0)]);
+    landed(&q, &[A]);
+    q.forget_landed(A);
+    world.close(A);
+    q.hide(A);
+    world.busy(A);
+    q.move_windows(&restores(&[(A, w(1), at(100.0))]));
+    q.move_windows(&[park(A, w(1), -900.0)]);
+    world.open(A);
+    landed(&q, &[A]);
+    assert_eq!(world.reached(A)[1..], ["hide", "move 1 to -900"]);
 }

@@ -13,10 +13,14 @@
 //! An effect that asks to look again ([`Effect::RequestRescan`]) is answered by
 //! this thread taking a fresh snapshot and feeding it back as the next thing to
 //! process, so the reaction to one external event is a single synchronous,
-//! testable cascade rather than a race across threads.
+//! testable cascade rather than a race across threads. The exception is a
+//! look asked for while the apps are still busy with Ordo's writes: every
+//! read would wait behind them, so it is handed to a [`LookGate`] and comes
+//! back as an ordinary rescan once they are done, or after [`LOOK_BOUND`].
+//! Presses meanwhile resolve against the workspace the core declared.
 
 use std::collections::VecDeque;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::Receiver;
 use ordo_core::{
@@ -26,7 +30,12 @@ use ordo_core::{
 
 use crate::clock::Clock;
 use crate::logger::{HotkeyBatch, Logger};
-use crate::ports::{Effector, RestackStats, SnapshotStats, WorldSource};
+use crate::ports::{Effector, LookGate, RestackStats, SnapshotStats, WorldSource};
+
+/// The longest a look is held back while the apps are busy. Bounds how stale
+/// the core's picture of frames and focus can get during a burst, and keeps
+/// an app that never goes idle from holding off every look.
+pub const LOOK_BOUND: Duration = Duration::from_millis(250);
 
 /// What the outside world sends the engine. Producers (the tap thread, the
 /// periodic timer, later the AX observer and the rescue signal) speak this;
@@ -147,6 +156,13 @@ pub struct Engine {
     /// snapshot taken mid-cascade has no sequence number until its event is
     /// logged, and events leave the queue in the order they entered it.
     snapshot_costs: VecDeque<Option<SnapshotStats>>,
+    gate: Option<Box<dyn LookGate>>,
+    /// When the oldest look still held back was first asked for.
+    held_since: Option<Instant>,
+    /// A gesture has been pumped since the last look. Its look is not held:
+    /// the core reads a gesture on the very next look, and a press in the
+    /// meantime would clear it.
+    gesture_unseen: bool,
 }
 
 type StateWatcher = Box<dyn FnMut(&State)>;
@@ -166,7 +182,53 @@ impl Engine {
             clock,
             on_state: None,
             snapshot_costs: VecDeque::new(),
+            gate: None,
+            held_since: None,
+            gesture_unseen: false,
         }
+    }
+
+    /// Hold looks back while the apps are busy with Ordo's writes, rather
+    /// than take them into apps that answer only once those writes are done.
+    pub fn with_look_gate(mut self, gate: Box<dyn LookGate>) -> Self {
+        self.gate = Some(gate);
+        self
+    }
+
+    /// Whether a look asked for now should be held back instead.
+    fn look_must_wait(&mut self) -> bool {
+        let Some(gate) = &self.gate else {
+            return false;
+        };
+        if self.gesture_unseen || gate.idle() {
+            return false;
+        }
+        let since = *self.held_since.get_or_insert_with(Instant::now);
+        since.elapsed() < LOOK_BOUND
+    }
+
+    fn looked(&mut self) {
+        self.held_since = None;
+        self.gesture_unseen = false;
+    }
+
+    /// A look asked for from outside: taken now, or held back until the apps
+    /// are idle (see [`LookGate`]).
+    fn look(&mut self, trigger: RescanTrigger) {
+        if !self.hold_look(trigger.clone()) {
+            self.observe(trigger);
+        }
+    }
+
+    /// Hand the look to the gate if it must wait; whether it was.
+    fn hold_look(&mut self, trigger: RescanTrigger) -> bool {
+        if !self.look_must_wait() {
+            return false;
+        }
+        if let (Some(gate), Some(since)) = (&self.gate, self.held_since) {
+            gate.defer(trigger, since + LOOK_BOUND);
+        }
+        true
     }
 
     /// Hand the state to `f` whenever a batch of messages has been fully
@@ -204,6 +266,7 @@ impl Engine {
     /// originate here (or from a `RequestRescan` cascade) — never from an
     /// external producer, which cannot touch the thread-affine world source.
     pub fn observe(&mut self, trigger: RescanTrigger) {
+        self.looked();
         let snap = self.world.snapshot();
         self.drain_park_trace();
         let cost = self.world.take_snapshot_stats();
@@ -266,11 +329,14 @@ impl Engine {
                     other => {
                         self.flush_hotkeys(&mut hotkeys);
                         match other {
-                            Msg::Rescan(trigger) => self.observe(trigger),
-                            Msg::Gesture(gesture) => self.pump(Event::Gesture {
-                                at: self.clock.now(),
-                                gesture,
-                            }),
+                            Msg::Rescan(trigger) => self.look(trigger),
+                            Msg::Gesture(gesture) => {
+                                self.gesture_unseen = true;
+                                self.pump(Event::Gesture {
+                                    at: self.clock.now(),
+                                    gesture,
+                                })
+                            }
                             Msg::Rescue => self.pump(Event::RescueEngaged {
                                 at: self.clock.now(),
                             }),
@@ -389,6 +455,10 @@ impl Engine {
             // even in observe mode. The fresh snapshot re-enters as the next
             // event, keeping the cascade single-threaded.
             Effect::RequestRescan { reason } => {
+                if self.hold_look(reason.clone()) {
+                    return;
+                }
+                self.looked();
                 let snap = self.world.snapshot();
                 self.drain_park_trace();
                 let cost = self.world.take_snapshot_stats();

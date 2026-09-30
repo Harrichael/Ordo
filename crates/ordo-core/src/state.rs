@@ -207,6 +207,12 @@ pub struct State {
     #[serde(default)]
     pub(crate) vanished: BTreeMap<WindowId, u64>,
     pub pending: Vec<PendingOp>,
+    /// The workspace the newest switch Ordo issued is taking the user to, and
+    /// that switch's op. Intent, not bookkeeping: it lives exactly as long as
+    /// its op, and ends when the op is confirmed, fails, is lost, or a newer
+    /// switch replaces it. See [`State::declared_workspace`].
+    #[serde(default)]
+    pub(crate) workspace_intent: Option<(OpId, WorkspaceId)>,
     /// Damping for tear re-alignment, mirroring `WindowRecord::corrections`.
     pub tear_corrections: u8,
     /// OpId counter. Lives in State — not a global — so `update` stays pure
@@ -234,6 +240,7 @@ impl State {
             moving: BTreeSet::new(),
             vanished: BTreeMap::new(),
             pending: Vec::new(),
+            workspace_intent: None,
             tear_corrections: 0,
             next_op: 0,
         }
@@ -308,6 +315,33 @@ impl State {
             FocusIntent::Desktop => None,
             _ => self.focus_target().or(self.focused),
         }
+    }
+
+    /// The workspace Ordo is taking the user to, while the switch it issued
+    /// is under way, else the one observed. A burst of presses runs faster
+    /// than the looks that confirm each switch, and "next" must step from
+    /// where the last press went, not from where the last look was taken.
+    pub fn declared_workspace(&self) -> Option<WorkspaceId> {
+        self.workspace_intent
+            .map(|(_, ws)| ws)
+            .or_else(|| self.current_workspace())
+    }
+
+    /// The workspace a window is being moved to, while that move is
+    /// unconfirmed, else the one it was seen on. `declared_workspace`'s
+    /// counterpart for one window, read from `pending` rather than a field of
+    /// its own: the assignment itself is the backend's word, which every
+    /// snapshot carries back, so the pending move only bridges the gap until
+    /// it does, and at most one move per window is ever pending.
+    pub fn declared_workspace_of(&self, window: WindowId) -> Option<WorkspaceId> {
+        self.pending
+            .iter()
+            .rev()
+            .find_map(|p| match p.expect {
+                Expectation::WindowOn { window: w, workspace } if w == window => Some(workspace),
+                _ => None,
+            })
+            .or_else(|| self.windows.get(&window).map(|r| r.workspace))
     }
 
     /// The monitor the user is "at": the focused window's monitor, falling

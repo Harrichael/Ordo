@@ -187,9 +187,10 @@ fn run(
     // The restack worker outlives everything but the process (tap-thread
     // lifetime contract); it reports its telemetry back through the engine's
     // channel, so it needs a sender before the engine thread consumes rx.
-    let restack = ordo::platform::restack_worker::spawn(tx.clone(), ws.signals());
     let queues = ordo::platform::ax_queues();
+    let restack = ordo::platform::restack_worker::spawn(tx.clone(), ws.signals(), queues.clone());
     let rescue_queues = queues.clone();
+    let gate = ordo::platform::look_gate::spawn(queues.clone(), tx.clone());
     let engine_ws = ws.clone();
     let engine_thread = std::thread::spawn(move || {
         let clock = SystemClock::new();
@@ -226,6 +227,9 @@ fn run(
             Box::new(MacEffector::new(backend, engine_intercepting, restack, queues))
         };
         let mut engine = Engine::new(logger, Box::new(world), effector, Box::new(clock));
+        if !observe {
+            engine = engine.with_look_gate(Box::new(gate));
+        }
         if let Some(menubar) = menubar {
             engine = engine.on_state(move |s| {
                 let mut view = MenuBarView::of(s);

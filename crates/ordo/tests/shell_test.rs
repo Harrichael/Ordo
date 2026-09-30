@@ -13,7 +13,7 @@ use ordo::clock::Clock;
 use ordo::engine::{Engine, Msg};
 use ordo::logger::Logger;
 use ordo::menubar::{MenuBarView, MonitorEntry, MonitorsView, WorkspaceEntry};
-use ordo::ports::{Effector, NullEffector, SnapshotStats, WorldSource};
+use ordo::ports::{Effector, LookGate, NullEffector, SnapshotStats, WorldSource};
 use ordo::replay::replay;
 use ordo_core::{
     after_merge, anchor_after_add, AxHintKind, Effect, Event, FocusIntent, Gesture, HotkeyAction, MonitorId, MonitorSnap, MonitorWs, OpOutcome, Pid,
@@ -1100,4 +1100,92 @@ fn the_menus_plus_adds_an_empty_monitor_beside_the_displays() {
     assert_eq!(after.monitors[..2], before.monitors[..]);
     let new = &after.monitors[2];
     assert_eq!((new.id, new.display, new.windows, new.all_windows), (VirtualMonitorId(3), None, 0, 0));
+}
+
+// --- holding looks back while the apps are busy ------------------------------
+
+/// A gate whose apps are as busy as the test says, recording what it was
+/// handed.
+struct FakeGate {
+    idle: Rc<Cell<bool>>,
+    held: Rc<RefCell<Vec<RescanTrigger>>>,
+}
+
+impl LookGate for FakeGate {
+    fn idle(&self) -> bool {
+        self.idle.get()
+    }
+
+    fn defer(&self, trigger: RescanTrigger, _until: Instant) {
+        self.held.borrow_mut().push(trigger);
+    }
+}
+
+/// An engine whose looks are counted, behind a gate whose apps are busy or
+/// not, run over a script of messages.
+fn run_gated(apps_idle: bool, script: Vec<Msg>) -> (usize, Vec<RescanTrigger>) {
+    let looks = Rc::new(Cell::new(0));
+    let world = ScriptedWorld {
+        snaps: vec![snap(Some(1), 1, 1); 10],
+        at: looks.clone(),
+    };
+    let held = Rc::new(RefCell::new(Vec::new()));
+    let engine = Engine::new(
+        in_memory_logger("emulated"),
+        Box::new(world),
+        Box::new(OkEffector),
+        Box::new(StepClock { n: Cell::new(0) }),
+    )
+    .with_look_gate(Box::new(FakeGate {
+        idle: Rc::new(Cell::new(apps_idle)),
+        held: held.clone(),
+    }));
+    let (tx, rx) = crossbeam_channel::unbounded();
+    for m in script {
+        tx.send(m).unwrap();
+    }
+    tx.send(Msg::Shutdown).unwrap();
+    engine.run(rx);
+    let held = held.borrow().clone();
+    (looks.get(), held)
+}
+
+/// While the apps are busy with Ordo's writes, a look would only wait behind
+/// them: the switch's own look and a periodic one are both handed to the gate,
+/// and nothing past the startup look is taken.
+#[test]
+fn looks_are_held_back_while_the_apps_are_busy() {
+    let script = vec![
+        Msg::hotkey(HotkeyAction::WorkspaceNext),
+        Msg::Rescan(RescanTrigger::Periodic),
+    ];
+    let (looks, held) = run_gated(false, script);
+    assert_eq!(looks, 1, "the startup look only");
+    assert!(held.contains(&RescanTrigger::Periodic), "{held:?}");
+    assert!(
+        held.iter().any(|t| matches!(t, RescanTrigger::PostEffect { .. })),
+        "{held:?}"
+    );
+
+    let script = vec![Msg::hotkey(HotkeyAction::WorkspaceNext)];
+    let (looks, held) = run_gated(true, script);
+    assert_eq!(looks, 2, "startup, and the switch's own look at once");
+    assert!(held.is_empty());
+}
+
+/// A gesture is read on the very next look, and a press before it would
+/// clear it: its look is never held.
+#[test]
+fn a_gestures_look_is_not_held_back() {
+    let script = vec![
+        Msg::Gesture(Gesture::MouseDown {
+            at: ordo_core::Point { x: 10.0, y: 10.0 },
+        }),
+        Msg::Rescan(RescanTrigger::AxHint {
+            pid: None,
+            kind: AxHintKind::Other("focus".into()),
+        }),
+    ];
+    let (looks, held) = run_gated(false, script);
+    assert_eq!(looks, 2, "{held:?}");
 }
