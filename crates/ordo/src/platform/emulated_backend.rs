@@ -8,9 +8,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use ordo_core::{
-    MonitorId, Pid, Point, Rect, VirtualMonitorId, VirtualMonitorsWord, WindowId, WorkspaceId,
+    MonitorId, Pid, Rect, VirtualMonitorId, VirtualMonitorsWord, WindowId, WorkspaceId,
 };
-use ordo_emulated::{Desktop, EmulatedWorkspaces, ParkTrace, ParkTraceKind, Unhide};
+use ordo_emulated::{Desktop, EmulatedWorkspaces, Move, ParkTrace, ParkTraceKind, Unhide};
 
 use crate::app_queue::AppQueues;
 
@@ -34,7 +34,7 @@ impl Desktop for AxDesktop {
             .collect()
     }
 
-    fn move_windows(&self, moves: &[(Pid, WindowId, Point)]) {
+    fn move_windows(&self, moves: &[Move]) {
         self.queues.move_windows(moves);
     }
 

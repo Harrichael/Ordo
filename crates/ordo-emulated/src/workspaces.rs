@@ -31,7 +31,7 @@ use ordo_core::{
 use crate::ledger::{Claim, Ledger, SwitchPlan};
 use crate::statefile::{self, PersistedState, PersistedWindow};
 use crate::trace::{ParkTrace, ParkTraceKind, SwitchCost};
-use crate::{Desktop, Unhide};
+use crate::{Desktop, Move, Unhide};
 
 /// How much of a parked window stays on-screen. macOS refuses to keep a fully
 /// off-screen window where you put it, so we leave a 1px handle — also the
@@ -508,9 +508,16 @@ impl EmulatedWorkspaces {
         for (_, w, f) in writes {
             self.last_requested.insert(*w, *f);
         }
-        let moves: Vec<(Pid, WindowId, Point)> = writes
+        // Decided before this is called, so `parked` already says which way
+        // each write goes.
+        let moves: Vec<Move> = writes
             .iter()
-            .map(|(pid, w, f)| (*pid, *w, Point { x: f.x, y: f.y }))
+            .map(|(pid, w, f)| Move {
+                pid: *pid,
+                window: *w,
+                to: Point { x: f.x, y: f.y },
+                parks: self.parked.contains(w),
+            })
             .collect();
         if !moves.is_empty() {
             d.move_windows(&moves);
@@ -2011,7 +2018,7 @@ mod tests {
         /// port's writes wait on each app's thread; a queued window is in
         /// flight.
         queueing: std::cell::Cell<bool>,
-        queue: std::cell::RefCell<Vec<(Pid, WindowId, Point)>>,
+        queue: std::cell::RefCell<Vec<Move>>,
     }
 
     impl FakeDesktop {
@@ -2174,7 +2181,7 @@ mod tests {
         /// size WOULD suffer is modelled in `write_whole_frame`; the ratchet
         /// that shrank the author's windows by 58pt lived in the gap between
         /// the two.
-        fn move_windows(&self, moves: &[(Pid, WindowId, Point)]) {
+        fn move_windows(&self, moves: &[Move]) {
             if self.frozen.get() {
                 return;
             }
@@ -2182,14 +2189,14 @@ mod tests {
                 self.queue.borrow_mut().extend_from_slice(moves);
                 return;
             }
-            for (pid, w, at) in moves {
-                let size_is_the_windows_own = self.windows.borrow()[w].1;
+            for m in moves {
+                let size_is_the_windows_own = self.windows.borrow()[&m.window].1;
                 self.land(
-                    *pid,
-                    *w,
+                    m.pid,
+                    m.window,
                     Rect {
-                        x: at.x,
-                        y: at.y,
+                        x: m.to.x,
+                        y: m.to.y,
                         ..size_is_the_windows_own
                     },
                 );
@@ -2197,7 +2204,7 @@ mod tests {
         }
 
         fn in_flight(&self, window: WindowId) -> bool {
-            self.queue.borrow().iter().any(|(_, w, _)| *w == window)
+            self.queue.borrow().iter().any(|m| m.window == window)
         }
 
         fn hide_app(&self, pid: Pid) {
@@ -2616,14 +2623,15 @@ mod tests {
                 };
                 let d = FakeDesktop::new(&[(w(1), Pid(10), f)]);
                 let want = park_frame(f, &geo());
-                d.move_windows(&[(
-                    Pid(10),
-                    w(1),
-                    Point {
+                d.move_windows(&[Move {
+                    pid: Pid(10),
+                    window: w(1),
+                    to: Point {
                         x: want.x,
                         y: want.y,
                     },
-                )]);
+                    parks: true,
+                }]);
                 let landed = d.frame(w(1));
                 let seen = visible_width(&landed);
                 assert!(
@@ -3286,6 +3294,28 @@ mod tests {
         assert_eq!(d.frame(w(1)), rect(100.0, 100.0));
         assert!(in_park_corner(&d.frame(w(2)), &geo()), "{:?}", d.frame(w(2)));
         assert!(!b.parked.contains(&w(1)));
+    }
+
+    /// The port is told which moves park, so an un-hide still to come can
+    /// hold them.
+    #[test]
+    fn a_switch_says_which_of_its_moves_park() {
+        let d = FakeDesktop::new(&[
+            (w(1), Pid(10), rect(100.0, 100.0)),
+            (w(2), Pid(20), rect(300.0, 200.0)),
+        ]);
+        let mut b = EmulatedWorkspaces::new(3);
+        rescan(&d, &mut b);
+        b.assign_window_to_workspace(w(2), ws(2)).unwrap();
+        b.switch_workspace(&d, ws(2));
+        rescan(&d, &mut b);
+
+        d.queueing.set(true);
+        b.switch_workspace(&d, ws(1));
+        let parks: Vec<(WindowId, bool)> =
+            d.queue.borrow().iter().map(|m| (m.window, m.parks)).collect();
+        assert!(parks.contains(&(w(2), true)), "{parks:?}");
+        assert!(parks.contains(&(w(1), false)), "{parks:?}");
     }
 
     /// A scan taken while our own park is on its way shows the window where

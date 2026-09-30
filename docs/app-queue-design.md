@@ -35,7 +35,7 @@ Jobs:
 - `Focus { window, generation }`: front the app, make the window key, raise it. Skipped if a newer focus was queued anywhere since.
 - `Marker`: counts a latch down.
 
-Queuing a `Move` or `Frame` for a window drops any unsent `Move` or `Frame` for it, and removes it from any unsent `Show`'s hold: the newest decision about a window is the only one left standing.
+Queuing a `Move` or `Frame` for a window drops any unsent `Move` or `Frame` for it: the newest decision about a window is the only one left standing. An unsent `Show` for the same app follows it too. Each move says whether it parks (the model knows), and a park adds the window to the hold at its park spot, while a restore or a `Frame` takes it out. A burst can park a window after its app's un-hide was planned, and revealing the app drags every window it doesn't hold onto a display.
 
 `AxApp` keeps the app element and its window elements between jobs. An element is used only while it still names its window (ids are recycled). It re-reads them when a window is missing or a write through one fails, then tries once more, but never re-reads twice for one write: against a hung app each re-read costs a messaging timeout.
 
@@ -97,6 +97,7 @@ What's not changed:
   - one app's jobs reach it in order;
   - a slow app doesn't hold up another;
   - a newer move replaces a queued one and frees the window from a queued hold;
+  - an unsent un-hide holds what is parked by the time it runs;
   - a frame and a move replace each other;
   - an overtaken focus never runs;
   - abandoning drops everything not yet sent, and stops a batch of moves at its next write;

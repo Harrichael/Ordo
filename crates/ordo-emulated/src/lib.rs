@@ -41,6 +41,18 @@ use std::time::Instant;
 
 use ordo_core::{Pid, Point, Rect, WindowId};
 
+/// One window sent to a new origin.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Move {
+    pub pid: Pid,
+    pub window: WindowId,
+    pub to: Point,
+    /// Whether this sends the window off screen, to its park. An un-hide of
+    /// its app still to come must hold it there; a move onto the screen is
+    /// the opposite, and must not be held.
+    pub parks: bool,
+}
+
 /// One app to un-hide, and the windows that must not come back with it.
 ///
 /// An empty `hold` is a deliberate statement, not an omission: reveal
@@ -78,7 +90,7 @@ pub trait Desktop {
     /// incoming one in a single breath.
     ///
     /// The moves may land after this returns; see [`Desktop::in_flight`].
-    fn move_windows(&self, moves: &[(Pid, WindowId, Point)]);
+    fn move_windows(&self, moves: &[Move]);
 
     /// Whether a write to this window may not show yet in what the desktop
     /// reports: asked for and not yet seen through. What this port reports

@@ -15,16 +15,19 @@
 //!
 //! A job still on the queue can be dropped, which is the only cancelling
 //! there is: a message that has reached an app is past recall. A newer move
-//! for a window replaces its unsent older one (and takes the window out of
-//! any unsent un-hide's hold), and a newer focus anywhere turns an unsent
-//! older one into a no-op. [`AppQueues::abandon`] drops everything.
+//! for a window replaces its unsent older one, and a newer focus anywhere
+//! turns an unsent older one into a no-op. An unsent un-hide follows the
+//! newest decisions too: a park adds its window to the hold, a restore takes
+//! it out. [`AppQueues::abandon`] drops everything.
 //!
 //! ```no_run
 //! # use ordo::app_queue::{AppQueues, AppSession};
 //! # use ordo_core::{Pid, Point, WindowId};
+//! # use ordo_emulated::Move;
 //! # fn open(pid: Pid) -> Box<dyn AppSession> { unimplemented!() }
 //! let queues = AppQueues::new(open);
-//! queues.move_windows(&[(Pid(7), WindowId(1), Point { x: 0.0, y: 0.0 })]);
+//! let to = Point { x: 0.0, y: 0.0 };
+//! queues.move_windows(&[Move { pid: Pid(7), window: WindowId(1), to, parks: false }]);
 //! queues.focus(Pid(7), WindowId(1));
 //! let landed = queues.marker(&[Pid(7)]);
 //! ```
@@ -35,7 +38,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use ordo_core::{Pid, Point, Rect, WindowId};
-use ordo_emulated::{ChainStat, FocusStat, HoldStat, WriteStat};
+use ordo_emulated::{ChainStat, FocusStat, HoldStat, Move, WriteStat};
 
 /// How long a write that returned still counts as on its way. The window
 /// server's copy of a frame trails the app's by a few ms; this is generous
@@ -108,7 +111,12 @@ struct Queued {
 }
 
 enum Job {
-    Move { window: WindowId, to: Point, seq: u64 },
+    Move {
+        window: WindowId,
+        to: Point,
+        parks: bool,
+        seq: u64,
+    },
     Frame { window: WindowId, to: Rect, seq: u64 },
     Show { hold: Vec<(WindowId, Point)>, seqs: Vec<u64> },
     Hide,
@@ -135,20 +143,21 @@ impl AppQueues {
     /// pid, as every caller does today. Two queues writing one window would
     /// land its writes in either order, and the record would track only the
     /// newer.
-    pub fn move_windows(&self, moves: &[(Pid, WindowId, Point)]) {
+    pub fn move_windows(&self, moves: &[Move]) {
         let mut by_app: Vec<(Pid, Vec<Job>)> = Vec::new();
         {
             let mut record = self.inner.record.lock().unwrap();
-            for (pid, window, to) in moves {
-                let seq = record.queued(*window, Instant::now());
+            for m in moves {
+                let seq = record.queued(m.window, Instant::now());
                 let job = Job::Move {
-                    window: *window,
-                    to: *to,
+                    window: m.window,
+                    to: m.to,
+                    parks: m.parks,
                     seq,
                 };
-                match by_app.iter_mut().find(|(p, _)| p == pid) {
+                match by_app.iter_mut().find(|(p, _)| *p == m.pid) {
                     Some((_, jobs)) => jobs.push(job),
-                    None => by_app.push((*pid, vec![job])),
+                    None => by_app.push((m.pid, vec![job])),
                 }
             }
         }
@@ -258,20 +267,45 @@ impl AppQueues {
         let now = Instant::now();
         let mut state = lane.state.lock().unwrap();
         for job in jobs {
-            if let Job::Move { window, .. } | Job::Frame { window, .. } = &job {
+            let decided = match &job {
+                Job::Move {
+                    window,
+                    to,
+                    parks,
+                    seq,
+                } => Some((*window, parks.then_some((*to, *seq)))),
+                Job::Frame { window, .. } => Some((*window, None)),
+                _ => None,
+            };
+            if let Some((window, park)) = decided {
                 // The newest decision about a window is the only one left
-                // standing: an older move, or an older hold, would carry it
-                // somewhere it no longer belongs before this one lands.
+                // standing: an older move would carry it somewhere it no
+                // longer belongs before this one lands.
                 let before = state.jobs.len();
                 state.jobs.retain(|q| {
-                    !matches!(&q.job, Job::Move { window: w, .. } | Job::Frame { window: w, .. } if w == window)
+                    !matches!(&q.job, Job::Move { window: w, .. } | Job::Frame { window: w, .. } if *w == window)
                 });
                 state.replaced += before - state.jobs.len();
+                // And an un-hide still to come must hold what is parked now,
+                // and nothing that is coming back on screen: revealing the
+                // app drags every window it does not hold onto a display.
                 for q in state.jobs.iter_mut() {
                     if let Job::Show { hold, seqs } = &mut q.job {
-                        if let Some(i) = hold.iter().position(|(w, _)| w == window) {
-                            hold.remove(i);
-                            seqs.remove(i);
+                        let at = hold.iter().position(|(w, _)| *w == window);
+                        match (at, park) {
+                            (Some(i), Some((to, seq))) => {
+                                hold[i].1 = to;
+                                seqs[i] = seq;
+                            }
+                            (None, Some((to, seq))) => {
+                                hold.push((window, to));
+                                seqs.push(seq);
+                            }
+                            (Some(i), None) => {
+                                hold.remove(i);
+                                seqs.remove(i);
+                            }
+                            (None, None) => {}
                         }
                     }
                 }
@@ -325,7 +359,7 @@ fn run_lane(inner: Arc<Inner>, pid: Pid, lane: Arc<Lane>) {
                 chain = Some((first.at, ChainStat::new(pid, queued_wall_ms, wait)));
             }
             match first.job {
-                Job::Move { window, to, seq } => {
+                Job::Move { window, to, seq, .. } => {
                     let mut moves = vec![(window, to, seq)];
                     while let Some(Queued {
                         job: Job::Move { .. },
@@ -333,7 +367,7 @@ fn run_lane(inner: Arc<Inner>, pid: Pid, lane: Arc<Lane>) {
                     }) = state.jobs.front()
                     {
                         if let Some(Queued {
-                            job: Job::Move { window, to, seq },
+                            job: Job::Move { window, to, seq, .. },
                             ..
                         }) = state.jobs.pop_front()
                         {

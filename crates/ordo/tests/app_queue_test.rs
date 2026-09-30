@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use ordo::app_queue::{AppQueues, AppSession, LAND_WINDOW};
 use ordo_core::{Pid, Point, Rect, WindowId};
-use ordo_emulated::HoldStat;
+use ordo_emulated::{HoldStat, Move};
 
 const A: Pid = Pid(1);
 const B: Pid = Pid(2);
@@ -20,6 +20,26 @@ fn w(n: u32) -> WindowId {
 
 fn at(x: f64) -> Point {
     Point { x, y: 0.0 }
+}
+
+fn restores(list: &[(Pid, WindowId, Point)]) -> Vec<Move> {
+    list.iter()
+        .map(|(pid, window, to)| Move {
+            pid: *pid,
+            window: *window,
+            to: *to,
+            parks: false,
+        })
+        .collect()
+}
+
+fn park(pid: Pid, window: WindowId, x: f64) -> Move {
+    Move {
+        pid,
+        window,
+        to: at(x),
+        parks: true,
+    }
 }
 
 #[derive(Default)]
@@ -168,7 +188,7 @@ fn landed(q: &AppQueues, apps: &[Pid]) {
 #[test]
 fn an_apps_jobs_reach_it_in_the_order_queued() {
     let (q, world) = queues();
-    q.move_windows(&[(A, w(1), at(10.0)), (A, w(2), at(20.0))]);
+    q.move_windows(&restores(&[(A, w(1), at(10.0)), (A, w(2), at(20.0))]));
     q.show(A, vec![(w(3), at(-900.0))]);
     q.focus(A, w(1));
     landed(&q, &[A]);
@@ -183,7 +203,7 @@ fn an_apps_jobs_reach_it_in_the_order_queued() {
 fn a_slow_app_does_not_hold_up_another() {
     let (q, world) = queues();
     world.close(A);
-    q.move_windows(&[(A, w(1), at(1.0)), (A, w(2), at(2.0)), (B, w(4), at(4.0))]);
+    q.move_windows(&restores(&[(A, w(1), at(1.0)), (A, w(2), at(2.0)), (B, w(4), at(4.0))]));
     landed(&q, &[B]);
     assert_eq!(world.reached(B), ["move 4 to 4"]);
     assert_eq!(world.reached(A), ["move 1 to 1"], "A is still on its first write");
@@ -201,9 +221,9 @@ fn a_newer_move_replaces_a_queued_one_and_frees_the_window_from_a_queued_hold() 
     world.close(A);
     q.hide(A);
     world.busy(A);
-    q.move_windows(&[(A, w(1), at(-900.0))]);
+    q.move_windows(&restores(&[(A, w(1), at(-900.0))]));
     q.show(A, vec![(w(1), at(-900.0)), (w(2), at(-800.0))]);
-    q.move_windows(&[(A, w(1), at(100.0))]);
+    q.move_windows(&restores(&[(A, w(1), at(100.0))]));
     world.open(A);
     landed(&q, &[A]);
     assert_eq!(
@@ -238,7 +258,7 @@ fn abandoning_drops_everything_not_yet_sent() {
     world.close(A);
     q.hide(A);
     world.busy(A);
-    q.move_windows(&[(A, w(1), at(1.0)), (A, w(2), at(2.0))]);
+    q.move_windows(&restores(&[(A, w(1), at(1.0)), (A, w(2), at(2.0))]));
     q.show(A, Vec::new());
     let before = q.marker(&[A]);
     q.abandon();
@@ -257,7 +277,7 @@ fn a_write_is_in_flight_until_it_has_had_time_to_land() {
     let (q, world) = queues();
     world.gone.lock().unwrap().push(w(2));
     world.close(A);
-    q.move_windows(&[(A, w(1), at(1.0)), (A, w(2), at(2.0))]);
+    q.move_windows(&restores(&[(A, w(1), at(1.0)), (A, w(2), at(2.0))]));
     assert!(q.in_flight(w(1), Instant::now()), "queued");
     world.open(A);
     landed(&q, &[A]);
@@ -277,9 +297,9 @@ fn a_write_reporting_late_leaves_the_newer_one_in_flight() {
     let (q, world) = queues();
     world.close(A);
     world.gone.lock().unwrap().push(w(1));
-    q.move_windows(&[(A, w(1), at(1.0))]);
+    q.move_windows(&restores(&[(A, w(1), at(1.0))]));
     world.busy(A);
-    q.move_windows(&[(A, w(1), at(2.0))]);
+    q.move_windows(&restores(&[(A, w(1), at(2.0))]));
     world.let_through(1);
     // The first write comes back refused; the second is now being made.
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -302,11 +322,11 @@ fn a_frame_and_a_move_replace_each_other() {
     world.close(A);
     q.hide(A);
     world.busy(A);
-    q.move_windows(&[(A, w(1), at(1.0))]);
+    q.move_windows(&restores(&[(A, w(1), at(1.0))]));
     q.set_frame(A, w(1), Rect { x: 5.0, y: 0.0, w: 10.0, h: 10.0 });
     q.show(A, vec![(w(2), at(-900.0))]);
     q.set_frame(A, w(2), Rect { x: 6.0, y: 0.0, w: 10.0, h: 10.0 });
-    q.move_windows(&[(A, w(2), at(7.0))]);
+    q.move_windows(&restores(&[(A, w(2), at(7.0))]));
     world.open(A);
     landed(&q, &[A]);
     assert_eq!(
@@ -320,7 +340,7 @@ fn a_frame_and_a_move_replace_each_other() {
 fn abandoning_stops_a_batch_of_moves_at_its_next_write() {
     let (q, world) = queues();
     world.close(A);
-    q.move_windows(&[(A, w(1), at(1.0)), (A, w(2), at(2.0)), (A, w(3), at(3.0))]);
+    q.move_windows(&restores(&[(A, w(1), at(1.0)), (A, w(2), at(2.0)), (A, w(3), at(3.0))]));
     world.busy(A);
     let before = q.marker(&[A]);
     q.abandon();
@@ -355,14 +375,37 @@ fn a_marker_waits_for_its_own_apps_and_their_running_job() {
 fn a_panicking_job_costs_that_job_only() {
     let (q, world) = queues();
     *world.panics_on.lock().unwrap() = Some(w(1));
-    q.move_windows(&[(A, w(1), at(1.0)), (B, w(3), at(3.0))]);
+    q.move_windows(&restores(&[(A, w(1), at(1.0)), (B, w(3), at(3.0))]));
     landed(&q, &[A, B]);
     *world.panics_on.lock().unwrap() = None;
-    q.move_windows(&[(A, w(2), at(2.0))]);
+    q.move_windows(&restores(&[(A, w(2), at(2.0))]));
     landed(&q, &[A]);
     assert_eq!(world.reached(A), ["move 1 to 1", "move 2 to 2"]);
     assert_eq!(world.reached(B), ["move 3 to 3"]);
     assert!(!q.in_flight(w(1), Instant::now()));
     let opened = world.opened_sessions.lock().unwrap();
     assert_eq!(opened.iter().filter(|p| **p == A).count(), 2, "a fresh session after the panic");
+}
+
+/// Two presses before a hidden app's queue gets going. The first switch
+/// restores W1 and plans an un-hide holding W3; the second parks W1 again
+/// and brings W3 back. The un-hide that finally runs must hold W1, which is
+/// parked now, and not W3, which is coming on screen: revealing the app
+/// drags every window it doesn't hold onto a display.
+#[test]
+fn an_unsent_unhide_holds_what_is_parked_by_the_time_it_runs() {
+    let (q, world) = queues();
+    world.close(A);
+    q.hide(A);
+    world.busy(A);
+    q.move_windows(&restores(&[(A, w(1), at(100.0))]));
+    q.show(A, vec![(w(3), at(-900.0))]);
+    q.move_windows(&[park(A, w(1), -900.0)]);
+    q.move_windows(&restores(&[(A, w(3), at(300.0))]));
+    world.open(A);
+    landed(&q, &[A]);
+    assert_eq!(
+        world.reached(A),
+        ["hide", "show holding [1]", "move 1 to -900", "move 3 to 300"]
+    );
 }
