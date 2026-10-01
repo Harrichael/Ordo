@@ -12,7 +12,8 @@ const CAP: usize = 512;
 ///
 /// What enters it is the user's use, not observed focus: a command that names
 /// a window records it (`State::declare_focus`), and so does a window born
-/// with focus, which opened for the user; an observed focus is recorded only
+/// with focus, which opened for the user, and the window Ordo hands focus on
+/// to when the focused one closes; an observed focus is recorded only
 /// where the user's input explains it (a click, Cmd+Tab, or a key press
 /// whose change stays within the app typed into) and the window is on
 /// screen. Driving this from raw

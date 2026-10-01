@@ -291,8 +291,8 @@ pub(crate) fn apply_snapshot(s: &mut State, snap: &WorldSnapshot) {
         s.focus_history.remove(w);
     }
 
-    // A window its app did not answer for is still there, on the displays
-    // still there. Where it belongs is the backend's word, which a scan that
+    // A window the scan missed but the window server has is still there, on
+    // the displays still there. Where it belongs is the backend's word, which a scan that
     // missed it still carries: a carry must confirm on it, or the carry's
     // retry would fight a window already where it was sent.
     for (id, mut r) in old_windows {

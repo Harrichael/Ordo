@@ -116,6 +116,12 @@ pub enum Note {
         from: WindowId,
         from_app: Pid,
     },
+    /// The window holding focus closed, and focus went to the next window in
+    /// the MRU order on its monitor (`to`), or that monitor's desktop (`None`).
+    FocusHandedOn {
+        closed: WindowId,
+        to: Option<WindowId>,
+    },
     /// The world contradicted the focus declaration; the grant was re-issued.
     FocusReasserted { window: WindowId },
     /// Focus re-assertion hit the damping limit: the app kept its own key
@@ -465,7 +471,7 @@ fn handle_gesture(s: &mut State, gesture: Gesture, now_ns: u64, notes: &mut Vec<
         away: Some(Away {
             from: s.focused,
             since_ns: now_ns,
-            by: gesture.into(),
+            by: if menu_was_open { Input::MenuBar } else { gesture.into() },
             within: None,
         }),
         into: (!hit.is_empty()).then(|| (hit.iter().map(|w| s.root_of(*w)).collect(), now_ns)),
@@ -1109,7 +1115,13 @@ fn handle_snapshot(
     reconcile::apply_snapshot(s, snap);
     keep_vanished_places(pre, s, now_ns);
 
-    record_landing(s, trigger, now_ns, notes);
+    // Whatever the app keys in the look that closed the focused window is
+    // the close's fallout, even inside the second after the click that
+    // closed it: where focus goes next is Ordo's to say.
+    let hand_on = hand_on_from_close(pre, s, &deltas);
+    if hand_on.is_none() {
+        record_landing(s, trigger, now_ns, notes);
+    }
     // A display came or went. Every window on the vanished display was just
     // re-homed by macOS, not by anyone's hand — nothing about a window's
     // placement in this snapshot says anything about intent. The FIRST
@@ -1183,6 +1195,10 @@ fn handle_snapshot(
     }
 
     let mut last_op: Option<OpId> = None;
+
+    if let Some(hand_on) = hand_on {
+        hand_on_focus(s, hand_on, now_ns, notes, &mut last_op, fx);
+    }
 
     // The user's hands outrank stale intent: an unexplained frame change on
     // a window in THIS snapshot means someone is actively placing it (a drag
@@ -1429,7 +1445,10 @@ const INTO_TTL_NS: u64 = 3_000_000_000;
 /// it, within `AWAY_TTL_NS`; a click also explains a landing on a window it
 /// hit, within `INTO_TTL_NS`. A hidden landing is never recorded: it is
 /// either navigation, which the follow declares, or a fling. The OS's focus
-/// at startup is the user's last choice before Ordo ran.
+/// at startup is the user's last choice before Ordo ran. Not called for a
+/// look in which Ordo hands focus on from a closed window
+/// (`hand_on_from_close`): what the app keys there is the close's fallout,
+/// and the order takes Ordo's declaration instead.
 fn record_landing(s: &mut State, trigger: &RescanTrigger, now_ns: u64, notes: &mut Vec<Note>) {
     let Landing { away, into } = std::mem::take(&mut s.unseen_landing);
     let focused = s.focused;
@@ -1480,6 +1499,153 @@ fn record_landing(s: &mut State, trigger: &RescanTrigger, now_ns: u64, notes: &m
     }
     if let Some(by) = by {
         notes.push(Note::LandingExplained { window: f, by });
+    }
+}
+
+/// Where focus goes when the window holding it closes: the next window in
+/// the MRU order on its monitor, which tops the restack `order`, or that
+/// monitor's desktop. A desktop on a monitor that is not the anchor is
+/// viewed first, so the anchor moves to it, and with it where new windows
+/// are corralled: the user is at that monitor now.
+enum HandOn {
+    Window {
+        closed: WindowId,
+        order: Vec<WindowId>,
+    },
+    Desktop {
+        closed: WindowId,
+        view: Option<VirtualMonitorId>,
+        display: MonitorId,
+    },
+}
+
+/// The focused window (or the declared one) closed in this look, and focus
+/// stays on its monitor. Left alone, macOS fronts the app's next window
+/// wherever it is, often on the other monitor (run 50 seq 159-161), and an
+/// app's own pick is not where the user was working. Who closed it does not
+/// matter: a dialog dismissing itself leaves the user where a close button
+/// would. It relies on `WindowDestroyed` meaning the window server agrees
+/// the window is gone (see `WorldSnapshot::unread`): a window one scan
+/// missed would otherwise hand focus away while the user types into it.
+fn hand_on_from_close(pre: &State, s: &State, deltas: &[Delta]) -> Option<HandOn> {
+    if s.mode != Mode::Active {
+        return None;
+    }
+    let closed = pre.declared_focus()?;
+    let rec = pre.windows.get(&closed)?;
+    // An attached window (a popup, a find bar) gives focus back to its root
+    // by itself.
+    if !deltas.contains(&Delta::WindowDestroyed(closed))
+        || !pre.is_visible(rec)
+        || rec.parent.is_some()
+    {
+        return None;
+    }
+    // A look that lost the windows of several apps at once is the screen
+    // going away (the lock screen, a native Space, a display reconfiguring),
+    // and they all come back a look or a few later. A close, or an app
+    // quitting, takes one app's.
+    let gone_apps: BTreeSet<Pid> = deltas
+        .iter()
+        .filter_map(|d| match d {
+            Delta::WindowDestroyed(w) => pre.windows.get(w).map(|r| r.app),
+            _ => None,
+        })
+        .collect();
+    if gone_apps.len() > 1 {
+        return None;
+    }
+    // A window born with focus declares itself.
+    if deltas
+        .iter()
+        .any(|d| matches!(d, Delta::WindowCreated(w) if s.focused == Some(*w)))
+    {
+        return None;
+    }
+    if went_elsewhere(pre, s, rec) {
+        return None;
+    }
+    let ws = s.current_workspace().filter(|ws| *ws == rec.workspace)?;
+    let order: Vec<WindowId> = mru_stack(s, ws)
+        .into_iter()
+        .filter(|w| s.windows[w].vmonitor == rec.vmonitor)
+        .collect();
+    if !order.is_empty() {
+        return Some(HandOn::Window { closed, order });
+    }
+    // The desktop declaration is held on the anchor's display, so another
+    // monitor's desktop needs the anchor moved there, which is only a focus
+    // jump while it leaves every display showing what it shows.
+    let (view, display) = match s.virtual_monitors {
+        None => (None, rec.monitor),
+        Some(v) if v.viewed == rec.vmonitor => (None, s.host_of(rec.vmonitor)?),
+        Some(_) if s.projection_with(Some(rec.vmonitor), None) == s.projection() => {
+            (Some(rec.vmonitor), s.host_of(rec.vmonitor)?)
+        }
+        Some(_) => return None,
+    };
+    Some(HandOn::Desktop {
+        closed,
+        view,
+        display,
+    })
+}
+
+/// The user's latest input, in the same look as the close, can't be what
+/// closed the window, so it took them somewhere: Cmd+Tab, a click that
+/// missed the closed window (the Dock, the desktop, another window; the click
+/// that closed it hit it), or a key press that brought up another app (a
+/// launcher). A key press within the closed window's app is Cmd+W, and a
+/// menu's click may be its Close item.
+fn went_elsewhere(pre: &State, s: &State, closed: &WindowRecord) -> bool {
+    let Landing { away, into } = &pre.unseen_landing;
+    let root = pre.root_of(closed.id);
+    match away.as_ref().map(|a| a.by) {
+        Some(Input::Switcher) => true,
+        Some(Input::Click) => into.as_ref().is_none_or(|(roots, _)| !roots.contains(&root)),
+        Some(Input::Key) => key_app(s).is_some_and(|app| app != closed.app),
+        Some(Input::MenuBar) | None => false,
+    }
+}
+
+/// Grant what `hand_on_from_close` chose, as a command would: the
+/// declaration it leaves is enforced against the app's own re-key, damped as
+/// any other.
+fn hand_on_focus(
+    s: &mut State,
+    hand_on: HandOn,
+    now_ns: u64,
+    notes: &mut Vec<Note>,
+    last_op: &mut Option<OpId>,
+    fx: &mut Vec<Effect>,
+) {
+    match hand_on {
+        HandOn::Window { closed, order } => {
+            let next = order[0];
+            let op = push_focus(s, next, s.focused != Some(next), now_ns, fx, notes);
+            if order.len() >= 2 {
+                fx.push(restack(s, order, true));
+            }
+            s.declare_focus(FocusIntent::Window(next));
+            notes.push(Note::FocusHandedOn {
+                closed,
+                to: Some(next),
+            });
+            *last_op = Some(op);
+        }
+        HandOn::Desktop {
+            closed,
+            view,
+            display,
+        } => {
+            if let Some(vm) = view {
+                push_view(s, vm, now_ns, fx);
+            }
+            let op = push_desktop(s, display, now_ns, fx, notes);
+            s.declare_focus(FocusIntent::Desktop);
+            notes.push(Note::FocusHandedOn { closed, to: None });
+            *last_op = Some(op);
+        }
     }
 }
 

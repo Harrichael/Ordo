@@ -190,17 +190,11 @@ impl WorldSource for MacWorldSource {
             };
         }
         self.blind = false;
-        // A window its app didn't answer for is kept only while the window
-        // server has it: an app that keeps timing out must not keep its
-        // closed windows alive.
-        let unread: Vec<WindowId> = alive
-            .into_iter()
-            .filter(|w| {
-                self.last_windows
-                    .get(w)
-                    .is_some_and(|pid| scan.walk.unanswered.contains(pid))
-            })
-            .collect();
+        let unread = still_there(alive, unlisted, |w| {
+            self.last_windows
+                .get(w)
+                .is_some_and(|pid| scan.walk.unanswered.contains(pid))
+        });
         let last_windows: HashMap<WindowId, Pid> = scan
             .windows
             .iter()
@@ -361,6 +355,22 @@ fn still_listed(windows: &[WindowId], listed: Option<Vec<WindowId>>) -> Vec<Wind
     }
 }
 
+/// Of the windows a scan missed that `still_listed` kept, those the core is
+/// told are still there (`WorldSnapshot::unread`), so that a window it is
+/// told closed is one the window server agrees is gone. An app's AX read
+/// drops a window now and then even when the app answers (run 45 seq 1969: a
+/// focused Slack window gone for one scan), and the core hands focus on when
+/// the focused window closes. Without the list there is no evidence either
+/// way, and only an app that didn't answer keeps its windows: one that keeps
+/// timing out must not keep its closed windows alive.
+fn still_there(
+    alive: Vec<WindowId>,
+    unlisted: bool,
+    unanswered: impl Fn(&WindowId) -> bool,
+) -> Vec<WindowId> {
+    alive.into_iter().filter(|w| !unlisted || unanswered(w)).collect()
+}
+
 /// A scan in which no app listed a window, while windows the model holds are
 /// still in the window server's list, saw nothing: the screen is locked or
 /// the session asleep (run 48 seq 662: thirteen minutes of such scans erased
@@ -384,5 +394,17 @@ mod tests {
         let last_closed = still_listed(&[a], Some(vec![WindowId(9)]));
         assert!(!is_blind(0, &last_closed));
         assert!(!is_blind(3, &locked), "a scan that sees windows is not blind");
+    }
+
+    #[test]
+    fn a_missed_window_is_still_there_while_the_window_server_lists_it() {
+        // a's app answered without it, b's app timed out, c is gone from the
+        // window server's list too.
+        let (a, b, c) = (WindowId(1), WindowId(2), WindowId(3));
+        let unanswered = |w: &WindowId| *w == b;
+        let alive = still_listed(&[a, b, c], Some(vec![a, b, WindowId(9)]));
+        assert_eq!(still_there(alive, false, unanswered), vec![a, b]);
+        let alive = still_listed(&[a, b, c], None);
+        assert_eq!(still_there(alive, true, unanswered), vec![b], "no list, no evidence");
     }
 }

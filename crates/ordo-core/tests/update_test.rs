@@ -1630,8 +1630,8 @@ fn closing_a_window_never_follows_focus_to_another_workspace() {
     }));
 
     // The same when the window closing is the DECLARED one: Alt+Tab to w3,
-    // confirmed, then Cmd+W. A declaration about a window that no longer
-    // exists is vacuous, so the hidden landing is held exactly as above.
+    // confirmed, then Cmd+W. Focus is handed on to w3's monitor's next
+    // window rather than held, and lands in the same place.
     let mut wins = std_windows();
     wins[1].workspace = ws(2);
     let s = update(
@@ -1669,6 +1669,328 @@ fn closing_a_window_never_follows_focus_to_another_workspace() {
     assert_eq!(count_switches(&closed.effects), 0);
     assert_eq!(focus_targets(&closed.effects), vec![wid(1)]);
     assert_eq!(closed.state.focus_intent(), FocusIntent::Window(wid(1)));
+}
+
+/// Run 50's shape: the user works on the right monitor (w2, w4, w5), and
+/// w4's app (pid 100) also has w1 and w3 on the left.
+fn closing_world() -> Vec<Win> {
+    let mut wins = std_windows();
+    wins.push(win(4, 100, 1, rect(2400.0, 500.0)));
+    wins.push(win(5, 300, 1, rect(3000.0, 100.0)));
+    wins
+}
+
+/// Boot `wins` and click each window of `focus_seq` in turn.
+fn booted_with(wins: &[Win], focus_seq: &[u32]) -> State {
+    let mut s = update(
+        &State::new(),
+        &observed(
+            vec![mon_a(1), mon_b(1)],
+            wins.to_vec(),
+            None,
+            RescanTrigger::Startup,
+        ),
+    )
+    .state;
+    for f in focus_seq {
+        s = used(&s, *f, vec![mon_a(1), mon_b(1)], wins.to_vec());
+    }
+    s
+}
+
+fn without(wins: &[Win], gone: &[u32]) -> Vec<Win> {
+    wins.iter()
+        .filter(|w| !gone.iter().any(|g| w.snap.id == wid(*g)))
+        .cloned()
+        .collect()
+}
+
+fn click_on(s: &State, wins: &[Win], w: u32) -> State {
+    let at = wins.iter().find(|x| x.snap.id == wid(w)).unwrap().snap.frame.center();
+    update(s, &click(at.x, at.y)).state
+}
+
+#[test]
+fn closing_the_focused_window_hands_focus_to_its_monitors_next_window() {
+    // Run 50 seq 159-161: a click closes Chrome's window on the right
+    // monitor, the look shows it gone and nothing key, and 2.7 s later
+    // macOS fronts Chrome's window on the LEFT monitor. The user was working
+    // on the right. Focus goes to the right monitor's next window in the MRU
+    // order (w2), not the next one overall (w1, on the left), and the right
+    // monitor is restacked under it; the left one is left alone.
+    let wins = closing_world();
+    let s = booted_with(&wins, &[5, 2, 1, 4]); // history [4, 1, 2, 5, 3]
+    let s = click_on(&s, &wins, 4);
+    let step = update(
+        &s,
+        &observed(
+            vec![mon_a(1), mon_b(1)],
+            without(&wins, &[4]),
+            None,
+            RescanTrigger::Periodic,
+        ),
+    );
+    assert_eq!(focus_targets(&step.effects), vec![wid(2)]);
+    assert!(step.effects.iter().any(|e| matches!(
+        e,
+        Effect::RestackWindows { order, focus_top: true, .. } if *order == vec![wid(2), wid(5)]
+    )));
+    assert_eq!(step.state.focus_intent(), FocusIntent::Window(wid(2)));
+    assert!(step.notes.contains(&Note::FocusHandedOn {
+        closed: wid(4),
+        to: Some(wid(2)),
+    }));
+}
+
+#[test]
+fn the_apps_own_rekey_after_a_close_is_fought_and_not_recorded() {
+    // The app keys its window on the left in the very look that shows the
+    // close, inside the second after the click that closed it, which would
+    // otherwise pass for where that click went. It is the close's fallout:
+    // Ordo's choice is granted over it, the MRU order is untouched, and when
+    // the app keeps w1 key after the grant's expectation has lapsed, the
+    // grant is re-issued.
+    let wins = closing_world();
+    let s = booted_with(&wins, &[5, 2, 1, 4]);
+    let s = click_on(&s, &wins, 4);
+    let at = ts();
+    let rekeyed = update(
+        &s,
+        &observed_at(
+            at,
+            vec![mon_a(1), mon_b(1)],
+            without(&wins, &[4]),
+            Some(1),
+            RescanTrigger::Periodic,
+        ),
+    );
+    assert_eq!(focus_targets(&rekeyed.effects), vec![wid(2)]);
+    // Only Ordo's choice moved.
+    let mut expected = vec![wid(2)];
+    expected.extend(history(&s).into_iter().filter(|w| *w != wid(2)));
+    assert_eq!(history(&rekeyed.state), expected);
+
+    let later = update(
+        &rekeyed.state,
+        &observed_at(
+            plus_ms(at, 2_700),
+            vec![mon_a(1), mon_b(1)],
+            without(&wins, &[4]),
+            Some(1),
+            RescanTrigger::Periodic,
+        ),
+    );
+    assert_eq!(focus_targets(&later.effects), vec![wid(2)]);
+    assert!(later.notes.contains(&Note::FocusReasserted { window: wid(2) }));
+    for step in [&rekeyed, &later] {
+        assert!(!step
+            .notes
+            .iter()
+            .any(|n| matches!(n, Note::LandingExplained { .. })));
+    }
+    assert_eq!(history(&later.state), expected);
+}
+
+#[test]
+fn closing_the_last_window_on_a_monitor_gives_that_monitor_its_desktop() {
+    // w2 is all the right monitor holds. Once it closes, the right
+    // monitor's desktop takes focus (its monitor becomes the anchor, where a
+    // desktop declaration is held), and the app that keys w1 on the left
+    // afterwards is fought for it.
+    let s = booted(&[1, 2]);
+    let s = click_on(&s, &std_windows(), 2);
+    let at = ts();
+    let closed = update(
+        &s,
+        &observed_at(
+            at,
+            vec![mon_a(1), mon_b(1)],
+            without(&std_windows(), &[2]),
+            None,
+            RescanTrigger::Periodic,
+        ),
+    );
+    assert!(focus_targets(&closed.effects).is_empty());
+    assert!(closed
+        .effects
+        .iter()
+        .any(|e| matches!(e, Effect::FocusDesktop { display, .. } if *display == mid(2))));
+    assert_eq!(closed.state.focus_intent(), FocusIntent::Desktop);
+    assert!(closed.notes.contains(&Note::FocusHandedOn {
+        closed: wid(2),
+        to: None,
+    }));
+
+    let viewing_b = VirtualMonitors {
+        count: 2,
+        viewed: vm(2),
+        enabled: true,
+    };
+    let rekeyed = update(
+        &closed.state,
+        &Event::WorldObserved {
+            at: plus_ms(at, 1_500),
+            trigger: RescanTrigger::Periodic,
+            snap: world_view(
+                viewing_b,
+                &[mon_a(1), mon_b(1)],
+                &without(&std_windows(), &[2]),
+                Some(1),
+            ),
+        },
+    );
+    assert!(rekeyed.notes.contains(&Note::DesktopReasserted {
+        display: mid(2),
+        from: wid(1),
+    }));
+}
+
+#[test]
+fn closing_an_unfocused_window_changes_nothing() {
+    let s = booted(&[2, 1]); // w1 key
+    let step = update(
+        &s,
+        &observed(
+            vec![mon_a(1), mon_b(1)],
+            without(&std_windows(), &[2]),
+            Some(1),
+            RescanTrigger::Periodic,
+        ),
+    );
+    assert!(step.effects.is_empty());
+    assert_eq!(step.state.focus_intent(), s.focus_intent());
+}
+
+#[test]
+fn a_click_on_another_window_in_the_same_look_as_a_close_is_where_the_user_went() {
+    // An app with no observer is seen only by the periodic look, seconds
+    // apart: the user closes w4 and clicks w5 before any look, and the look
+    // finds the app has keyed w1. Nothing is handed on, and when w5 comes up
+    // key it is the click's.
+    let wins = closing_world();
+    let s = booted_with(&wins, &[5, 2, 1, 4]);
+    let s = click_on(&s, &wins, 4);
+    let s = click_on(&s, &wins, 5);
+    let rest = without(&wins, &[4]);
+    let closed = update(
+        &s,
+        &observed(vec![mon_a(1), mon_b(1)], rest.clone(), Some(1), RescanTrigger::Periodic),
+    );
+    assert!(focus_targets(&closed.effects).is_empty());
+    let landed = update(
+        &closed.state,
+        &observed(vec![mon_a(1), mon_b(1)], rest, Some(5), RescanTrigger::Periodic),
+    );
+    assert!(landed.notes.contains(&Note::LandingExplained {
+        window: wid(5),
+        by: Input::Click,
+    }));
+    assert_eq!(history(&landed.state)[0], wid(5));
+}
+
+#[test]
+fn a_dock_click_or_a_launcher_after_cmd_w_is_where_the_user_went() {
+    // Cmd+W closes w4, and before the look the user either clicks the Dock
+    // (Chrome's icon, bringing up its w1) or types into a launcher that
+    // brings up w5's app. Either way the look shows where the user went, and
+    // it stands. Cmd+W alone, with the app keying its own w1, is the close's
+    // fallout and is handed on as ever, and so is File > Close: the click on
+    // the menu item hits no window either, but it is the menu's.
+    let wins = closing_world();
+    let s = booted_with(&wins, &[5, 2, 1, 4]);
+    let typed = update(&s, &gesture(Gesture::Key)).state;
+    let rest = without(&wins, &[4]);
+    let look_at = |s: &State, focused: u32| {
+        update(
+            s,
+            &observed(vec![mon_a(1), mon_b(1)], rest.clone(), Some(focused), RescanTrigger::Periodic),
+        )
+    };
+
+    let docked = look_at(&update(&typed, &click(960.0, 1075.0)).state, 1);
+    assert!(focus_targets(&docked.effects).is_empty());
+    assert_eq!(history(&docked.state)[0], wid(1));
+
+    let launched = look_at(&update(&typed, &gesture(Gesture::Key)).state, 5);
+    assert!(focus_targets(&launched.effects).is_empty());
+    assert_eq!(launched.state.focused, Some(wid(5)));
+
+    let rekeyed = look_at(&typed, 1);
+    assert_eq!(focus_targets(&rekeyed.effects), vec![wid(2)]);
+
+    let menu = update(&s, &gesture(Gesture::MenuBar { at: Point { x: 2000.0, y: 5.0 } })).state;
+    let menu_closed = look_at(&update(&menu, &click(2050.0, 60.0)).state, 1);
+    assert_eq!(focus_targets(&menu_closed.effects), vec![wid(2)]);
+}
+
+#[test]
+fn closing_an_attached_window_leaves_focus_to_its_root() {
+    // w6 hangs off w4 (an omnibox popup, a find bar). When it is dismissed
+    // the app keys w4 again by itself, so there is nothing to hand on.
+    let mut wins = closing_world();
+    let mut popup = win(6, 100, 1, rect(2850.0, 700.0));
+    popup.snap.parent = Some(wid(4));
+    wins.push(popup);
+    let s = booted_with(&wins, &[5, 2, 1, 4, 6]);
+    assert_eq!(s.focused, Some(wid(6)));
+    let step = update(
+        &s,
+        &observed(
+            vec![mon_a(1), mon_b(1)],
+            without(&wins, &[6]),
+            Some(4),
+            RescanTrigger::Periodic,
+        ),
+    );
+    assert!(step.effects.is_empty(), "{:?}", step.effects);
+}
+
+#[test]
+fn a_window_one_scan_missed_while_the_window_server_lists_it_is_not_a_close() {
+    // The shell lists a window its app's AX read dropped as `unread` while
+    // the window server still has it (run 45 seq 1969: a focused Slack
+    // window gone for one scan). The model keeps it and nothing moves.
+    let wins = closing_world();
+    let s = booted_with(&wins, &[5, 2, 1, 4]);
+    let mut snap = world(&[mon_a(1), mon_b(1)], &without(&wins, &[4]), None);
+    snap.unread = vec![wid(4)];
+    let step = update(
+        &s,
+        &Event::WorldObserved {
+            at: ts(),
+            trigger: RescanTrigger::Periodic,
+            snap,
+        },
+    );
+    assert!(step.effects.is_empty());
+    assert!(step.state.windows.contains_key(&wid(4)));
+}
+
+#[test]
+fn the_screen_going_away_is_not_a_close() {
+    // The lock screen, or a native Space, empties a look of every app's
+    // windows, and they all come back a few looks later. Nothing is handed
+    // on, so nothing is fought when they return.
+    let s = booted(&[1, 2]);
+    let gone = update(
+        &s,
+        &observed(vec![mon_a(1), mon_b(1)], Vec::new(), None, RescanTrigger::Periodic),
+    );
+    assert!(gone.effects.is_empty());
+    let back = update(
+        &gone.state,
+        &observed(
+            vec![mon_a(1), mon_b(1)],
+            std_windows(),
+            Some(2),
+            RescanTrigger::Periodic,
+        ),
+    );
+    assert!(focus_targets(&back.effects).is_empty());
+    assert!(!back
+        .effects
+        .iter()
+        .any(|e| matches!(e, Effect::FocusDesktop { .. })));
 }
 
 #[test]

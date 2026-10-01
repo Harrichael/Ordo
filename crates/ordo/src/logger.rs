@@ -467,6 +467,7 @@ fn note_kind(n: &Note) -> &'static str {
         Note::FollowedFocus { .. } => "followed_focus",
         Note::MonitorAdopted { .. } => "monitor_adopted",
         Note::HeldFocus { .. } => "held_focus",
+        Note::FocusHandedOn { .. } => "focus_handed_on",
         Note::FocusReasserted { .. } => "focus_reasserted",
         Note::FocusDiverged { .. } => "focus_diverged",
         Note::DesktopReasserted { .. } => "desktop_reasserted",

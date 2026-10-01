@@ -226,9 +226,11 @@ pub struct WorldSnapshot {
     /// replays diverge regardless — the decision logic changed with the shape).
     #[serde(default)]
     pub workspaces: WorkspaceSnap,
-    /// Windows missing from `windows` only because their app did not answer
-    /// in time, and which the window server still has. The model keeps them
-    /// as last seen, placed by the backend's word like any other.
+    /// Windows missing from `windows` that the window server still has: their
+    /// app did not answer in time, or answered without them, as an AX read
+    /// now and then does. The model keeps them as last seen, placed by the
+    /// backend's word like any other, so a window missing from a snapshot and
+    /// not listed here is one the window server agrees is gone.
     #[serde(default)]
     pub unread: Vec<WindowId>,
 }

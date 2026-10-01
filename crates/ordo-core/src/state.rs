@@ -118,8 +118,10 @@ pub enum FocusIntent {
 }
 
 /// What the user's latest input can still explain of the focus changes that
-/// follow it: the only way an observation writes the MRU order. What the OS
-/// or an app keys with no input behind it is not where the user went.
+/// follow it: the only way an observed focus enters the MRU order. What the
+/// OS or an app keys with no input behind it is not where the user went. (A
+/// look that shows the focused window closing writes the order too, but
+/// through Ordo's declaration of the window it hands focus on to.)
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Landing {
     /// A key press or click: the first focus change after it is the user's,
