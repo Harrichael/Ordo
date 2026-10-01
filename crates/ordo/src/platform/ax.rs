@@ -63,6 +63,19 @@ pub struct Walk {
     /// none can be moved. Measured once for Outlook, running for weeks,
     /// against an Ordo started from a different terminal than the last.
     pub refused: Vec<Pid>,
+    /// Apps that did not answer for their window list within the messaging
+    /// timeout, busy with something (often Ordo's own writes). Their windows
+    /// are unknown this time, not gone: in run 46 all six of kitty's windows
+    /// dropped out of one scan this way, and came back 1.8 s later.
+    pub unanswered: Vec<Pid>,
+}
+
+/// How an app answered for its window list.
+#[derive(Clone, Copy, PartialEq)]
+enum Listing {
+    Answered,
+    Refused,
+    Unanswered,
 }
 
 /// Enumerate every standard window of every regular (Dock-visible) app, plus
@@ -98,14 +111,17 @@ fn walk() -> (Vec<AxWindow>, Walk) {
         .map(|a| (a.processIdentifier(), a.bundleIdentifier().map(|b| b.to_string())))
         .filter(|(pid, _)| *pid > 0)
         .collect();
-    let per_app: Vec<(Vec<AxWindow>, Duration, bool)> = std::thread::scope(|scope| {
+    let per_app: Vec<(Vec<AxWindow>, Duration, Listing)> = std::thread::scope(|scope| {
         let handles: Vec<_> = apps
             .iter()
             .map(|(pid, bundle_id)| scope.spawn(move || app_windows(*pid, bundle_id)))
             .collect();
         handles
             .into_iter()
-            .map(|h| h.join().unwrap_or_default())
+            .map(|h| {
+                h.join()
+                    .unwrap_or((Vec::new(), Duration::ZERO, Listing::Unanswered))
+            })
             .collect()
     });
     let slowest = apps
@@ -113,25 +129,28 @@ fn walk() -> (Vec<AxWindow>, Walk) {
         .zip(&per_app)
         .max_by_key(|(_, (_, took, _))| *took)
         .map(|((pid, _), (_, took, _))| (Pid(*pid), *took));
-    let refused = apps
-        .iter()
-        .zip(&per_app)
-        .filter(|(_, (_, _, refused))| *refused)
-        .map(|((pid, _), _)| Pid(*pid))
-        .collect();
+    let listed = |how: Listing| -> Vec<Pid> {
+        apps.iter()
+            .zip(&per_app)
+            .filter(|(_, (_, _, listing))| *listing == how)
+            .map(|((pid, _), _)| Pid(*pid))
+            .collect()
+    };
+    let refused = listed(Listing::Refused);
+    let unanswered = listed(Listing::Unanswered);
     let windows = per_app.into_iter().flat_map(|(w, _, _)| w).collect();
     let walk = Walk {
         elapsed: started.elapsed(),
         apps: apps.len(),
         slowest,
         refused,
+        unanswered,
     };
     (windows, walk)
 }
 
-/// The app's windows, how long asking took, and whether it refused to answer
-/// at all (see [`Walk::refused`]).
-fn app_windows(pid: i32, bundle_id: &Option<String>) -> (Vec<AxWindow>, Duration, bool) {
+/// The app's windows, how long asking took, and how it answered.
+fn app_windows(pid: i32, bundle_id: &Option<String>) -> (Vec<AxWindow>, Duration, Listing) {
     let started = Instant::now();
     let mut windows = Vec::new();
     let el = unsafe { AXUIElement::new_application(pid) };
@@ -142,7 +161,11 @@ fn app_windows(pid: i32, bundle_id: &Option<String>) -> (Vec<AxWindow>, Duration
     // AXUIElement pointers (a use-after-free that only surfaces once the
     // app actually has windows to enumerate).
     let listed = unsafe { copy_attr_or_error(&el, "AXWindows") };
-    let refused = matches!(listed, Err(AXError::APIDisabled));
+    let listing = match listed {
+        Err(AXError::APIDisabled) => Listing::Refused,
+        Err(AXError::CannotComplete) => Listing::Unanswered,
+        _ => Listing::Answered,
+    };
     if let Ok(raw) = listed {
         unsafe {
             for i in 0..super::cf::array_len(raw) {
@@ -157,7 +180,7 @@ fn app_windows(pid: i32, bundle_id: &Option<String>) -> (Vec<AxWindow>, Duration
             sys::CFRelease(raw);
         }
     }
-    (windows, started.elapsed(), refused)
+    (windows, started.elapsed(), listing)
 }
 
 fn read_window(win: *const AXUIElement, app: Pid, bundle_id: Option<String>) -> Option<AxWindow> {
@@ -449,6 +472,9 @@ pub struct HoldOutcome {
     pub writes: u32,
     pub elapsed_ms: u64,
     pub escaped: Vec<WindowId>,
+    /// Held windows out of the hold's reach: gone from the window server,
+    /// another app's, or not in the app's own window list.
+    pub unreachable: Vec<WindowId>,
     /// Whether the app had `AXEnhancedUserInterface` on, so it was turned off
     /// for the hold and back on after.
     pub enhanced_ui: bool,
@@ -490,6 +516,30 @@ pub fn show_app_holding(
     };
     let el = unsafe { AXUIElement::new_application(pid.0) };
     unsafe { el.set_messaging_timeout(MESSAGING_TIMEOUT_SECS) };
+    // Only a window the window server has, as this app's, can be revealed by
+    // this un-hide. An id the model holds for a window since closed, or
+    // recycled by another app, is nothing to write to or wait for. A read
+    // that comes back empty may have failed, and is no evidence.
+    let ids: Vec<WindowId> = hold.iter().map(|(w, _)| *w).collect();
+    let described = super::zorder::describe(&ids);
+    let owned = |w: &WindowId| {
+        described.is_empty()
+            || described
+                .iter()
+                .any(|(d, owner, _)| d == w && *owner == pid.0)
+    };
+    let mut unreachable: Vec<WindowId> = ids.iter().filter(|w| !owned(w)).copied().collect();
+    let hold: Vec<(WindowId, Point)> = hold.iter().filter(|(w, _)| owned(w)).copied().collect();
+    let outcome = |unhid, writes, escaped, enhanced_ui, unreachable, stacks| HoldOutcome {
+        pid,
+        unhid,
+        writes,
+        elapsed_ms: started.elapsed().as_millis() as u64,
+        escaped,
+        unreachable,
+        enhanced_ui,
+        stacks,
+    };
     // See `Desktop::show_apps`: an un-hide sent to a showing app brings all
     // its windows forward, so a showing app is never sent one. But showing
     // is not proof its parked windows stayed parked: any focus un-hides an
@@ -499,15 +549,7 @@ pub fn show_app_holding(
     // would leave its windows invisible.
     let showing = app_hidden(pid) == Some(false);
     if showing && hold.iter().all(|(w, at)| holds_at(*w, *at)) {
-        return HoldOutcome {
-            pid,
-            unhid: false,
-            writes: 0,
-            elapsed_ms: started.elapsed().as_millis() as u64,
-            escaped: Vec::new(),
-            enhanced_ui: false,
-            stacks,
-        };
+        return outcome(false, 0, Vec::new(), false, unreachable, stacks);
     }
     if hold.is_empty() {
         // Nothing to lose to the reveal, and most un-hides are this: don't pay
@@ -515,34 +557,24 @@ pub fn show_app_holding(
         mark("before un-hide");
         unsafe { set_bool(&el, "AXHidden", false) };
         mark("after un-hide");
-        return HoldOutcome {
-            pid,
-            unhid: true,
-            writes: 0,
-            elapsed_ms: started.elapsed().as_millis() as u64,
-            escaped: Vec::new(),
-            enhanced_ui: false,
-            stacks,
-        };
+        return outcome(true, 0, Vec::new(), false, unreachable, stacks);
     }
 
     // Resolve the window elements BEFORE the un-hide: an AXWindows walk is a
     // round trip to the app, and once the reveal is under way that round trip
     // queues behind the app's own order-in work — the very milliseconds the
-    // hold is racing for. The array is borrowed from, so it stays alive for
-    // the whole chase (same rule as `raise_sequenced`).
-    let raw = unsafe { copy_attr(&el, "AXWindows") };
+    // hold is racing for. The arrays are borrowed from, so they stay alive
+    // for the whole chase (same rule as `raise_sequenced`).
+    let mut arrays: Vec<*const c_void> = Vec::new();
+    let listed = listed_windows(&el, &mut arrays);
     let mut chase: Vec<(WindowId, Point, *const AXUIElement)> = Vec::new();
-    if let Some(raw) = raw {
-        unsafe {
-            for i in 0..super::cf::array_len(raw) {
-                let win = super::cf::array_get(raw, i) as *const AXUIElement;
-                let Some(id) = window_id(win) else { continue };
-                if let Some((_, at)) = hold.iter().find(|(w, _)| *w == id) {
-                    chase.push((id, *at, win));
-                }
-            }
-        }
+    let mut chased: Vec<(WindowId, Point)> = hold.clone();
+    if let Some(listed) = &listed {
+        resolve(listed, &mut chase, &mut chased, &mut unreachable);
+    }
+    if showing && chased.iter().all(|(w, at)| holds_at(*w, *at)) {
+        release(arrays);
+        return outcome(false, 0, Vec::new(), false, unreachable, stacks);
     }
 
     mark("before un-hide");
@@ -557,6 +589,15 @@ pub fn show_app_holding(
 
     let deadline = started + HOLD_BUDGET;
     let mut writes = 0u32;
+    // An app that didn't answer before the un-hide is asked once more now,
+    // spending the hold's one re-read; failing that, nothing can be written,
+    // and its windows are left to the check below.
+    let mut reread = listed.is_none();
+    if reread {
+        if let Some(listed) = listed_windows(&el, &mut arrays) {
+            resolve(&listed, &mut chase, &mut chased, &mut unreachable);
+        }
+    }
     loop {
         // A window absent from this read is mid-reveal and reads as "not
         // there yet", which is the right answer: keep writing. Absence is what
@@ -570,13 +611,47 @@ pub fn show_app_holding(
         }
         // No sleep between rounds — each write is a synchronous round trip to
         // the app, which is the only pacing this loop needs (~12 writes per
-        // window over a converging chase). A write the app REFUSES is a window
-        // that no longer exists; dropping it is what keeps a dead handle from
-        // spinning here until the budget runs out.
-        chase.retain(|(_, at, win)| {
+        // window over a converging chase).
+        let mut refused: Vec<WindowId> = Vec::new();
+        for (w, at, win) in &chase {
             writes += 1;
-            unsafe { set_point(&**win, "AXPosition", at.x, at.y) == AXError::Success }
+            if unsafe { set_point(&**win, "AXPosition", at.x, at.y) } != AXError::Success {
+                refused.push(*w);
+            }
+        }
+        if refused.is_empty() {
+            continue;
+        }
+        // A refused write is a stale element or a closed window, and only a
+        // fresh read tells which: the window is chased on through its fresh
+        // element, or, no longer listed, it has closed. One re-read per hold,
+        // as `AxApp::through` allows: against a hung app each costs a
+        // messaging timeout. A window refused after that is dropped, and left
+        // to the check below.
+        let fresh = if reread {
+            None
+        } else {
+            reread = true;
+            listed_windows(&el, &mut arrays)
+        };
+        chase.retain_mut(|(w, _, win)| {
+            if !refused.contains(w) {
+                return true;
+            }
+            match fresh.as_ref().and_then(|f| f.get(w)) {
+                Some(el) => {
+                    *win = *el;
+                    true
+                }
+                None => false,
+            }
         });
+        if let Some(fresh) = &fresh {
+            for w in refused.iter().filter(|w| !fresh.contains_key(w)) {
+                chased.retain(|(c, _)| c != w);
+                unreachable.push(*w);
+            }
+        }
     }
 
     mark("after holds");
@@ -584,29 +659,70 @@ pub fn show_app_holding(
         if restore_eui {
             set_bool(&el, "AXEnhancedUserInterface", true);
         }
-        if let Some(raw) = raw {
-            sys::CFRelease(raw);
-        }
     }
+    release(arrays);
     if restore_eui {
         mark("after enhanced UI on");
     }
 
-    // Asked fresh rather than inferred from the loop, so a window that was
-    // never found in AXWindows or whose handle went stale is reported as
-    // escaped rather than silently counted as held.
-    HoldOutcome {
-        pid,
-        unhid: !showing,
-        writes,
-        elapsed_ms: started.elapsed().as_millis() as u64,
-        escaped: hold
-            .iter()
-            .filter(|(w, at)| !holds_at(*w, *at))
-            .map(|(w, _)| *w)
-            .collect(),
-        enhanced_ui: restore_eui,
-        stacks,
+    // Asked fresh rather than inferred from the loop, so a window whose
+    // writes kept being refused is reported as escaped rather than silently
+    // counted as held.
+    let escaped = chased
+        .iter()
+        .filter(|(w, at)| !holds_at(*w, *at))
+        .map(|(w, _)| *w)
+        .collect();
+    outcome(!showing, writes, escaped, restore_eui, unreachable, stacks)
+}
+
+/// The app's window elements by id, borrowed from an AXWindows array that is
+/// pushed onto `arrays` for the caller to release. `None` when the app didn't
+/// answer, which says nothing about its windows, unlike an empty list.
+fn listed_windows(
+    el: &AXUIElement,
+    arrays: &mut Vec<*const c_void>,
+) -> Option<HashMap<WindowId, *const AXUIElement>> {
+    let mut out = HashMap::new();
+    let raw = unsafe { copy_attr(el, "AXWindows") }?;
+    unsafe {
+        for i in 0..super::cf::array_len(raw) {
+            let win = super::cf::array_get(raw, i) as *const AXUIElement;
+            if let Some(id) = window_id(win) {
+                out.insert(id, win);
+            }
+        }
+    }
+    arrays.push(raw);
+    Some(out)
+}
+
+/// Chase each window of `chased` through its element in the app's list. One
+/// the app doesn't list can't be written, and it is not one the reveal orders
+/// in: the window server keeps some helper windows alive (Chrome's omnibox
+/// and find-bar popups, kitty's 64x64 one), and the model holds their ids.
+/// Waited for, each read as escaped on every un-hide of its app.
+fn resolve(
+    listed: &HashMap<WindowId, *const AXUIElement>,
+    chase: &mut Vec<(WindowId, Point, *const AXUIElement)>,
+    chased: &mut Vec<(WindowId, Point)>,
+    unreachable: &mut Vec<WindowId>,
+) {
+    chased.retain(|(w, at)| match listed.get(w) {
+        Some(win) => {
+            chase.push((*w, *at, *win));
+            true
+        }
+        None => {
+            unreachable.push(*w);
+            false
+        }
+    });
+}
+
+fn release(arrays: Vec<*const c_void>) {
+    for raw in arrays {
+        unsafe { sys::CFRelease(raw) };
     }
 }
 
@@ -902,13 +1018,15 @@ impl crate::app_queue::AppSession for AxApp {
                 o.elapsed_ms
             );
         }
-        HoldStat::new(o.pid, o.unhid, hold.len(), o.writes, o.elapsed_ms, o.escaped).with_steps(
-            o.enhanced_ui,
-            o.stacks
-                .into_iter()
-                .map(|(step, ids)| (step.to_string(), ids))
-                .collect(),
-        )
+        HoldStat::new(o.pid, o.unhid, hold.len(), o.writes, o.elapsed_ms, o.escaped)
+            .with_steps(
+                o.enhanced_ui,
+                o.stacks
+                    .into_iter()
+                    .map(|(step, ids)| (step.to_string(), ids))
+                    .collect(),
+            )
+            .with_unreachable(o.unreachable)
     }
 
     fn hide(&mut self) {

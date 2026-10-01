@@ -59,9 +59,12 @@ pub enum Event {
     },
 }
 
-/// Only gestures that MOVE focus are witnessed. Ordinary keystrokes are not:
-/// Cmd+N preceded a verified app-initiated fling by 500ms (run 51 seq 12769),
-/// so any "recent input" rule would have blessed it.
+/// The gestures that move focus are witnessed, and ordinary keystrokes too,
+/// as a bare [`Gesture::Key`], within a limit: a key press explains a focus
+/// change only inside the app it was typed into, or anywhere when it was
+/// typed into no model window (a launcher, the desktop). Without that limit
+/// typing would bless every app that grabs focus meanwhile: Cmd+N preceded a
+/// verified app-initiated fling by 500ms (run 51 seq 12769).
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Gesture {
     /// Any mouse button went down here (global CG coordinates). The point is
@@ -80,6 +83,33 @@ pub enum Gesture {
     /// in-app window cycle fired (Cmd+`). The target is the OS's to know; a
     /// focus landing on a hidden workspace right after is the user going there.
     SystemSwitch,
+    /// The user pressed a key that was not an Ordo chord: typing, or an app's
+    /// window shortcut, Spotlight, a launcher. It carries no key, so the log
+    /// never holds what was typed, and the tap reports one per short interval
+    /// at most. It explains the next focus change within the app it was typed
+    /// into (see above), but hands the slot to no one and licenses no follow:
+    /// typing is not navigation.
+    Key,
+}
+
+/// Which kind of input explained a focus landing, as the log records it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Input {
+    Click,
+    MenuBar,
+    Switcher,
+    Key,
+}
+
+impl From<Gesture> for Input {
+    fn from(g: Gesture) -> Self {
+        match g {
+            Gesture::MouseDown { .. } => Input::Click,
+            Gesture::MenuBar { .. } => Input::MenuBar,
+            Gesture::SystemSwitch => Input::Switcher,
+            Gesture::Key => Input::Key,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -184,6 +214,9 @@ pub enum OpOutcome {
 /// Spaces the OS owns them and the same field genuinely is observed. The core
 /// handles both identically — the backend's word is authoritative — so the
 /// core path never bifurcates; only the provenance differs, behind the seam.
+///
+/// `unread` is neither: it says what the observation did NOT cover, so the
+/// absence of those windows from `windows` is not read as their closing.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WorldSnapshot {
     pub monitors: Vec<MonitorSnap>,
@@ -193,6 +226,11 @@ pub struct WorldSnapshot {
     /// replays diverge regardless — the decision logic changed with the shape).
     #[serde(default)]
     pub workspaces: WorkspaceSnap,
+    /// Windows missing from `windows` only because their app did not answer
+    /// in time, and which the window server still has. The model keeps them
+    /// as last seen, placed by the backend's word like any other.
+    #[serde(default)]
+    pub unread: Vec<WindowId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

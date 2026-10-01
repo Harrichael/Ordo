@@ -93,6 +93,9 @@ impl Msg {
 /// fresh look. Creation hints survive, one per app, because only they
 /// authorize corralling a new window; every other trigger means just "go
 /// look". Gestures and the mode messages stay fences: their place is intent.
+/// A key press is the exception: typing runs through a burst without being
+/// part of it, and what it explains is the look after it, so it goes ahead
+/// of the batch's look and splits nothing.
 fn collapse_rescans(batch: Vec<Msg>) -> Vec<Msg> {
     let mut out = Vec::with_capacity(batch.len());
     let mut rescans: Vec<RescanTrigger> = Vec::new();
@@ -104,7 +107,7 @@ fn collapse_rescans(batch: Vec<Msg>) -> Vec<Msg> {
             Msg::Hotkey(..) | Msg::RestackStats(_) => after.push(m),
             // Ahead of the look the batch's rescans become, so that look acts
             // on it.
-            Msg::AppVisibility(..) => out.push(m),
+            Msg::AppVisibility(..) | Msg::Gesture(Gesture::Key) => out.push(m),
             fence => {
                 flush_rescans(&mut rescans, &mut out);
                 out.append(&mut after);
@@ -207,9 +210,12 @@ impl Engine {
         since.elapsed() < LOOK_BOUND
     }
 
-    fn looked(&mut self) {
-        self.held_since = None;
+    /// A look is being taken now; how long it was held back.
+    fn looked(&mut self) -> Duration {
         self.gesture_unseen = false;
+        self.held_since
+            .take()
+            .map_or(Duration::ZERO, |since| since.elapsed())
     }
 
     /// A look asked for from outside: taken now, or held back until the apps
@@ -266,10 +272,10 @@ impl Engine {
     /// originate here (or from a `RequestRescan` cascade) — never from an
     /// external producer, which cannot touch the thread-affine world source.
     pub fn observe(&mut self, trigger: RescanTrigger) {
-        self.looked();
+        let held = self.looked();
         let snap = self.world.snapshot();
         self.drain_park_trace();
-        let cost = self.world.take_snapshot_stats();
+        let cost = self.world.take_snapshot_stats().map(|c| SnapshotStats { held, ..c });
         // No displays means the world is unobservable, not empty — displays
         // asleep make every window "missing", and believing that once erased
         // the whole model over a weekend. Discard the blind scan; the next
@@ -326,6 +332,15 @@ impl Engine {
                     Msg::AppVisibility(pid, hidden) => {
                         self.effector.note_app_visibility(pid, hidden);
                     }
+                    // Nor a key press, which may overtake presses queued in
+                    // the same batch: a command after it only clears what it
+                    // would have explained. Its look is held like any other,
+                    // since it licenses no follow, and the hold ends well
+                    // within the time it explains a focus change for.
+                    Msg::Gesture(Gesture::Key) => self.pump(Event::Gesture {
+                        at: self.clock.now(),
+                        gesture: Gesture::Key,
+                    }),
                     other => {
                         self.flush_hotkeys(&mut hotkeys);
                         match other {
@@ -458,10 +473,10 @@ impl Engine {
                 if self.hold_look(reason.clone()) {
                     return;
                 }
-                self.looked();
+                let held = self.looked();
                 let snap = self.world.snapshot();
                 self.drain_park_trace();
-                let cost = self.world.take_snapshot_stats();
+                let cost = self.world.take_snapshot_stats().map(|c| SnapshotStats { held, ..c });
                 // The same blind-scan discard as `observe`: a post-effect
                 // rescan during display sleep or a display reconfiguration
                 // must not feed the core an empty world.

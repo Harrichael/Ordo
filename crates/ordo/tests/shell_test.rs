@@ -123,6 +123,7 @@ impl FakeOs {
             monitors,
             windows: self.windows.clone(),
             focused: self.focused,
+            unread: Vec::new(),
         }
     }
 }
@@ -148,6 +149,7 @@ impl WorldSource for FakeWorld {
             apps: 2,
             windows: self.0.borrow().windows.len(),
             slowest: Some((Pid(200), Duration::from_millis(6))),
+            held: Duration::ZERO,
         })
     }
 }
@@ -318,6 +320,7 @@ fn snap(focused: Option<u32>, a_ws: u8, b_ws: u8) -> WorldSnapshot {
         monitors: vec![mon(1, 0.0), mon(2, 1920.0)],
         windows: vec![win(1, 100, 100.0), win(2, 200, 2000.0), win(3, 100, 600.0)],
         focused: focused.map(WindowId),
+        unread: Vec::new(),
         workspaces: WorkspaceSnap {
             monitors: [
                 (
@@ -1188,4 +1191,94 @@ fn a_gestures_look_is_not_held_back() {
     ];
     let (looks, held) = run_gated(false, script);
     assert_eq!(looks, 2, "{held:?}");
+}
+
+/// Each look logs how long it was held back: nothing for one taken at once,
+/// and the wait for one asked for while the apps were busy, taken once they
+/// went idle.
+#[test]
+fn each_look_logs_how_long_it_was_held_back() {
+    let dir = std::env::temp_dir().join(format!("ordo-held-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = dir.join("held.db");
+    let _ = std::fs::remove_file(&db);
+    let os = fake_os(FocusPolicy::Lands);
+    let idle = Rc::new(Cell::new(false));
+    {
+        let logger = Logger::open(&db, "test", "emulated", 1_000).unwrap();
+        let mut engine = engine_on(&os, logger).with_look_gate(Box::new(FakeGate {
+            idle: idle.clone(),
+            held: Rc::new(RefCell::new(Vec::new())),
+        }));
+        engine.observe(RescanTrigger::Startup);
+        engine.pump(Event::Hotkey {
+            at: at(1),
+            action: HotkeyAction::WorkspaceNext,
+        });
+        std::thread::sleep(Duration::from_millis(5));
+        idle.set(true);
+        engine.observe(RescanTrigger::Periodic);
+    }
+    let conn = Connection::open(&db).unwrap();
+    let held: Vec<f64> = conn
+        .prepare("SELECT held_ms FROM snapshots ORDER BY seq")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(held.len(), 2, "{held:?}");
+    assert_eq!(held[0], 0.0);
+    assert!(held[1] >= 5.0, "{held:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The user closes the last window. A scan with displays and no windows is
+/// believed: telling that from a locked screen is the world source's job,
+/// which asks the window server and reports a locked screen as no displays.
+#[test]
+fn closing_the_last_window_is_seen() {
+    let mut empty = snap(None, 1, 1);
+    empty.windows.clear();
+    let world = ScriptedWorld {
+        snaps: vec![snap(Some(1), 1, 1), empty],
+        at: Rc::new(Cell::new(0)),
+    };
+    let mut engine = Engine::new(
+        in_memory_logger("emulated"),
+        Box::new(world),
+        Box::new(OkEffector),
+        Box::new(StepClock { n: Cell::new(0) }),
+    );
+    engine.observe(RescanTrigger::Startup);
+    engine.observe(RescanTrigger::Periodic);
+    assert!(engine.state().windows.is_empty());
+}
+
+/// Typing runs through a burst without being part of it: a key press queued
+/// between two presses does not keep them from folding into one switch, as
+/// a click between them would.
+#[test]
+fn a_key_press_does_not_split_a_queued_burst() {
+    let dir = std::env::temp_dir().join(format!("ordo-keyburst-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = dir.join("keyburst.db");
+    let _ = std::fs::remove_file(&db);
+    let os = fake_os(FocusPolicy::Lands);
+    {
+        let engine = engine_on(&os, Logger::open(&db, "test", "emulated", 1_000).unwrap());
+        let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
+        tx.send(Msg::hotkey(HotkeyAction::WorkspaceNext)).unwrap();
+        tx.send(Msg::Gesture(Gesture::Key)).unwrap();
+        tx.send(Msg::hotkey(HotkeyAction::WorkspaceNext)).unwrap();
+        tx.send(Msg::Shutdown).unwrap();
+        engine.run(rx);
+    }
+    assert_eq!(os.borrow().active, WorkspaceId(3));
+    let conn = Connection::open(&db).unwrap();
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM effects WHERE kind = 'switch_workspace'"),
+        1
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

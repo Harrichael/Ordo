@@ -12,6 +12,8 @@ Handoff notes for whoever picks this up next. Each item is open: what is known, 
 | 29 | 1790627142362 | Workspace 3 with 8 Preview windows; restacking flicker |
 | 33 | 1790639352913 | Only-hidden un-hides, before the revealed-app hold |
 | 35 | 1790678196817 | With the revealed-app hold (3e936ef) |
+| 46 | 1790720812195 | Whole-app drops from AX timeouts |
+| 48 | 1790802567287 | Burst work; focus failures, escaped holds, a screen lock |
 
 **Queries:** the switch-speed scripts are in `scripts/log-analysis/` (see `docs/switch-speed.md`); older analyses were ad hoc and aren't saved. The tables to read are `events`, `effects`, `notes`, `park_trace`, `restacks` + `raises`, `hotkey_batches`, `snapshots`.
 - Time ordering inside one engine step: `park_trace.wall_ms` is stamped when the trace is drained, so use `rowid` for order.
@@ -94,7 +96,7 @@ Run 25 (old planner): 4 restacks ended `converged = 0`, `restack_id` 1279, 1307,
 
 ## 6. Snapshot cost leftovers
 
-- **Six ledger windows are alive but never scanned:** 24998, 44850, 44863, 67652, 70295, 70296 (minimized, on another Space, or the Chrome find bar). Every snapshot therefore calls `existing_windows`, a full CG list at about 2ms. Cache the "alive but unscanned" answer between snapshots.
+- **Six ledger windows are alive but never scanned:** 24998, 44850, 44863, 67652, 70295, 70296 (minimized, on another Space, or the Chrome find bar). Every snapshot therefore calls `existing_windows`, a full CG list at about 2ms. Cache the "alive but unscanned" answer between snapshots. Most are Chrome helper popups the ledger adopted once and can't forget (see §9).
 - **About 5–7ms per snapshot outside the window walk is untimed** (`snapshots.total_ms - walk_ms - enforce_ms`). Candidates: `focused_window`'s AXFrontmost loop, `believed_frames`, trace building, persistence.
 
 ## 7. Fly-by flashing of intermediate workspaces
@@ -108,3 +110,19 @@ Run 21: every press was a full switch, because the engine keeps up with presses 
 - **Startup "re-parks" that move nothing.** 10–14 per restart, `Reassert` rows with observed == requested; every restart on 2026-09-28/29 had them. The at-park check disagrees with an exact park position right after launch. Harmless but noisy.
 - **`docs/desired-state-reconciler.md` still orders its plan with Focus first.** Before anything there is built, it should adopt the rule that the stacking worker makes the top key before the other raises (9d93a0f).
 - **Shutdown takes up to 2s.** After SIGINT, the periodic-rescan thread only sends `Msg::Shutdown` between sleeps (`main.rs`, `period` = the rescan interval), so hotkeys keep being handled meanwhile. A restart during a burst saw 8 switches land after the signal.
+
+## 9. Windows the scans miss, and holds on windows that aren't there
+
+Investigated from run 48 (and 46, 47, 49). What was fixed, and what is left.
+
+**Fixed:**
+- **"focus: window not found" was a hidden app, not a missing window.** All 5 in run 48 (seqs 261, 451, 554, 603, 955) and all 10 in run 49 targeted a kitty window while kitty was still hidden: the switch had just queued kitty's un-hide, and `zorder::owner_of` asked the `kCGWindowListOptionIncludingWindow` list, which leaves out a hidden app's windows. The window was in the model before and after each one; the `focus_reasserted` that followed was the core retrying. `owner_of` now asks by name (`describe`), which answers for hidden apps.
+- **An app that doesn't answer loses its windows for one scan.** Run 46 seq 3704: all six kitty windows vanished at once, the scan's slowest app was kitty at 204 ms (the 0.2 s timeout), and they came back 1.8 s later. Run 47 had 15 such whole-app drops, 14 with `walk_ms` of 195 or more. `app_windows` read a timed-out `AXWindows` as no windows. The snapshot now carries `unread`: the windows of apps that returned `kAXErrorCannotComplete` which the window server's full list still has, so an app that keeps timing out can't keep closed windows alive. The core keeps them as last seen, placed by the backend's word.
+- **A locked screen emptied the model.** Run 48 seq 662-670: two displays, 11 apps, 0 windows, for 13 minutes; every window was destroyed in the model, and after the 10 s vanish grace lost its MRU place. Each of the windows named in the handoff (41128, 67722, 44837, 80126, 77899) vanished in run 48 only in this one episode. `MacWorldSource::snapshot` now reports a scan in which no app lists a window, while the window server's full list still has windows the last snapshot held, as no displays at all (the existing "unobservable" path), and says so once on stderr. A scan whose missing windows are gone from that list too is believed: the last window closing.
+- **"Escaped" holds were ghost ledger entries.** All 10 non-converged Shows in run 48 escaped only windows their app never lists in `AXWindows`: kitty's 22570 (64x64) on every kitty hold, and 11 Chrome ids (23310, 24998, 44850, 44863, 66427, 67652, 72006, 73055, 73389, 75111, 77901; omnibox dropdowns, a find bar, a status bubble), each an id next to a real Chrome window's. None appears in the scans around the holds (only 24998 and 75111 appear in run 48 at all, briefly, as untitled popups); most never appear in any run since 30. No window the app lists escaped, and nothing points to a refused write. The hold never wrote to them (they weren't in the chase), but the final check counted them. `show_app_holding` now drops held windows the window server doesn't have as this app's, reports the ones the app lists nothing for as `unreachable` rather than escaped, skips the enhanced-UI toggle when a showing app's listed windows already hold, and retries a refused write once through a fresh element before giving up on it. An app that doesn't answer for its window list is asked again after the un-hide; its windows stay chased, and read as escaped if they don't hold.
+
+**Still open:**
+- **The ledger adopts helper popups and never forgets them.** `note_scan` adopts any window an AX scan lists, `AXUnknown` popups included, and forgets one only when the window server's full list drops it. Chrome keeps its helper windows alive while they're hidden, so they stay in the ledger across restarts (all of the ids above are in `state.json`), are parked and held on every switch, and cost `existing_windows` a full CG list per snapshot (§6). This is §3's problem: decide which windows are managed before adopting them. A narrower fix would be to hold, park and check only windows the latest scan listed, keeping the claim for when one reappears.
+- **Chrome's un-hide takes 177-257 ms**, most of it the un-hide round trip itself, not the hold waiting. Preview's plain un-hide, with nothing held, has a median of about 107 ms.
+- **A window whose own reads time out is still dropped.** Only a timed-out `AXWindows` list marks the app unread; a timed-out `AXPosition` or `AXSize` on one window drops just that window. No case seen: run 47's 99 single-window drops were Chrome popups coming and going, none with a slow walk.
+- **`snapshots.slowest_pid` names one app.** When two apps time out together, the one that lost its windows may not be the one named.

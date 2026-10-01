@@ -93,6 +93,9 @@ pub struct HoldStat {
     pub writes: u32,
     pub elapsed_ms: u64,
     pub escaped: Vec<WindowId>,
+    /// Held windows the port could not reach: gone, another app's, or not in
+    /// the app's own window list. Not escapes: nothing the un-hide reveals.
+    pub unreachable: Vec<WindowId>,
     /// `escaped.is_empty()`, carried as its own field so the question this
     /// telemetry exists to answer is one column and not an array to measure.
     pub converged: bool,
@@ -120,6 +123,7 @@ impl HoldStat {
             elapsed_ms,
             converged: escaped.is_empty(),
             escaped,
+            unreachable: Vec::new(),
             enhanced_ui: false,
             stacks: Vec::new(),
         }
@@ -128,6 +132,11 @@ impl HoldStat {
     pub fn with_steps(mut self, enhanced_ui: bool, stacks: Vec<(String, Vec<WindowId>)>) -> Self {
         self.enhanced_ui = enhanced_ui;
         self.stacks = stacks;
+        self
+    }
+
+    pub fn with_unreachable(mut self, unreachable: Vec<WindowId>) -> Self {
+        self.unreachable = unreachable;
         self
     }
 }

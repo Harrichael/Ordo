@@ -81,9 +81,18 @@ pub(crate) fn diff(state: &State, snap: &WorldSnapshot) -> Vec<Delta> {
         }
     }
 
-    for id in state.windows.keys() {
-        if !snap.windows.iter().any(|w| w.id == *id) {
+    for (id, old) in &state.windows {
+        if snap.windows.iter().any(|w| w.id == *id) {
+            continue;
+        }
+        if !snap.unread.contains(id) {
             deltas.push(Delta::WindowDestroyed(*id));
+        } else if let Some(to) = snap.workspaces.assignments.get(id).filter(|to| **to != old.workspace) {
+            deltas.push(Delta::WindowWorkspaceChanged {
+                window: *id,
+                from: old.workspace,
+                to: *to,
+            });
         }
     }
     for w in &snap.windows {
@@ -166,7 +175,9 @@ pub(crate) fn diff(state: &State, snap: &WorldSnapshot) -> Vec<Delta> {
 
 /// Belief follows the snapshot wholesale — records are rebuilt, not patched.
 /// Only what the snapshot cannot know survives: focus history, declarations,
-/// damping counters, pendings (handled by the caller). Observed focus is
+/// damping counters, pendings (handled by the caller), and the records of
+/// windows it says it did not read (`unread`), which carry over as last seen
+/// but take the backend's word afresh. Observed focus is
 /// mirrored here but never recorded into the MRU history: which window counts
 /// as "used" is the caller's decision, made against the focus declaration.
 pub(crate) fn apply_snapshot(s: &mut State, snap: &WorldSnapshot) {
@@ -278,6 +289,30 @@ pub(crate) fn apply_snapshot(s: &mut State, snap: &WorldSnapshot) {
         .collect();
     for w in attached {
         s.focus_history.remove(w);
+    }
+
+    // A window its app did not answer for is still there, on the displays
+    // still there. Where it belongs is the backend's word, which a scan that
+    // missed it still carries: a carry must confirm on it, or the carry's
+    // retry would fight a window already where it was sent.
+    for (id, mut r) in old_windows {
+        if snap.unread.contains(&id)
+            && !s.windows.contains_key(&id)
+            && s.monitors.contains_key(&r.monitor)
+        {
+            if let Some(ws) = snap.workspaces.assignments.get(&id) {
+                r.workspace = *ws;
+            }
+            if let Some(vm) = snap
+                .workspaces
+                .virtual_monitors
+                .as_ref()
+                .and_then(|word| word.assignments.get(&id))
+            {
+                r.vmonitor = *vm;
+            }
+            s.windows.insert(id, r);
+        }
     }
 
     // A window gone from this scan keeps its history entry for now; the

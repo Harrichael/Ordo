@@ -43,6 +43,11 @@
 //! chords — Cmd+Tab and Cmd+` — which Ordo never swallows but must see: they
 //! are the user's intent about focus, and without a trace of them the focus
 //! change they cause is indistinguishable from an app flinging focus around.
+//! Every other key that reaches an app is reported too, keyless and rate
+//! limited ([`KeyWitness`]): an app's window shortcut or a launcher moves
+//! focus from the keyboard just as surely.
+
+use std::time::{Duration, Instant};
 
 use ordo_core::{HotkeyAction, WorkspaceId};
 
@@ -116,6 +121,39 @@ pub fn witness(keycode: u16, m: Mods) -> Option<Witness> {
         code::TAB => Some(Witness::AppSwitcherArmed),
         code::GRAVE => Some(Witness::WindowCycle),
         _ => None,
+    }
+}
+
+/// At most one key press is reported per this interval. Typing runs to ten
+/// keys a second, and each report is a logged core event; what one explains
+/// (the first focus change within a second, in the core) is covered as well
+/// by the report a moment before.
+const KEY_REPORT_INTERVAL: Duration = Duration::from_millis(300);
+
+/// Which key-downs the tap reports as a user's key press
+/// ([`ordo_core::Gesture::Key`]). Never the key itself.
+#[derive(Default)]
+pub struct KeyWitness {
+    last: Option<Instant>,
+}
+
+impl KeyWitness {
+    /// Whether this key-down is reported. Never while Ordo is paused or
+    /// rescued, when nothing reads it; never one the tap swallows as an Ordo
+    /// chord, which is a command already; nor one of macOS's own focus
+    /// chords, which [`witness`] reports as what they are.
+    pub fn report(&mut self, keycode: u16, m: Mods, intercepting: bool, now: Instant) -> bool {
+        if !intercepting || match_chord(keycode, m).is_some() || witness(keycode, m).is_some() {
+            return false;
+        }
+        if self
+            .last
+            .is_some_and(|t| now.saturating_duration_since(t) < KEY_REPORT_INTERVAL)
+        {
+            return false;
+        }
+        self.last = Some(now);
+        true
     }
 }
 
@@ -218,6 +256,26 @@ mod tests {
     /// Digit keycodes are not sequential and 5/6 are transposed, so a mapping
     /// that looks right can silently send you to the wrong workspace. Pinned
     /// against the literal codes rather than the table it is derived from.
+    /// A key typed into an app is reported, at most one per interval;
+    /// an Ordo chord never is, being a command already, nor a chord macOS's
+    /// own switcher answers, nor anything while Ordo is paused.
+    #[test]
+    fn typing_is_reported_sparingly_and_ordo_chords_never() {
+        let t0 = Instant::now();
+        let plain = mods(false, false, false, false);
+        let mut keys = KeyWitness::default();
+        assert!(keys.report(code::J, plain, true, t0));
+        assert!(!keys.report(code::K, plain, true, t0 + Duration::from_millis(100)));
+        assert!(keys.report(code::K, plain, true, t0 + Duration::from_millis(400)));
+
+        let mut keys = KeyWitness::default();
+        let cmd = mods(true, false, false, false);
+        assert!(!keys.report(code::RIGHT, cmd, true, t0), "Cmd+Right is Ordo's");
+        assert!(!keys.report(code::TAB, cmd, true, t0), "Cmd+Tab is macOS's switcher");
+        assert!(!keys.report(code::J, plain, false, t0), "nothing while paused");
+        assert!(keys.report(code::J, plain, true, t0));
+    }
+
     #[test]
     fn cmd_alt_digit_jumps_to_that_workspace() {
         let chord = mods(true, true, false, false);

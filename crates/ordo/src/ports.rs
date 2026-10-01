@@ -64,6 +64,10 @@ pub struct SnapshotStats {
     pub apps: usize,
     pub windows: usize,
     pub slowest: Option<(Pid, Duration)>,
+    /// How long the look was held back while the apps were busy with Ordo's
+    /// writes (see [`LookGate`]); zero when it was taken at once. The engine
+    /// fills it in, since it owns the hold.
+    pub held: Duration,
 }
 
 /// Carries out a core [`Effect`] against the OS.

@@ -37,7 +37,8 @@ row("un-hide/hold elapsed", [c['show']['elapsed_ms'] for c in chains if c.get('s
 row("focus ran at", [c['focus']['done_ms'] for c in chains if c.get('focus') and not c['focus']['skipped']])
 print(f"moves replaced before sending: {sum(c['replaced'] for c in chains)}; focuses skipped: "
       f"{sum(1 for c in chains if c.get('focus') and c['focus']['skipped'])}; "
-      f"holds that left windows out: {sum(1 for c in chains if c.get('show') and not c['show']['converged'])}")
+      f"holds that left windows out: {sum(1 for c in chains if c.get('show') and not c['show']['converged'])}; "
+      f"holds with windows out of their reach: {sum(1 for c in chains if c.get('show') and c['show'].get('unreachable'))}")
 print("\nper app:")
 per = defaultdict(list)
 for c in chains: per[c['pid']].append(c)

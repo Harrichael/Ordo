@@ -84,24 +84,14 @@ pub fn describe(windows: &[WindowId]) -> Vec<(WindowId, i32, Rect)> {
     out
 }
 
-/// The pid that owns this window, on screen or not (a hidden app's windows
-/// included).
+/// The pid that owns this window, on screen or not. Asked by name, as
+/// [`describe`] does: the `kCGWindowListOptionIncludingWindow` list leaves out
+/// a hidden app's windows (see [`window_bounds`]), and every switch focuses a
+/// window whose app its own un-hide, just queued, has not yet shown. Asked
+/// that way, all of run 48's "focus: window not found" failures were kitty
+/// windows, with kitty still hidden.
 pub fn owner_of(w: WindowId) -> Option<i32> {
-    const INCLUDING_WINDOW: u32 = 1 << 3;
-    unsafe {
-        let arr = CGWindowListCopyWindowInfo(INCLUDING_WINDOW, w.0);
-        if arr.is_null() {
-            return None;
-        }
-        let pid = (cf::array_len(arr) > 0)
-            .then(|| {
-                let d = cf::array_get(arr, 0) as sys::CFDictionaryRef;
-                cf::number_i64(cf::dict_get(d, "kCGWindowOwnerPID"))
-            })
-            .flatten();
-        sys::CFRelease(arr);
-        pid.map(|p| p as i32)
-    }
+    describe(&[w]).first().map(|(_, pid, _)| *pid)
 }
 
 /// On-screen normal (layer-0) windows with their owning pids, front to back.

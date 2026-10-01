@@ -33,7 +33,7 @@
 use rusqlite::{Connection, Transaction};
 
 /// The schema version this build writes and understands.
-pub const CURRENT_VERSION: i32 = 8;
+pub const CURRENT_VERSION: i32 = 9;
 
 type Migration = fn(&Transaction) -> rusqlite::Result<()>;
 
@@ -46,6 +46,7 @@ const MIGRATIONS: &[Migration] = &[
     m6_restack_start_order,
     m7_overlap_restacks,
     m8_restack_landing_wait,
+    m9_snapshot_held,
 ];
 
 /// Read the version of an existing log, refusing one written by a newer Ordo.
@@ -202,6 +203,11 @@ fn m7_overlap_restacks(tx: &Transaction) -> rusqlite::Result<()> {
 
 fn m8_restack_landing_wait(tx: &Transaction) -> rusqlite::Result<()> {
     tx.execute_batch("ALTER TABLE restacks ADD COLUMN landing_wait_ms INTEGER NOT NULL DEFAULT 0;")
+}
+
+/// How long each look was held back while the apps were busy.
+fn m9_snapshot_held(tx: &Transaction) -> rusqlite::Result<()> {
+    tx.execute_batch("ALTER TABLE snapshots ADD COLUMN held_ms REAL NOT NULL DEFAULT 0;")
 }
 
 /// Version 1: the schema as it first shipped. Frozen — see the module rules.
@@ -504,6 +510,7 @@ CREATE INDEX events_by_kind ON events(run_id, kind);
         assert!(columns(&conn, "restacks").contains(&"start_order".to_string()));
         assert!(columns(&conn, "restacks").contains(&"frames".to_string()));
         assert!(columns(&conn, "raises").contains(&"ax_ms".to_string()));
+        assert!(columns(&conn, "snapshots").contains(&"held_ms".to_string()));
     }
 
     #[test]

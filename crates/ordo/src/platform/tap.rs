@@ -11,8 +11,11 @@
 //! mouse-down (telling menu bar clicks apart), and macOS's Cmd+Tab / Cmd+` — and reports them as
 //! [`Msg::Gesture`] while passing the event through untouched. Without that
 //! trace, a click and a notification stealing focus look identical to the
-//! core. Ordinary keystrokes are deliberately NOT reported: they say nothing
-//! about focus, and treating "recent typing" as intent blessed a fling once.
+//! core. Every other key that reaches an app is reported as a bare
+//! [`Gesture::Key`] (no key, at most one per interval, and nothing while
+//! Ordo is paused or rescued; see [`keys::KeyWitness`]): the core lets it
+//! explain only the focus change right after it within the app typed into,
+//! and never a follow onto a hidden workspace.
 //!
 //! The rescue chord is handled here, ahead of everything, so the kill switch
 //! works even if the engine thread is wedged: on the second press within the
@@ -52,6 +55,7 @@ struct TapContext {
     /// Cmd+Tab was pressed and Cmd is still held: the app switcher acts on the
     /// release, which is when the gesture is reported.
     app_switcher_armed: Cell<bool>,
+    keys: RefCell<keys::KeyWitness>,
 }
 
 /// Spawn the tap on its own thread with its own run loop. The thread runs until
@@ -67,6 +71,7 @@ pub fn spawn(tx: Sender<Msg>, intercepting: Arc<AtomicBool>, menu_bars: MenuBars
             tap: RefCell::new(None),
             last_rescue: Cell::new(None),
             app_switcher_armed: Cell::new(false),
+            keys: RefCell::new(keys::KeyWitness::default()),
         }));
 
         // Mouse-downs and modifier changes are listened to, never altered;
@@ -157,6 +162,12 @@ unsafe extern "C-unwind" fn callback(
     }
 
     let keycode = CGEvent::integer_value_field(Some(ev), CGEventField::KeyboardEventKeycode) as u16;
+    let typed = ctx.keys.borrow_mut().report(
+        keycode,
+        mods,
+        ctx.intercepting.load(Ordering::Relaxed),
+        Instant::now(),
+    );
 
     // The engage chord is checked before the interception gate — its whole job
     // is to work while Ordo is disengaged (post-rescue, or a --paused start).
@@ -197,6 +208,9 @@ unsafe extern "C-unwind" fn callback(
                 Some(Witness::AppSwitcherArmed) => ctx.app_switcher_armed.set(true),
                 Some(Witness::WindowCycle) => {
                     let _ = ctx.tx.send(Msg::Gesture(Gesture::SystemSwitch));
+                }
+                None if typed => {
+                    let _ = ctx.tx.send(Msg::Gesture(Gesture::Key));
                 }
                 None => {}
             }

@@ -4,14 +4,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::effect::{CorrectionAxis, Effect, Expectation};
 use crate::event::{
-    AxHintKind, Event, Gesture, HotkeyAction, OpOutcome, RescanTrigger, WorldSnapshot,
+    AxHintKind, Event, Gesture, HotkeyAction, Input, OpOutcome, RescanTrigger, WorldSnapshot,
 };
 use crate::ids::{
     MonitorId, OpId, Pid, Rect, VirtualMonitorId, WindowId, WorkspaceId, FRAME_EPSILON,
 };
 use crate::project::{after_merge, project, Projection};
 use crate::reconcile::{self, Delta};
-use crate::state::{FocusIntent, Mode, PendingOp, State, WindowRecord};
+use crate::state::{Away, FocusIntent, Landing, Mode, PendingOp, State, WindowRecord};
 
 /// How long an expectation may go unmet before its op is declared lost.
 ///
@@ -71,6 +71,10 @@ pub enum Note {
     OpSuperseded { op: OpId, by: OpId },
     /// A change we didn't cause. Belief absorbed it.
     External { delta: Delta },
+    /// The user's input explained a focus landing, and it entered the MRU
+    /// order (and, after a key press, the declaration). What makes the rule
+    /// in `record_landing` measurable.
+    LandingExplained { window: WindowId, by: Input },
     /// The verdict `handle_gesture` reached on a witnessed gesture: whether
     /// it armed a follow and, when a mouse-down did not, which visible window
     /// swallowed the point. This exists because an UNARMED follow is otherwise
@@ -185,7 +189,7 @@ pub fn update(state: &State, event: &Event) -> Step {
         }
         // Not gated on mode: a gesture while rescued still means the OS owns
         // focus, which is exactly what a later Engaged must find.
-        Event::Gesture { gesture, .. } => handle_gesture(&mut s, *gesture, &mut notes),
+        Event::Gesture { at, gesture } => handle_gesture(&mut s, *gesture, at.mono_ns, &mut notes),
     }
 
     Step {
@@ -262,21 +266,14 @@ fn push_desktop(
 ) -> OpId {
     let op = s.mint_op();
     fx.push(Effect::FocusDesktop { op, display });
-    supersede(s, op, is_focus_grant, notes);
-    if s.focused.is_some() {
-        s.pending.push(PendingOp {
-            op,
-            expect: Expectation::DesktopFocused,
-            issued_ns: now_ns,
-        });
-    }
+    let expect = Expectation::DesktopFocused;
+    retire_grants(s, op, &expect, s.focused.is_some(), now_ns, notes);
     op
 }
 
-/// Hand focus to `window`. The single emitter with `push_desktop`: each app
-/// queue skips a focus once a newer one is queued anywhere, so every older
-/// grant is moot the moment this one is issued. `expect` is false where the
-/// belief already holds this focus, so no delta will need explaining.
+/// Hand focus to `window`. The single emitter with `push_desktop`. `expect`
+/// is false where the belief already holds this focus, so no delta will need
+/// explaining.
 fn push_focus(
     s: &mut State,
     window: WindowId,
@@ -287,15 +284,40 @@ fn push_focus(
 ) -> OpId {
     let op = s.mint_op();
     fx.push(Effect::FocusWindow { op, window });
-    supersede(s, op, is_focus_grant, notes);
-    if expect {
+    retire_grants(s, op, &Expectation::Focused(window), expect, now_ns, notes);
+    op
+}
+
+/// Book a new grant, `op`, against the older ones. Each app queue skips a
+/// focus once a newer one is queued anywhere, so an older grant for another
+/// target is moot the moment this one is issued, and retired. Then this one
+/// is expected even where the last look already saw its window key
+/// (`expected` false): the overtaken grant may have been sent already and
+/// land late, and the newest grant, on its way behind it, is what
+/// `enforce_focus` must wait for rather than grant over. With nothing
+/// overtaken, an older grant for the SAME target stands in for this one, and
+/// stays the record that a grant for it is on its way.
+fn retire_grants(
+    s: &mut State,
+    op: OpId,
+    expect: &Expectation,
+    expected: bool,
+    now_ns: u64,
+    notes: &mut Vec<Note>,
+) {
+    let overtakes = s
+        .pending
+        .iter()
+        .any(|p| is_focus_grant(&p.expect) && p.expect != *expect);
+    let book = expected || overtakes;
+    supersede(s, op, |e| is_focus_grant(e) && (book || e != expect), notes);
+    if book {
         s.pending.push(PendingOp {
             op,
-            expect: Expectation::Focused(window),
+            expect: expect.clone(),
             issued_ns: now_ns,
         });
     }
-    op
 }
 
 fn is_focus_grant(e: &Expectation) -> bool {
@@ -392,8 +414,8 @@ fn view_for(s: &State, target: WindowId) -> (Option<VirtualMonitorId>, Projectio
     (Some(vm), s.projection_with(Some(vm), None))
 }
 
-/// The user reached for focus through the OS rather than through Ordo. Whatever
-/// Ordo declared is moot — the OS owns the slot until the next command — and
+/// The user reached for focus through the OS rather than through Ordo (by any
+/// gesture except a key press, below). Whatever Ordo declared is moot — the OS owns the slot until the next command — and
 /// the next observation gets to read a hidden-workspace landing as the user
 /// going there, but only if the gesture could have been aimed there: a click
 /// INTO a window on the visible workspace keys that window (or a sheet or
@@ -402,26 +424,52 @@ fn view_for(s: &State, target: WindowId) -> (Option<VirtualMonitorId>, Projectio
 /// A click that ends an open menu is classified as the menu's, not as a click
 /// into whatever window the menu was drawn over: it may be a menu item, and a
 /// menu item can open anything.
-fn handle_gesture(s: &mut State, gesture: Gesture, notes: &mut Vec<Note>) {
+///
+/// A key press is none of that: typing into the window Ordo declared is not
+/// reaching for focus elsewhere. It only explains the focus change after it,
+/// within the app it was typed into (see `Away::within`), and leaves a
+/// click's own landing waiting.
+fn handle_gesture(s: &mut State, gesture: Gesture, now_ns: u64, notes: &mut Vec<Note>) {
+    if gesture == Gesture::Key {
+        s.unseen_landing.away = Some(Away {
+            from: s.focused,
+            since_ns: now_ns,
+            by: Input::Key,
+            within: key_app(s),
+        });
+        return;
+    }
     s.declare_focus(FocusIntent::Deferred);
     let opens_menu = matches!(gesture, Gesture::MenuBar { .. });
     let menu_was_open = std::mem::replace(&mut s.menu_open, opens_menu);
-    let (armed, within) = match gesture {
-        Gesture::SystemSwitch => (true, None),
-        Gesture::MenuBar { .. } => (false, None),
-        Gesture::MouseDown { .. } if menu_was_open => (true, None),
-        Gesture::MouseDown { at } => {
+    let hit: Vec<WindowId> = match gesture {
+        Gesture::MouseDown { at } if !menu_was_open => {
             let here = s.current_workspace();
-            let within = s
-                .windows
+            s.windows
                 .values()
-                .find(|r| Some(r.workspace) == here && r.frame.contains(at))
-                .map(|r| r.id);
-            (within.is_none(), within)
+                .filter(|r| Some(r.workspace) == here && r.frame.contains(at))
+                .map(|r| r.id)
+                .collect()
         }
+        _ => Vec::new(),
     };
-    // After the declaration, which clears it.
+    let within = hit.first().copied();
+    let armed = match gesture {
+        Gesture::SystemSwitch => true,
+        Gesture::MenuBar { .. } | Gesture::Key => false,
+        Gesture::MouseDown { .. } => within.is_none(),
+    };
+    // After the declaration, which clears them.
     s.navigation_gesture = armed;
+    s.unseen_landing = Landing {
+        away: Some(Away {
+            from: s.focused,
+            since_ns: now_ns,
+            by: gesture.into(),
+            within: None,
+        }),
+        into: (!hit.is_empty()).then(|| (hit.iter().map(|w| s.root_of(*w)).collect(), now_ns)),
+    };
     notes.push(Note::GestureClassified {
         gesture,
         armed,
@@ -1061,18 +1109,7 @@ fn handle_snapshot(
     reconcile::apply_snapshot(s, snap);
     keep_vanished_places(pre, s, now_ns);
 
-    // While the OS owns the slot, its choice among the VISIBLE windows is the
-    // only record of where the user went. A hidden landing is never recorded
-    // from observation: it is either navigation, which the follow below
-    // declares, or a fling, which must not touch the history at all.
-    if s.focus_target().is_none() {
-        if let Some(f) = s.focused {
-            if s.windows.get(&f).is_some_and(|r| s.is_visible(r)) {
-                let root = s.root_of(f);
-                s.focus_history.touch(root);
-            }
-        }
-    }
+    record_landing(s, trigger, now_ns, notes);
     // A display came or went. Every window on the vanished display was just
     // re-homed by macOS, not by anyone's hand — nothing about a window's
     // placement in this snapshot says anything about intent. The FIRST
@@ -1368,6 +1405,81 @@ fn handle_snapshot(
         fx.push(Effect::RequestRescan {
             reason: RescanTrigger::PostEffect { op },
         });
+    }
+}
+
+/// How long a key press or click explains the first focus change after it.
+/// Apps come forward within a few hundred ms of the input that moved them
+/// (gesture to landing in runs 40-49: p75 390 ms); much longer, and a key
+/// press would explain whatever an app keyed on its own seconds later.
+const AWAY_TTL_NS: u64 = 1_000_000_000;
+
+/// How long a click waits to see a window it hit come up key. Longer than
+/// `AWAY_TTL_NS` because a click names its windows, so waiting risks less,
+/// and an app with no observer is seen only by the periodic look, two
+/// seconds apart. Bounded all the same: a click the user moved on from must
+/// not explain the app re-keying that window on its own minutes later.
+const INTO_TTL_NS: u64 = 3_000_000_000;
+
+/// Write into the MRU order the focus the user's input explains, and nothing
+/// else the screen shows: an app keying a window with no input behind it, or
+/// a flicker between two looks, is not where the user went (run 49 seq 22:
+/// a 27 ms flicker onto a Chrome window headed every later restack of its
+/// workspace). A key press or click explains the first focus change after
+/// it, within `AWAY_TTL_NS`; a click also explains a landing on a window it
+/// hit, within `INTO_TTL_NS`. A hidden landing is never recorded: it is
+/// either navigation, which the follow declares, or a fling. The OS's focus
+/// at startup is the user's last choice before Ordo ran.
+fn record_landing(s: &mut State, trigger: &RescanTrigger, now_ns: u64, notes: &mut Vec<Note>) {
+    let Landing { away, into } = std::mem::take(&mut s.unseen_landing);
+    let focused = s.focused;
+    let focused_root = focused.map(|f| s.root_of(f));
+    let focused_app = key_app(s);
+    let mut landed: Option<(WindowId, Option<Input>)> = None;
+    if matches!(trigger, RescanTrigger::Startup) {
+        landed = focused.map(|f| (f, None));
+    } else {
+        let lapsed = |since: u64, ttl: u64| now_ns.saturating_sub(since) >= ttl;
+        s.unseen_landing.away = match away {
+            Some(a) if lapsed(a.since_ns, AWAY_TTL_NS) => None,
+            Some(a)
+                if focused != a.from
+                    && a.within.is_none_or(|app| focused_app == Some(app)) =>
+            {
+                landed = focused.map(|f| (f, Some(a.by)));
+                None
+            }
+            other => other,
+        };
+        s.unseen_landing.into = match into {
+            Some((_, since)) if lapsed(since, INTO_TTL_NS) => None,
+            Some((roots, _)) if focused_root.is_some_and(|r| roots.contains(&r)) => {
+                landed = focused.map(|f| (f, Some(Input::Click)));
+                None
+            }
+            other => other,
+        };
+    }
+    let Some((f, by)) = landed.filter(|(f, _)| s.windows.get(f).is_some_and(|r| s.is_visible(r)))
+    else {
+        return;
+    };
+    match s.focus_intent() {
+        FocusIntent::Deferred => {
+            let root = s.root_of(f);
+            s.focus_history.touch(root);
+        }
+        // Every gesture but a key press hands the slot to the OS, so a
+        // declaration still standing means focus moved from the keyboard:
+        // Spotlight, an app's window shortcut. It is the user's, and
+        // enforcement must not take it back. Unless a grant of Ordo's own is
+        // still on its way: then the change is that grant's doing, or its
+        // fallout (a sibling keyed in its place).
+        _ if s.pending.iter().any(|p| is_focus_grant(&p.expect)) => return,
+        _ => s.declare_focus(FocusIntent::Window(f)),
+    }
+    if let Some(by) = by {
+        notes.push(Note::LandingExplained { window: f, by });
     }
 }
 

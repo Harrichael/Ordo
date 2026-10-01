@@ -43,7 +43,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ordo_core::{
     MonitorId, MonitorSnap, MonitorWs, Pid, Rect, WindowId, WindowSnap, WorkspaceSnap,
@@ -109,6 +109,11 @@ pub struct MacWorldSource {
     /// snapshot that re-asking every window would pay forever.
     facts: HashMap<WindowId, zorder::ServerFacts>,
     unreachable: Unreachable,
+    /// Every window the last believed snapshot had, with its app: what a
+    /// scan that misses windows is checked against.
+    last_windows: HashMap<WindowId, Pid>,
+    /// Blind scans are being discarded; said once per episode.
+    blind: bool,
 }
 
 impl MacWorldSource {
@@ -127,6 +132,8 @@ impl MacWorldSource {
             trace: Vec::new(),
             stats: None,
             facts: HashMap::new(),
+            last_windows: HashMap::new(),
+            blind: false,
         }
     }
 }
@@ -143,6 +150,7 @@ impl WorldSource for MacWorldSource {
                 windows: Vec::new(),
                 focused: None,
                 workspaces: WorkspaceSnap::default(),
+                unread: Vec::new(),
             };
         }
         let started = Instant::now();
@@ -153,6 +161,53 @@ impl WorldSource for MacWorldSource {
             .collect();
 
         let scan = ax::scan();
+        let missed: Vec<WindowId> = self
+            .last_windows
+            .keys()
+            .filter(|w| !scan.windows.iter().any(|s| s.id == **w))
+            .copied()
+            .collect();
+        let listed = (!missed.is_empty()).then(zorder::all_windows);
+        let unlisted = matches!(listed, Some(None));
+        let alive = still_listed(&missed, listed.flatten());
+        if is_blind(scan.windows.len(), &alive) {
+            if !std::mem::replace(&mut self.blind, true) {
+                eprintln!(
+                    "ordo: no app lists a window, {}; ignoring scans until windows reappear",
+                    if unlisted {
+                        "and the window server's list can't be read"
+                    } else {
+                        "while the window server still has them (screen locked?)"
+                    }
+                );
+            }
+            return WorldSnapshot {
+                monitors: Vec::new(),
+                windows: Vec::new(),
+                focused: None,
+                workspaces: WorkspaceSnap::default(),
+                unread: Vec::new(),
+            };
+        }
+        self.blind = false;
+        // A window its app didn't answer for is kept only while the window
+        // server has it: an app that keeps timing out must not keep its
+        // closed windows alive.
+        let unread: Vec<WindowId> = alive
+            .into_iter()
+            .filter(|w| {
+                self.last_windows
+                    .get(w)
+                    .is_some_and(|pid| scan.walk.unanswered.contains(pid))
+            })
+            .collect();
+        let last_windows: HashMap<WindowId, Pid> = scan
+            .windows
+            .iter()
+            .map(|w| (w.id, w.app))
+            .chain(unread.iter().filter_map(|w| self.last_windows.get(w).map(|p| (*w, *p))))
+            .collect();
+        self.last_windows = last_windows;
         let frames: HashMap<WindowId, (Pid, Rect)> = scan
             .windows
             .iter()
@@ -277,12 +332,14 @@ impl WorldSource for MacWorldSource {
             apps: scan.walk.apps,
             windows: scan.windows.len(),
             slowest: scan.walk.slowest,
+            held: Duration::ZERO,
         });
         WorldSnapshot {
             monitors,
             windows,
             focused: scan.focused,
             workspaces,
+            unread,
         }
     }
 
@@ -292,5 +349,40 @@ impl WorldSource for MacWorldSource {
 
     fn take_snapshot_stats(&mut self) -> Option<SnapshotStats> {
         self.stats.take()
+    }
+}
+
+/// Of `windows`, those the window server's full list still has; all of them
+/// when the list can't be read, which is no evidence of anything.
+fn still_listed(windows: &[WindowId], listed: Option<Vec<WindowId>>) -> Vec<WindowId> {
+    match listed {
+        Some(listed) => windows.iter().filter(|w| listed.contains(w)).copied().collect(),
+        None => windows.to_vec(),
+    }
+}
+
+/// A scan in which no app listed a window, while windows the model holds are
+/// still in the window server's list, saw nothing: the screen is locked or
+/// the session asleep (run 48 seq 662: thirteen minutes of such scans erased
+/// every window, and every window's place in the MRU order). One whose
+/// missing windows are gone from that list too is the last window closing.
+fn is_blind(scanned: usize, missed_but_listed: &[WindowId]) -> bool {
+    scanned == 0 && !missed_but_listed.is_empty()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_scan_is_blind_only_while_the_window_server_still_has_the_missing_windows() {
+        let (a, b) = (WindowId(1), WindowId(2));
+        let locked = still_listed(&[a, b], Some(vec![a, b, WindowId(9)]));
+        assert!(is_blind(0, &locked));
+        let unreadable = still_listed(&[a, b], None);
+        assert!(is_blind(0, &unreadable));
+        let last_closed = still_listed(&[a], Some(vec![WindowId(9)]));
+        assert!(!is_blind(0, &last_closed));
+        assert!(!is_blind(3, &locked), "a scan that sees windows is not blind");
     }
 }

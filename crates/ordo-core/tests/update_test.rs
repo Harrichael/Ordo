@@ -182,6 +182,7 @@ fn world_view(
         monitors: monitors.iter().map(|m| m.snap.clone()).collect(),
         windows: windows.iter().map(|w| w.snap.clone()).collect(),
         focused: focused.map(wid),
+        unread: Vec::new(),
         workspaces: WorkspaceSnap {
             monitors: monitors
                 .iter()
@@ -265,7 +266,7 @@ fn click(x: f64, y: f64) -> Event {
     gesture(Gesture::MouseDown { at: Point { x, y } })
 }
 
-/// Boot the standard world, then focus each window in `focus_seq` in order,
+/// Boot the standard world, then click each window in `focus_seq` in order,
 /// so the MRU history is exactly `focus_seq` reversed-into-front order.
 fn booted(focus_seq: &[u32]) -> State {
     let mut s = update(
@@ -279,18 +280,35 @@ fn booted(focus_seq: &[u32]) -> State {
     )
     .state;
     for f in focus_seq {
-        s = update(
-            &s,
-            &observed(
-                vec![mon_a(1), mon_b(1)],
-                std_windows(),
-                Some(*f),
-                RescanTrigger::Periodic,
-            ),
-        )
-        .state;
+        s = used(&s, *f, vec![mon_a(1), mon_b(1)], std_windows());
     }
     s
+}
+
+/// The user clicks window `w` and the next look sees it key: how the MRU
+/// history learns of a window used outside Ordo.
+fn used(s: &State, w: u32, monitors: Vec<Mon>, windows: Vec<Win>) -> State {
+    let at = windows
+        .iter()
+        .find(|x| x.snap.id == wid(w))
+        .expect("the window is in the world")
+        .snap
+        .frame
+        .center();
+    let clicked = update(s, &click(at.x, at.y));
+    assert!(
+        clicked.notes.iter().any(|n| matches!(
+            n,
+            Note::GestureClassified { within: Some(hit), .. } if *hit == wid(w)
+        )),
+        "the click hit w{w} first: {:?}",
+        clicked.notes
+    );
+    update(
+        &clicked.state,
+        &observed(monitors, windows, Some(w), RescanTrigger::Periodic),
+    )
+    .state
 }
 
 fn focus_targets(effects: &[Effect]) -> Vec<WindowId> {
@@ -707,6 +725,193 @@ fn a_quick_return_still_expects_its_own_focus_grant() {
         .any(|p| p.expect == Expectation::Focused(wid(1))));
 }
 
+/// A grant that repeats one still on its way, to a window the last look
+/// already saw key, needs no expectation of its own, and must not retire the
+/// older one: that one is the record that a grant is in flight. A look that
+/// then catches focus elsewhere (an earlier grant landing late) waits for
+/// it, rather than granting again over it.
+#[test]
+fn a_repeated_grant_keeps_the_one_in_flight_on_record() {
+    let s = booted(&[3, 1, 2]); // w2 key, w1 behind it
+    let away = update(&s, &hotkey(HotkeyAction::MruWorkspace)).state; // -> w1
+    let back = update(&away, &hotkey(HotkeyAction::MruWorkspace)).state; // -> w2
+    let viewed = update(&back, &hotkey(HotkeyAction::ViewMonitorNext));
+    assert_eq!(focus_targets(&viewed.effects), vec![wid(2)]);
+
+    let on_2 = VirtualMonitors {
+        count: 2,
+        viewed: vm(2),
+        enabled: true,
+    };
+    let late = update(
+        &viewed.state,
+        &observed_view(
+            on_2,
+            vec![mon_a(1), mon_b(1)],
+            std_windows(),
+            Some(1),
+            RescanTrigger::Periodic,
+        ),
+    );
+    assert!(focus_targets(&late.effects).is_empty(), "{:?}", late.effects);
+}
+
+/// A grant to the window the last look saw key, issued while a grant to
+/// another window may still land (it was overtaken, but may have been sent
+/// already): the newest grant is expected, so a look that catches the old
+/// one landing waits for it rather than granting again over it.
+#[test]
+fn a_grant_that_overtakes_another_is_expected_even_where_focus_already_is() {
+    let s = booted(&[3, 1, 2]); // w2 key
+    let to_1 = update(&s, &hotkey(HotkeyAction::MruWorkspace)).state; // grant to w1
+    let deferred = update(&to_1, &gesture(Gesture::SystemSwitch)).state;
+    let stale = look(&deferred, 2).state;
+    let viewed = update(&stale, &hotkey(HotkeyAction::ViewMonitorNext));
+    assert_eq!(focus_targets(&viewed.effects), vec![wid(2)]);
+
+    let on_2 = VirtualMonitors {
+        count: 2,
+        viewed: vm(2),
+        enabled: true,
+    };
+    let late = update(
+        &viewed.state,
+        &observed_view(
+            on_2,
+            vec![mon_a(1), mon_b(1)],
+            std_windows(),
+            Some(1),
+            RescanTrigger::Periodic,
+        ),
+    );
+    assert!(focus_targets(&late.effects).is_empty(), "{:?}", late.effects);
+}
+
+fn switch_targets(effects: &[Effect]) -> Vec<WorkspaceId> {
+    effects
+        .iter()
+        .filter_map(|e| match e {
+            Effect::SwitchWorkspace { target, .. } => Some(*target),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A switch steers the next press only while it is under way. One the
+/// executor reports failed or timed out, one that no look confirmed within its lifetime,
+/// and every one in flight when the kill switch fires stop being where Ordo
+/// is taking the user: the next press steps from the workspace on screen.
+#[test]
+fn a_switch_steers_presses_only_while_it_is_under_way() {
+    let s = booted(&[1]);
+    let on_1 = || observed(vec![mon_a(1), mon_b(1)], std_windows(), Some(1), RescanTrigger::Periodic);
+
+    let failed = update(&s, &hotkey(HotkeyAction::WorkspaceNext));
+    let refused = update(
+        &failed.state,
+        &Event::EffectResult {
+            at: ts(),
+            op: switch_op(&failed.effects),
+            outcome: OpOutcome::Failed {
+                detail: "no such space".into(),
+            },
+        },
+    );
+    let after_failure = update(&refused.state, &hotkey(HotkeyAction::WorkspaceNext));
+    assert_eq!(switch_targets(&after_failure.effects), [ws(2)]);
+
+    let timed_out = update(&s, &hotkey(HotkeyAction::WorkspaceNext));
+    let unanswered = update(
+        &timed_out.state,
+        &Event::EffectResult {
+            at: ts(),
+            op: switch_op(&timed_out.effects),
+            outcome: OpOutcome::Timeout,
+        },
+    );
+    let after_timeout = update(&unanswered.state, &hotkey(HotkeyAction::WorkspaceNext));
+    assert_eq!(switch_targets(&after_timeout.effects), [ws(2)]);
+
+    let lost = update(&s, &hotkey(HotkeyAction::WorkspaceNext));
+    let mut unseen = lost.state;
+    for _ in 0..6 {
+        unseen = update(&unseen, &on_1()).state;
+    }
+    let after_loss = update(&unseen, &hotkey(HotkeyAction::WorkspaceNext));
+    assert_eq!(switch_targets(&after_loss.effects), [ws(2)]);
+
+    let rescued = update(&s, &hotkey(HotkeyAction::WorkspaceNext));
+    let rescued = update(&rescued.state, &Event::RescueEngaged { at: ts() });
+    let engaged = update(&rescued.state, &Event::Engaged { at: ts() });
+    let after_rescue = update(&engaged.state, &hotkey(HotkeyAction::WorkspaceNext));
+    assert_eq!(switch_targets(&after_rescue.effects), [ws(2)]);
+}
+
+/// Each press of a burst makes the last one's switch and focus grant moot:
+/// the app queues skip the older grant, and the older switch can never be
+/// seen now. They are retired at the press, not left to expire a second
+/// later as lost (run 48: 32 `op_lost` notes, half of them for grants). A
+/// look that catches the overtaken grant landing anyway reads it as not
+/// ours and waits for the newest grant, which is still on its way.
+#[test]
+fn a_burst_retires_the_switches_and_grants_it_overtakes() {
+    let wins = vec![
+        win(1, 100, 1, rect(100.0, 100.0)),
+        win(2, 200, 2, rect(100.0, 100.0)),
+        win(3, 300, 3, rect(100.0, 100.0)),
+    ];
+    let on = |active: u8, focused: u32| {
+        observed(
+            vec![mon_a(active), mon_b(active)],
+            wins.clone(),
+            Some(focused),
+            RescanTrigger::Periodic,
+        )
+    };
+    let s = update(
+        &State::new(),
+        &observed(vec![mon_a(1), mon_b(1)], wins.clone(), Some(1), RescanTrigger::Startup),
+    )
+    .state;
+    let first = update(&s, &hotkey(HotkeyAction::WorkspaceNext));
+    let second = update(&first.state, &hotkey(HotkeyAction::WorkspaceNext));
+    let op_of = |effects: &[Effect], focus: bool| {
+        effects
+            .iter()
+            .find_map(|e| match e {
+                Effect::FocusWindow { op, .. } if focus => Some(*op),
+                Effect::SwitchWorkspace { op, .. } if !focus => Some(*op),
+                _ => None,
+            })
+            .unwrap()
+    };
+    assert!(second.notes.contains(&Note::OpSuperseded {
+        op: op_of(&first.effects, false),
+        by: op_of(&second.effects, false),
+    }));
+    assert!(second.notes.contains(&Note::OpSuperseded {
+        op: op_of(&first.effects, true),
+        by: op_of(&second.effects, true),
+    }));
+
+    let overtaken = update(&second.state, &on(3, 2));
+    assert!(focus_targets(&overtaken.effects).is_empty(), "the newest grant is in flight");
+    assert!(overtaken.notes.iter().any(|n| matches!(
+        n,
+        Note::External { delta: Delta::FocusChanged { to: Some(w), .. } } if *w == wid(2)
+    )));
+
+    let mut settled = overtaken.state;
+    let mut notes = Vec::new();
+    for _ in 0..6 {
+        let step = update(&settled, &on(3, 3));
+        notes.extend(step.notes);
+        settled = step.state;
+    }
+    assert!(!notes.iter().any(|n| matches!(n, Note::OpLost { .. })), "{notes:?}");
+    assert!(settled.pending.is_empty());
+}
+
 #[test]
 fn switching_to_an_empty_workspace_gives_focus_to_the_desktop_and_holds_it() {
     // The sliver on workspace 7: switching away from Chrome to an empty
@@ -954,6 +1159,85 @@ fn a_window_missing_from_one_scan_keeps_its_place() {
     let reborn = at(&still_gone, plus_ms(t, 18_000), std_windows());
     let tab = update(&reborn, &hotkey(HotkeyAction::MruWorkspace));
     assert_eq!(focus_targets(&tab.effects), vec![wid(2)]);
+}
+
+/// An app busy past the read's timeout lists no windows, and that is not
+/// the same as having none (run 46: all six of kitty's windows dropped out
+/// of one scan while kitty was the app the scan waited on). The shell names
+/// such windows, where the window server still has them, and they stay in
+/// the model as last seen; once the app answers without them, they are gone.
+#[test]
+fn a_window_its_app_did_not_answer_for_stays() {
+    let s = booted(&[3, 1]);
+    let look = |s: &State, unread: Vec<WindowId>| {
+        let mut snap = world(&[mon_a(1), mon_b(1)], &std_windows(), Some(2));
+        snap.windows.retain(|w| w.app == Pid(200));
+        snap.unread = unread;
+        update(
+            s,
+            &Event::WorldObserved {
+                at: ts(),
+                trigger: RescanTrigger::Periodic,
+                snap,
+            },
+        )
+    };
+
+    let busy = look(&s, vec![wid(1), wid(3)]);
+    assert!(busy.state.windows.contains_key(&wid(1)));
+    assert!(busy.state.windows.contains_key(&wid(3)));
+    assert!(!busy
+        .notes
+        .iter()
+        .any(|n| matches!(n, Note::External { delta: Delta::WindowDestroyed(_) })));
+
+    let answered = look(&busy.state, Vec::new());
+    assert!(!answered.state.windows.contains_key(&wid(1)));
+    assert!(answered
+        .notes
+        .contains(&Note::External { delta: Delta::WindowDestroyed(wid(1)) }));
+}
+
+/// A carry whose look finds the carried window's app not answering: the
+/// window is kept from the last look, but it sits where the backend's word
+/// puts it, so the carry is confirmed and nothing fights to move it again.
+#[test]
+fn a_carry_is_confirmed_while_the_carried_windows_app_does_not_answer() {
+    let s = booted(&[1]);
+    let carry = update(&s, &hotkey(HotkeyAction::CarryFocusedToWorkspaceNext));
+    let move_op = carry
+        .effects
+        .iter()
+        .find_map(|e| match e {
+            Effect::AssignWindowToWorkspace { op, .. } => Some(*op),
+            _ => None,
+        })
+        .unwrap();
+    let mut wins = std_windows();
+    wins[0].workspace = ws(2);
+    let mut state = carry.state;
+    let mut notes = Vec::new();
+    let mut effects = Vec::new();
+    for _ in 0..8 {
+        let mut snap = world(&[mon_a(2), mon_b(2)], &wins, Some(1));
+        snap.windows.retain(|w| w.app != Pid(100));
+        snap.unread = vec![wid(1), wid(3)];
+        let step = update(
+            &state,
+            &Event::WorldObserved {
+                at: ts(),
+                trigger: RescanTrigger::Periodic,
+                snap,
+            },
+        );
+        notes.extend(step.notes);
+        effects.extend(step.effects);
+        state = step.state;
+    }
+    assert!(notes.contains(&Note::SelfConfirmed { op: move_op }), "{notes:?}");
+    assert!(!effects
+        .iter()
+        .any(|e| matches!(e, Effect::MoveWindowToWorkspace { .. })), "{effects:?}");
 }
 
 #[test]
@@ -2321,6 +2605,8 @@ fn a_grant_landing_on_a_sibling_is_corrected_and_does_not_reorder_mru() {
         )
     };
     // History built while ws2 was up: w4, then w2; then the user is on ws1.
+    // Built by clicks, since a focus seen with no gesture behind it is not
+    // the user's and no longer enters the history.
     let mut s = update(
         &State::new(),
         &observed(
@@ -2331,9 +2617,13 @@ fn a_grant_landing_on_a_sibling_is_corrected_and_does_not_reorder_mru() {
         ),
     )
     .state;
-    for (active, focused) in [(2, 2), (1, 1)] {
-        s = update(&s, &obs(active, focused)).state;
-    }
+    s = used(&s, 2, vec![mon_a(2), mon_b(2)], wins.clone());
+    s = update(
+        &s,
+        &observed(vec![mon_a(1), mon_b(1)], wins.clone(), None, RescanTrigger::Periodic),
+    )
+    .state;
+    s = used(&s, 1, vec![mon_a(1), mon_b(1)], wins.clone());
     let step = update(&s, &hotkey(HotkeyAction::WorkspaceNext));
     assert_eq!(focus_targets(&step.effects), vec![wid(2)]);
 
@@ -2354,7 +2644,7 @@ fn a_grant_landing_on_a_sibling_is_corrected_and_does_not_reorder_mru() {
 }
 
 #[test]
-fn mru_records_declarations_and_only_the_os_s_visible_choice_when_deferred() {
+fn mru_records_declarations_and_where_a_click_lands() {
     let s = booted(&[3, 2, 1]); // history [1, 2, 3], all on ws1
     let step = update(&s, &hotkey(HotkeyAction::MruWorkspace)); // -> w2
     assert_eq!(
@@ -2376,7 +2666,8 @@ fn mru_records_declarations_and_only_the_os_s_visible_choice_when_deferred() {
     assert_eq!(flung.state.focus_history.iter().next(), Some(wid(2)));
     assert_eq!(flung.state.focus_intent(), FocusIntent::Window(wid(2)));
 
-    // After a click the OS owns the slot, and its choice is the record.
+    // After a click the OS owns the slot, and where the click lands is the
+    // record.
     let clicked = update(&flung.state, &click(700.0, 600.0)).state; // inside w3
     let seen = update(
         &clicked,
@@ -2389,6 +2680,160 @@ fn mru_records_declarations_and_only_the_os_s_visible_choice_when_deferred() {
     );
     assert!(seen.effects.is_empty(), "nothing to enforce while deferred");
     assert_eq!(seen.state.focus_history.iter().next(), Some(wid(3)));
+}
+
+fn history(s: &State) -> Vec<WindowId> {
+    s.focus_history.iter().collect()
+}
+
+/// A look at the standard world, focus on `focused`.
+fn look(s: &State, focused: u32) -> Step {
+    update(
+        s,
+        &observed(
+            vec![mon_a(1), mon_b(1)],
+            std_windows(),
+            Some(focused),
+            RescanTrigger::Periodic,
+        ),
+    )
+}
+
+/// `look` repeated `n` times, each a tick later.
+fn looks(s: &State, focused: u32, n: usize) -> State {
+    (0..n).fold(s.clone(), |s, _| look(&s, focused).state)
+}
+
+/// Run 49 seq 11-23: the user clicked, and ten seconds later Chrome keyed
+/// another of its windows for 27 ms. The core wrote that flicker into the
+/// MRU order, and every later restack of the workspace put that window
+/// second. A click explains the focus change right after it, and a landing
+/// on the window it hit a little later, however many looks it takes the app
+/// to come forward; nothing else the screen shows is where the user went.
+#[test]
+fn only_what_a_click_explains_enters_the_mru_order() {
+    let s = booted(&[3, 2, 1]);
+    assert_eq!(history(&s), [wid(1), wid(2), wid(3)]);
+
+    let clicked = update(&s, &click(700.0, 600.0)).state; // inside w3
+    let not_yet = looks(&clicked, 1, 5);
+    let flicker = look(&not_yet, 2).state;
+    assert_eq!(history(&flicker), [wid(1), wid(2), wid(3)]);
+
+    let landed = look(&flicker, 3).state;
+    assert_eq!(history(&landed), [wid(3), wid(1), wid(2)]);
+
+    let later_flicker = look(&landed, 2).state;
+    let back = look(&later_flicker, 3).state;
+    assert_eq!(history(&back), [wid(3), wid(1), wid(2)]);
+}
+
+/// A click inside one window can front another: a link that opens in a
+/// window already open, a button that raises a panel. What comes up key
+/// right after the click is where it took the user.
+#[test]
+fn a_click_that_fronts_another_window_counts_for_that_window() {
+    let s = booted(&[3, 2, 1]);
+    let clicked = update(&s, &click(700.0, 600.0)).state; // inside w3
+    let fronted = look(&clicked, 2).state;
+    assert_eq!(history(&fronted), [wid(2), wid(1), wid(3)]);
+}
+
+/// A click whose window never came up key, and that the user moved on
+/// from, does not explain that window keying itself much later.
+#[test]
+fn a_click_the_user_moved_on_from_explains_nothing_later() {
+    let s = booted(&[3, 2, 1]);
+    let clicked = update(&s, &click(700.0, 600.0)).state; // inside w3
+    let moved_on = looks(&clicked, 1, 16);
+    let rekeyed = look(&moved_on, 3).state;
+    assert_eq!(history(&rekeyed), [wid(1), wid(2), wid(3)]);
+}
+
+/// Focus moved from the keyboard within the app typed into (a window
+/// shortcut) is the user's: a key press explains the focus change right
+/// after it, which becomes the declaration and the head of the MRU order,
+/// and is not fought. The same change with no key press behind it, or long
+/// after one, is an app's doing: pulled back, and not recorded.
+#[test]
+fn a_key_press_explains_the_focus_change_right_after_it_and_nothing_later() {
+    let s = booted(&[3, 2, 1]);
+    let to_2 = update(&s, &hotkey(HotkeyAction::MruWorkspace)).state;
+    let to_1 = update(&look(&to_2, 2).state, &hotkey(HotkeyAction::MruWorkspace)).state;
+    let on_1 = look(&to_1, 1).state;
+    assert_eq!(on_1.focus_intent(), FocusIntent::Window(wid(1)));
+    assert_eq!(history(&on_1), [wid(1), wid(2), wid(3)]);
+
+    let pressed = update(&on_1, &gesture(Gesture::Key)).state;
+    let shortcut = look(&pressed, 3); // w1's app keys its other window
+    assert!(focus_targets(&shortcut.effects).is_empty(), "not fought");
+    assert!(shortcut.notes.contains(&Note::LandingExplained {
+        window: wid(3),
+        by: Input::Key,
+    }));
+    assert_eq!(shortcut.state.focus_intent(), FocusIntent::Window(wid(3)));
+    assert_eq!(history(&shortcut.state), [wid(3), wid(1), wid(2)]);
+
+    let unprompted = look(&on_1, 3);
+    assert_eq!(focus_targets(&unprompted.effects), vec![wid(1)]);
+    assert_eq!(history(&unprompted.state), [wid(1), wid(2), wid(3)]);
+
+    let long_before = looks(&update(&on_1, &gesture(Gesture::Key)).state, 1, 6);
+    let late = look(&long_before, 3);
+    assert_eq!(focus_targets(&late.effects), vec![wid(1)]);
+    assert_eq!(history(&late.state), [wid(1), wid(2), wid(3)]);
+}
+
+/// An Outlook reminder or a Slack huddle grabbing focus while the user
+/// types is that app's doing, however recent the last key press: typing
+/// explains a change only within the app typed into. Pulled back, and kept
+/// out of the MRU order.
+#[test]
+fn another_app_grabbing_focus_while_the_user_types_is_fought() {
+    let s = booted(&[3, 2, 1]);
+    let to_2 = update(&s, &hotkey(HotkeyAction::MruWorkspace)).state;
+    let to_1 = update(&look(&to_2, 2).state, &hotkey(HotkeyAction::MruWorkspace)).state;
+    let typing = update(&look(&to_1, 1).state, &gesture(Gesture::Key)).state;
+    let typing = update(&look(&typing, 1).state, &gesture(Gesture::Key)).state;
+    let grabbed = look(&typing, 2); // another app's window
+    assert_eq!(focus_targets(&grabbed.effects), vec![wid(1)]);
+    assert_eq!(grabbed.state.focus_intent(), FocusIntent::Window(wid(1)));
+    assert_eq!(history(&grabbed.state), [wid(1), wid(2), wid(3)]);
+}
+
+/// A key typed into no window of the model (Spotlight, Raycast, Alfred, the
+/// desktop) can send focus anywhere: the pick that lands next is the user's.
+#[test]
+fn a_launcher_pick_is_where_the_user_went() {
+    let s = booted(&[3, 2, 1]);
+    let launcher = look(&s, 1);
+    let launcher = update(
+        &launcher.state,
+        &observed(vec![mon_a(1), mon_b(1)], std_windows(), None, RescanTrigger::Periodic),
+    )
+    .state;
+    let typed = update(&launcher, &gesture(Gesture::Key)).state;
+    let picked = look(&typed, 2);
+    assert_eq!(history(&picked.state), [wid(2), wid(1), wid(3)]);
+    assert!(picked.notes.contains(&Note::LandingExplained {
+        window: wid(2),
+        by: Input::Key,
+    }));
+}
+
+/// Cmd+Tab can key any window, so it explains the first focus change after
+/// it, if that comes soon. One that moved nothing must not be left open to
+/// explain whatever an app keys on its own a while later.
+#[test]
+fn cmd_tab_explains_where_focus_goes_next_but_not_a_change_long_after() {
+    let s = booted(&[3, 2, 1]);
+    let switched = update(&s, &gesture(Gesture::SystemSwitch)).state;
+    let landed = look(&switched, 2).state;
+    assert_eq!(history(&landed), [wid(2), wid(1), wid(3)]);
+
+    let unmoved = looks(&update(&landed, &gesture(Gesture::SystemSwitch)).state, 2, 6);
+    let stolen = look(&unmoved, 3).state;
+    assert_eq!(history(&stolen), [wid(2), wid(1), wid(3)]);
 }
 
 #[test]

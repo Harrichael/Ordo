@@ -44,7 +44,7 @@ mod update;
 
 pub use effect::{CorrectionAxis, Effect, Expectation};
 pub use event::{
-    AxHintKind, Event, Gesture, HotkeyAction, MonitorSnap, MonitorWs, OpOutcome, RescanTrigger, Ts,
+    AxHintKind, Event, Gesture, HotkeyAction, Input, MonitorSnap, MonitorWs, OpOutcome, RescanTrigger, Ts,
     VirtualMonitorsWord, WindowSnap, WorkspaceSnap, WorldSnapshot,
 };
 pub use ids::{

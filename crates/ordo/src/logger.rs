@@ -358,8 +358,8 @@ impl Logger {
         let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
         self.conn.execute(
             "INSERT INTO snapshots (run_id, wall_ms, seq, total_ms, walk_ms, enforce_ms,
-                 apps, windows, slowest_pid, slowest_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                 apps, windows, slowest_pid, slowest_ms, held_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 self.run_id,
                 now_wall_ms,
@@ -371,6 +371,7 @@ impl Logger {
                 s.windows as i64,
                 s.slowest.map(|(p, _)| p.0),
                 s.slowest.map(|(_, d)| ms(d)),
+                ms(s.held),
             ],
         )?;
         Ok(())
@@ -459,7 +460,9 @@ fn note_kind(n: &Note) -> &'static str {
         Note::SelfConfirmed { .. } => "self_confirmed",
         Note::OpLost { .. } => "op_lost",
         Note::OpFailed { .. } => "op_failed",
+        Note::OpSuperseded { .. } => "op_superseded",
         Note::External { .. } => "external",
+        Note::LandingExplained { .. } => "landing_explained",
         Note::GestureClassified { .. } => "gesture_classified",
         Note::FollowedFocus { .. } => "followed_focus",
         Note::MonitorAdopted { .. } => "monitor_adopted",

@@ -10,11 +10,15 @@ const CAP: usize = 512;
 /// Only root windows are kept (see `State::root_of`): focusing an attached
 /// window is using its root.
 ///
-/// What enters it is DECLARED use, not observed focus: a command that names a
-/// window records it (`State::declare_focus`), and an observed focus is
-/// recorded only while the OS owns the slot and the window is on the visible
-/// workspace. Driving this from raw observation let every app-initiated fling
-/// (a notification, a browser re-keying a sibling) silently reorder Alt+Tab.
+/// What enters it is the user's use, not observed focus: a command that names
+/// a window records it (`State::declare_focus`), and so does a window born
+/// with focus, which opened for the user; an observed focus is recorded only
+/// where the user's input explains it (a click, Cmd+Tab, or a key press
+/// whose change stays within the app typed into) and the window is on
+/// screen. Driving this from raw
+/// observation let every app-initiated fling (a notification, a browser
+/// re-keying a sibling, a 27 ms flicker) silently reorder Alt+Tab and every
+/// restack after it.
 ///
 /// The alternative — per-scope MRU stacks indexed by workspace x monitor x
 /// app — would need lockstep edits on every window move, destroy, and monitor

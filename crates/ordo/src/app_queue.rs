@@ -632,8 +632,9 @@ fn run_lane(inner: Arc<Inner>, pid: Pid, lane: Arc<Lane>) {
                 state.landed.clear();
                 for ((w, at), seq) in hold.iter().zip(&seqs) {
                     // An escaped window is not on its way anywhere: the
-                    // model's own checks should see it and put it back.
-                    if held.escaped.contains(w) {
+                    // model's own checks should see it and put it back. Nor
+                    // is one the hold could not reach.
+                    if held.escaped.contains(w) || held.unreachable.contains(w) {
                         record.refused(*w, *seq);
                     } else {
                         record.written(*w, *seq, now);

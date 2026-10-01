@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::effect::Expectation;
+use crate::event::Input;
 use crate::ids::{MonitorId, OpId, Pid, Point, Rect, VirtualMonitorId, WindowId, WorkspaceId};
 use crate::mru::FocusHistory;
 use crate::project::{project, Projection};
@@ -116,6 +117,36 @@ pub enum FocusIntent {
     Deferred,
 }
 
+/// What the user's latest input can still explain of the focus changes that
+/// follow it: the only way an observation writes the MRU order. What the OS
+/// or an app keys with no input behind it is not where the user went.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub(crate) struct Landing {
+    /// A key press or click: the first focus change after it is the user's,
+    /// if it comes within `AWAY_TTL_NS` (update.rs). Spent by that change, or
+    /// lapsed; a later key press or click starts it afresh.
+    pub(crate) away: Option<Away>,
+    /// The windows (roots) a click hit, and when: a landing on one of them is
+    /// the click's within the longer `INTO_TTL_NS`, whatever landed first,
+    /// since a look can come between a click and the app keying the window
+    /// it hit. Spent by that landing, or lapsed.
+    pub(crate) into: Option<(Vec<WindowId>, u64)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct Away {
+    /// The focus as it stood at the input: a change is a move from it.
+    pub(crate) from: Option<WindowId>,
+    pub(crate) since_ns: u64,
+    pub(crate) by: Input,
+    /// The app a key press was typed into: the change it explains must stay
+    /// in that app (a window shortcut), since another app grabbing focus
+    /// while the user types is that app's doing. `None` for every other
+    /// input, and for a key typed into no model window (a launcher, the
+    /// desktop), which can send focus anywhere.
+    pub(crate) within: Option<Pid>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct State {
     pub mode: Mode,
@@ -156,9 +187,18 @@ pub struct State {
     /// hidden workspace in that observation is the user going there, and is
     /// followed; without it the same landing is a violation. "Since the last
     /// observation" rather than a time window because the engine serializes
-    /// events, so this is exact and replayable.
+    /// events, so this is exact and replayable. Only the follow reads it:
+    /// what a gesture can write into the MRU order is `unseen_landing`, which
+    /// is spent by its own rules.
     #[serde(default)]
     pub(crate) navigation_gesture: bool,
+    /// The MRU half of a gesture, where `navigation_gesture` is the follow
+    /// half, and a key press has only this half. Unlike that flag it outlives
+    /// the next observation: each part is spent by the landing it explains or
+    /// lapses (see [`Landing`]); a newer input replaces it, and any command
+    /// clears it.
+    #[serde(default)]
+    pub(crate) unseen_landing: Landing,
     /// A menu-bar click opened a menu that no click or hotkey has closed yet.
     /// While a menu tracks, the front app can report a window on a hidden
     /// workspace as focused (kitty was caught doing it on every click), and
@@ -233,6 +273,7 @@ impl State {
             focus_intent: FocusIntent::Deferred,
             focus_corrections: 0,
             navigation_gesture: false,
+            unseen_landing: Landing::default(),
             menu_open: false,
             conceded: None,
             focus_history: FocusHistory::new(),
@@ -272,6 +313,7 @@ impl State {
         self.focus_intent = intent;
         self.focus_corrections = 0;
         self.navigation_gesture = false;
+        self.unseen_landing = Landing::default();
         self.conceded = None;
     }
 
