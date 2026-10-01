@@ -15,8 +15,9 @@
 //! a second decision path.
 
 use std::cell::{Cell, OnceCell};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use block2::RcBlock;
 use crossbeam_channel::Sender;
@@ -69,6 +70,30 @@ const NAMED_APPS: usize = 3;
 struct Mailbox {
     latest: Mutex<Option<MenuBarView>>,
     tx: Sender<Msg>,
+    own_menu: OwnMenu,
+}
+
+/// Whether Ordo's own menu is open, for the threads that must not read what
+/// happens in it as the user acting on the world: a click in it is a pick
+/// of Ordo's, which reaches the engine as a command if it asks for one.
+#[derive(Clone, Default)]
+pub struct OwnMenu(Arc<AtomicBool>);
+
+impl OwnMenu {
+    pub fn is_open(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    fn set(&self, open: bool) {
+        self.0.store(open, Ordering::Relaxed);
+        let wall_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis());
+        eprintln!(
+            "ordo: own menu {} at wall {wall_ms}",
+            if open { "opened" } else { "closed" }
+        );
+    }
 }
 
 /// The engine's handle to the menu bar. Cheap to clone, safe to call from
@@ -96,11 +121,12 @@ impl MenuBar {
 
 /// Nothing appears until the first view arrives: an item that showed a
 /// guess before the first snapshot would be the menu bar lying.
-pub fn install(tx: Sender<Msg>) -> MenuBar {
+pub fn install(tx: Sender<Msg>, own_menu: OwnMenu) -> MenuBar {
     MenuBar {
         mailbox: Arc::new(Mailbox {
             latest: Mutex::new(None),
             tx,
+            own_menu,
         }),
     }
 }
@@ -482,11 +508,13 @@ define_class!(
         #[unsafe(method(menuWillOpen:))]
         fn menu_will_open(&self, _menu: &NSMenu) {
             self.ivars().open.set(true);
+            self.ivars().mailbox.own_menu.set(true);
         }
 
         #[unsafe(method(menuDidClose:))]
         fn menu_did_close(&self, _menu: &NSMenu) {
             self.ivars().open.set(false);
+            self.ivars().mailbox.own_menu.set(false);
         }
 
         #[unsafe(method(menuNeedsUpdate:))]

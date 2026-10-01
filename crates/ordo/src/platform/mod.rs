@@ -118,6 +118,11 @@ pub struct MacWorldSource {
     /// The windows now kept as `unread`: since when, and whether they've
     /// been called ghosts yet.
     unread_since: HashMap<WindowId, Unread>,
+    own_menu: status_item::OwnMenu,
+    /// What the focus read stood on at the last scan with Ordo's menu open,
+    /// logged on change: opening that menu has moved focus onto a hidden
+    /// workspace's window, and why is not yet known.
+    menu_focus: Option<(Vec<Pid>, Option<WindowId>)>,
 }
 
 struct Unread {
@@ -133,11 +138,33 @@ struct Unread {
 const GHOST_AFTER: Duration = Duration::from_secs(10);
 
 impl MacWorldSource {
+    fn note_menu_focus(&mut self, focused: Option<WindowId>) {
+        if !self.own_menu.is_open() {
+            if self.menu_focus.take().is_some() {
+                eprintln!("ordo: own menu closed; focus read {:?}", focused.map(|w| w.0));
+            }
+            return;
+        }
+        let seen = (ax::frontmost_claims(), focused);
+        if self.menu_focus.as_ref() != Some(&seen) {
+            let wall_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis());
+            let claims: Vec<i32> = seen.0.iter().map(|p| p.0).collect();
+            eprintln!(
+                "ordo: own menu open at wall {wall_ms}: apps claiming frontmost {claims:?}, focus read {:?}",
+                focused.map(|w| w.0)
+            );
+            self.menu_focus = Some(seen);
+        }
+    }
+
     pub fn new(
         backend: SharedBackend,
         intercepting: Arc<AtomicBool>,
         settle: display_watch::DisplaySettle,
         unreachable: Unreachable,
+        own_menu: status_item::OwnMenu,
     ) -> Self {
         MacWorldSource {
             backend,
@@ -151,6 +178,8 @@ impl MacWorldSource {
             last_windows: HashMap::new(),
             blind: false,
             unread_since: HashMap::new(),
+            own_menu,
+            menu_focus: None,
         }
     }
 }
@@ -276,6 +305,7 @@ impl WorldSource for MacWorldSource {
             .collect();
         self.last_windows = last_windows;
         self.note_unread(&unread, &scan);
+        self.note_menu_focus(scan.focused);
         let frames: HashMap<WindowId, (Pid, Rect)> = scan
             .windows
             .iter()

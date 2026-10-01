@@ -56,7 +56,7 @@ fn main() {
     };
 
     let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
-    let menubar = ordo::platform::status_item::install(tx);
+    let menubar = ordo::platform::status_item::install(tx, Default::default());
     menubar.show(view);
     std::thread::spawn(move || {
         while let Ok(msg) = rx.recv() {

@@ -41,6 +41,7 @@ use ordo_core::{Gesture, Point};
 use crate::engine::Msg;
 use crate::keys::{self, Chord, Mods, Witness};
 use crate::platform::display::MenuBars;
+use crate::platform::status_item::OwnMenu;
 
 /// Two presses of the rescue chord within this window engage rescue.
 const RESCUE_WINDOW: Duration = Duration::from_secs(2);
@@ -49,6 +50,7 @@ struct TapContext {
     tx: Sender<Msg>,
     intercepting: Arc<AtomicBool>,
     menu_bars: MenuBars,
+    own_menu: OwnMenu,
     /// Set after the tap is created, so the callback can re-enable it.
     tap: RefCell<Option<CFRetained<CFMachPort>>>,
     last_rescue: Cell<Option<Instant>>,
@@ -62,12 +64,13 @@ struct TapContext {
 /// the process exits. Returns immediately; if the tap can't be created (no
 /// Accessibility permission), logs and the thread ends — Ordo still observes,
 /// just without hotkeys.
-pub fn spawn(tx: Sender<Msg>, intercepting: Arc<AtomicBool>, menu_bars: MenuBars) {
+pub fn spawn(tx: Sender<Msg>, intercepting: Arc<AtomicBool>, menu_bars: MenuBars, own_menu: OwnMenu) {
     std::thread::spawn(move || {
         let ctx = Box::into_raw(Box::new(TapContext {
             tx,
             intercepting,
             menu_bars,
+            own_menu,
             tap: RefCell::new(None),
             last_rescue: Cell::new(None),
             app_switcher_armed: Cell::new(false),
@@ -141,6 +144,12 @@ unsafe extern "C-unwind" fn callback(
 
     match ty {
         CGEventType::LeftMouseDown | CGEventType::RightMouseDown | CGEventType::OtherMouseDown => {
+            // A click in Ordo's own menu is no gesture on the world: read as
+            // one, it explained an app's re-key onto a hidden workspace, and
+            // the core followed it there.
+            if ctx.own_menu.is_open() {
+                return pass;
+            }
             let p = CGEvent::location(Some(ev));
             let at = Point { x: p.x, y: p.y };
             let gesture = if ctx.menu_bars.contains(at) {

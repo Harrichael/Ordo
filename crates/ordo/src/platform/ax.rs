@@ -251,6 +251,28 @@ pub fn is_key(w: WindowId, pid: i32) -> bool {
     id == Some(w)
 }
 
+/// Every app answering `AXFrontmost` true, where [`frontmost_app`] takes the
+/// first: for logging what the focus read stands on when it surprises.
+pub fn frontmost_claims() -> Vec<Pid> {
+    let apps = NSWorkspace::sharedWorkspace().runningApplications();
+    apps.iter()
+        .filter(|a| a.activationPolicy() == NSApplicationActivationPolicy::Regular)
+        .map(|a| a.processIdentifier())
+        .filter(|pid| *pid > 0)
+        .filter(|pid| {
+            let el = unsafe { AXUIElement::new_application(*pid) };
+            unsafe { el.set_messaging_timeout(MESSAGING_TIMEOUT_SECS) };
+            let Some(front) = (unsafe { copy_attr(&el, "AXFrontmost") }) else {
+                return false;
+            };
+            let is_front = unsafe { &*(front as *const CFBoolean) }.value();
+            unsafe { sys::CFRelease(front) };
+            is_front
+        })
+        .map(Pid)
+        .collect()
+}
+
 pub fn frontmost_app() -> Option<Pid> {
     // Ask each app's live `AXFrontmost` attribute — NOT
     // NSWorkspace.frontmostApplication, which is a cache that refreshes only

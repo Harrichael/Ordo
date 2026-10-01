@@ -154,9 +154,10 @@ fn run(
     let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
 
     let menu_bars = ordo::platform::display::MenuBars::default();
+    let own_menu = ordo::platform::status_item::OwnMenu::default();
     if !observe {
         // The tap runs even when paused — it's what hears the engage chord.
-        tap::spawn(tx.clone(), intercepting.clone(), menu_bars.clone());
+        tap::spawn(tx.clone(), intercepting.clone(), menu_bars.clone(), own_menu.clone());
         // New-window corralling depends on the WindowCreated hint this emits.
         observer::spawn(tx.clone());
     }
@@ -173,7 +174,8 @@ fn run(
 
     // Observe mode stays out of the menu bar: it executes nothing, so a menu
     // offering to switch workspaces would be a lie.
-    let menubar = (!observe).then(|| ordo::platform::status_item::install(tx.clone()));
+    let menubar =
+        (!observe).then(|| ordo::platform::status_item::install(tx.clone(), own_menu.clone()));
 
     // Display plug/unplug: the world is unobservable while macOS rearranges
     // it, then one rescan re-projects everything onto the new rig.
@@ -184,6 +186,7 @@ fn run(
     let world_intercepting = intercepting.clone();
     let unreachable = ordo::platform::Unreachable::default();
     let world_unreachable = unreachable.clone();
+    let world_own_menu = own_menu.clone();
     // The restack worker outlives everything but the process (tap-thread
     // lifetime contract); it reports its telemetry back through the engine's
     // channel, so it needs a sender before the engine thread consumes rx.
@@ -218,7 +221,13 @@ fn run(
             }
         };
         let world = ordo::platform::ws_events::SubscribingWorld::new(
-            MacWorldSource::new(backend.clone(), world_intercepting, settle, world_unreachable),
+            MacWorldSource::new(
+                backend.clone(),
+                world_intercepting,
+                settle,
+                world_unreachable,
+                world_own_menu,
+            ),
             engine_ws,
         );
         let effector: Box<dyn Effector> = if observe {
