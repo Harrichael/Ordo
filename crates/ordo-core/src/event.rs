@@ -67,10 +67,11 @@ pub enum Event {
 /// verified app-initiated fling by 500ms (run 51 seq 12769).
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Gesture {
-    /// Any mouse button went down here (global CG coordinates). The point is
-    /// what lets the core tell a click INTO a visible window (the OS keys the
-    /// right thing; a later hidden-workspace landing is a fling) from a click
-    /// elsewhere — the Dock, a notification — that can be navigation.
+    /// Any mouse button went down here (global CG coordinates), on neither a
+    /// menu bar nor the Dock. The point is what lets the core tell a click
+    /// INTO a visible window (the OS keys the right thing; a later
+    /// hidden-workspace landing is a fling) from a click elsewhere — the
+    /// desktop, a notification — that can be navigation.
     MouseDown { at: Point },
     /// A mouse button went down in a display's menu bar. It moves the user to
     /// that display — macOS hands focus to its front window, or its desktop
@@ -79,6 +80,16 @@ pub enum Gesture {
     /// (opening Ordo's own menu was once read as navigating to a parked
     /// window, and slid the view away).
     MenuBar { at: Point },
+    /// A mouse button went down on the Dock or one of its menus: the window
+    /// server routed the click to a window of the Dock's. The core cannot
+    /// tell this from a point, as the Dock hides, moves between edges and
+    /// displays, and lies over windows: hit-tested, its clicks were taken as
+    /// clicks into the window beneath (run 55 seq 3205: Slack's, under an
+    /// auto-hidden Dock). Like the app switcher, it can bring up any app's
+    /// window, so a hidden landing after it is the user going there. Mission
+    /// Control and Launchpad are the Dock's too, and so are their clicks,
+    /// rightly: they are navigation. (Stage Manager is not the Dock's.)
+    Dock { at: Point },
     /// macOS's app switcher completed (Cmd released after Cmd+Tab) or its
     /// in-app window cycle fired (Cmd+`). The target is the OS's to know; a
     /// focus landing on a hidden workspace right after is the user going there.
@@ -99,6 +110,10 @@ pub enum Input {
     MenuBar,
     Switcher,
     Key,
+    Dock,
+    /// No input of the user's: a window born without focus that its app
+    /// keyed a beat later (see `Landing::awaited`), declared as a birth.
+    Birth,
 }
 
 impl From<Gesture> for Input {
@@ -106,6 +121,7 @@ impl From<Gesture> for Input {
         match g {
             Gesture::MouseDown { .. } => Input::Click,
             Gesture::MenuBar { .. } => Input::MenuBar,
+            Gesture::Dock { .. } => Input::Dock,
             Gesture::SystemSwitch => Input::Switcher,
             Gesture::Key => Input::Key,
         }

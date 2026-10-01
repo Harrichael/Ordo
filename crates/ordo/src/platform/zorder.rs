@@ -43,6 +43,26 @@ extern "C" {
 /// costs ten times as much (examples/frames_probe.rs, which also found these
 /// frames equal to the apps' own AX frames, to the point).
 pub fn describe(windows: &[WindowId]) -> Vec<(WindowId, i32, Rect)> {
+    descriptions(windows)
+        .into_iter()
+        .map(|d| (d.id, d.pid, d.bounds))
+        .collect()
+}
+
+/// One window as the window server describes it.
+pub struct Described {
+    pub id: WindowId,
+    pub pid: i32,
+    pub layer: Option<i32>,
+    pub bounds: Rect,
+}
+
+/// [`describe`] for one window, with its layer.
+pub fn describe_one(w: WindowId) -> Option<Described> {
+    descriptions(&[w]).into_iter().next()
+}
+
+fn descriptions(windows: &[WindowId]) -> Vec<Described> {
     let mut out = Vec::new();
     // Raw window ids, not CF numbers, hence no callbacks.
     let raw: Vec<*const std::ffi::c_void> =
@@ -66,16 +86,17 @@ pub fn describe(windows: &[WindowId]) -> Vec<(WindowId, i32, Rect)> {
             let d = cf::array_get(arr, i) as sys::CFDictionaryRef;
             let b = cf::dict_get(d, "kCGWindowBounds");
             let seen = (|| {
-                Some((
-                    WindowId(cf::number_i64(cf::dict_get(d, "kCGWindowNumber"))? as u32),
-                    cf::number_i64(cf::dict_get(d, "kCGWindowOwnerPID"))? as i32,
-                    Rect {
+                Some(Described {
+                    id: WindowId(cf::number_i64(cf::dict_get(d, "kCGWindowNumber"))? as u32),
+                    pid: cf::number_i64(cf::dict_get(d, "kCGWindowOwnerPID"))? as i32,
+                    layer: cf::number_i64(cf::dict_get(d, "kCGWindowLayer")).map(|l| l as i32),
+                    bounds: Rect {
                         x: cf::number_f64(cf::dict_get(b, "X"))?,
                         y: cf::number_f64(cf::dict_get(b, "Y"))?,
                         w: cf::number_f64(cf::dict_get(b, "Width"))?,
                         h: cf::number_f64(cf::dict_get(b, "Height"))?,
                     },
-                ))
+                })
             })();
             out.extend(seen);
         }

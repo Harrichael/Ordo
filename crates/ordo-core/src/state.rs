@@ -128,11 +128,26 @@ pub(crate) struct Landing {
     /// if it comes within `AWAY_TTL_NS` (update.rs). Spent by that change, or
     /// lapsed; a later key press or click starts it afresh.
     pub(crate) away: Option<Away>,
-    /// The windows (roots) a click hit, and when: a landing on one of them is
-    /// the click's within the longer `INTO_TTL_NS`, whatever landed first,
-    /// since a look can come between a click and the app keying the window
-    /// it hit. Spent by that landing, or lapsed.
-    pub(crate) into: Option<(Vec<WindowId>, u64)>,
+    /// Windows whose coming up key is explained whatever landed first, since
+    /// a look can come between the input and the app keying its window: what
+    /// a click hit, and a window born without focus, which stands for the
+    /// input that asked for it (Cmd+N, a Dock menu's New Window): kitty keys
+    /// the window it last had key first, for about a second (runs 54 and 55).
+    /// At most one of each: a click ends a birth's wait, and a newer birth
+    /// replaces it.
+    #[serde(default)]
+    pub(crate) awaited: Vec<Awaited>,
+}
+
+/// Roots that a landing on, within `AWAIT_TTL_NS` (update.rs) of `since_ns`,
+/// is `by`'s doing. Spent by that landing, or lapsed.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct Awaited {
+    pub(crate) roots: Vec<WindowId>,
+    pub(crate) since_ns: u64,
+    /// `Click` or `Birth`. A birth's landing is declared, as a birth with
+    /// focus is; a click's only enters the MRU order.
+    pub(crate) by: Input,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -184,14 +199,14 @@ pub struct State {
     #[serde(default)]
     pub(crate) focus_corrections: u8,
     /// A witnessed user gesture that could be navigation — Cmd+Tab, Cmd+`, a
-    /// mouse-down outside every visible window — arrived since the last
-    /// observation. The next observation consumes it: a focus landing on a
-    /// hidden workspace in that observation is the user going there, and is
-    /// followed; without it the same landing is a violation. "Since the last
-    /// observation" rather than a time window because the engine serializes
-    /// events, so this is exact and replayable. Only the follow reads it:
-    /// what a gesture can write into the MRU order is `unseen_landing`, which
-    /// is spent by its own rules.
+    /// Dock click, a mouse-down outside every visible window — arrived since
+    /// the last observation. The next observation consumes it: a focus
+    /// landing on a hidden workspace in that observation is the user going
+    /// there, and is followed; without it the same landing is a violation.
+    /// "Since the last observation" rather than a time window because the
+    /// engine serializes events, so this is exact and replayable. Only the
+    /// follow reads it: what a gesture can write into the MRU order is
+    /// `unseen_landing`, which is spent by its own rules.
     #[serde(default)]
     pub(crate) navigation_gesture: bool,
     /// The MRU half of a gesture, where `navigation_gesture` is the follow

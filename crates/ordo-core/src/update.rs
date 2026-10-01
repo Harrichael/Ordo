@@ -11,7 +11,7 @@ use crate::ids::{
 };
 use crate::project::{after_move, Projection};
 use crate::reconcile::{self, Delta};
-use crate::state::{Away, FocusIntent, Landing, Mode, PendingOp, State, WindowRecord};
+use crate::state::{Away, Awaited, FocusIntent, Landing, Mode, PendingOp, State, WindowRecord};
 
 /// How long an expectation may go unmet before its op is declared lost.
 ///
@@ -81,8 +81,10 @@ pub enum Note {
     /// invisible — the gesture event is logged, the hidden landing is held,
     /// and nothing in between says why (the same absence-of-evidence hole
     /// `park_trace` closed for parking). It also proves whether `SystemSwitch`
-    /// reaches the core at all, and shows a Dock click landing inside the
-    /// window beneath an auto-hidden Dock.
+    /// reaches the core at all, and a Dock click classified as a `MouseDown`
+    /// inside a window is one the shell failed to see was the Dock's. The
+    /// reverse, a click into a window taken for the Dock's, shows as a `Dock`
+    /// row whose `at` lies inside a visible window's frame.
     GestureClassified {
         gesture: Gesture,
         armed: bool,
@@ -478,7 +480,8 @@ fn view_for(s: &State, target: WindowId) -> (Option<VirtualMonitorId>, Projectio
 ///
 /// A click that ends an open menu is classified as the menu's, not as a click
 /// into whatever window the menu was drawn over: it may be a menu item, and a
-/// menu item can open anything.
+/// menu item can open anything. A click on the Dock is like Cmd+Tab: it names
+/// no window, and can bring up any.
 ///
 /// A key press is none of that: typing into the window Ordo declared is not
 /// reaching for focus elsewhere. It only explains the focus change after it,
@@ -510,9 +513,15 @@ fn handle_gesture(s: &mut State, gesture: Gesture, now_ns: u64, notes: &mut Vec<
     };
     let within = hit.first().copied();
     let armed = match gesture {
-        Gesture::SystemSwitch => true,
+        Gesture::SystemSwitch | Gesture::Dock { .. } => true,
         Gesture::MenuBar { .. } | Gesture::Key => false,
         Gesture::MouseDown { .. } => within.is_none(),
+    };
+    // The shell saw the Dock take the click, so it was no menu item.
+    let by = match gesture {
+        Gesture::Dock { .. } => Input::Dock,
+        _ if menu_was_open => Input::MenuBar,
+        g => g.into(),
     };
     // After the declaration, which clears them.
     s.navigation_gesture = armed;
@@ -520,10 +529,18 @@ fn handle_gesture(s: &mut State, gesture: Gesture, now_ns: u64, notes: &mut Vec<
         away: Some(Away {
             from: s.focused,
             since_ns: now_ns,
-            by: if menu_was_open { Input::MenuBar } else { gesture.into() },
+            by,
             within: None,
         }),
-        into: (!hit.is_empty()).then(|| (hit.iter().map(|w| s.root_of(*w)).collect(), now_ns)),
+        awaited: if hit.is_empty() {
+            Vec::new()
+        } else {
+            vec![Awaited {
+                roots: hit.iter().map(|w| s.root_of(*w)).collect(),
+                since_ns: now_ns,
+                by: Input::Click,
+            }]
+        },
     };
     notes.push(Note::GestureClassified {
         gesture,
@@ -1183,6 +1200,16 @@ fn handle_snapshot(
             if let Delta::WindowCreated(w) = d {
                 if s.focused == Some(*w) {
                     s.declare_focus(FocusIntent::Window(*w));
+                } else if s.windows.get(w).is_some_and(|r| r.parent.is_none()) {
+                    // Its app may key it a beat late: `record_landing`
+                    // declares it then.
+                    let awaited = &mut s.unseen_landing.awaited;
+                    awaited.retain(|a| a.by != Input::Birth);
+                    awaited.push(Awaited {
+                        roots: vec![*w],
+                        since_ns: now_ns,
+                        by: Input::Birth,
+                    });
                 }
             }
         }
@@ -1432,12 +1459,12 @@ fn handle_snapshot(
 /// press would explain whatever an app keyed on its own seconds later.
 const AWAY_TTL_NS: u64 = 1_000_000_000;
 
-/// How long a click waits to see a window it hit come up key. Longer than
-/// `AWAY_TTL_NS` because a click names its windows, so waiting risks less,
-/// and an app with no observer is seen only by the periodic look, two
-/// seconds apart. Bounded all the same: a click the user moved on from must
-/// not explain the app re-keying that window on its own minutes later.
-const INTO_TTL_NS: u64 = 3_000_000_000;
+/// How long a click or a birth waits to see a window it named come up key.
+/// Longer than `AWAY_TTL_NS` because these name their windows, so waiting
+/// risks less, and an app with no observer is seen only by the periodic look,
+/// two seconds apart. Bounded all the same: a click the user moved on from
+/// must not explain the app re-keying that window on its own minutes later.
+const AWAIT_TTL_NS: u64 = 3_000_000_000;
 
 /// Write into the MRU order the focus the user's input explains, and nothing
 /// else the screen shows: an app keying a window with no input behind it, or
@@ -1445,14 +1472,15 @@ const INTO_TTL_NS: u64 = 3_000_000_000;
 /// a 27 ms flicker onto a Chrome window headed every later restack of its
 /// workspace). A key press or click explains the first focus change after
 /// it, within `AWAY_TTL_NS`; a click also explains a landing on a window it
-/// hit, within `INTO_TTL_NS`. A hidden landing is never recorded: it is
-/// either navigation, which the follow declares, or a fling. The OS's focus
-/// at startup is the user's last choice before Ordo ran. Not called for a
-/// look in which Ordo hands focus on from a closed window
+/// hit, within `AWAIT_TTL_NS`, and a birth explains a landing on the window
+/// born, declared as a birth with focus is. A hidden landing is never
+/// recorded: it is either navigation, which the follow declares, or a fling.
+/// The OS's focus at startup is the user's last choice before Ordo ran. Not
+/// called for a look in which Ordo hands focus on from a closed window
 /// (`hand_on_from_close`): what the app keys there is the close's fallout,
 /// and the order takes Ordo's declaration instead.
 fn record_landing(s: &mut State, trigger: &RescanTrigger, now_ns: u64, notes: &mut Vec<Note>) {
-    let Landing { away, into } = std::mem::take(&mut s.unseen_landing);
+    let Landing { away, mut awaited } = std::mem::take(&mut s.unseen_landing);
     let focused = s.focused;
     let focused_root = focused.map(|f| s.root_of(f));
     let focused_app = key_app(s);
@@ -1472,20 +1500,19 @@ fn record_landing(s: &mut State, trigger: &RescanTrigger, now_ns: u64, notes: &m
             }
             other => other,
         };
-        s.unseen_landing.into = match into {
-            Some((_, since)) if lapsed(since, INTO_TTL_NS) => None,
-            Some((roots, _)) if focused_root.is_some_and(|r| roots.contains(&r)) => {
-                landed = focused.map(|f| (f, Some(Input::Click)));
-                None
-            }
-            other => other,
-        };
+        awaited.retain(|a| !lapsed(a.since_ns, AWAIT_TTL_NS));
+        let hit = focused_root.and_then(|r| awaited.iter().position(|a| a.roots.contains(&r)));
+        if let Some(i) = hit {
+            landed = focused.map(|f| (f, Some(awaited.remove(i).by)));
+        }
+        s.unseen_landing.awaited = awaited;
     }
     let Some((f, by)) = landed.filter(|(f, _)| s.windows.get(f).is_some_and(|r| s.is_visible(r)))
     else {
         return;
     };
     match s.focus_intent() {
+        _ if by == Some(Input::Birth) => s.declare_focus(FocusIntent::Window(f)),
         FocusIntent::Deferred => {
             let root = s.root_of(f);
             s.focus_history.touch(root);
@@ -1593,25 +1620,27 @@ fn hand_on_from_close(pre: &State, s: &State, deltas: &[Delta]) -> Option<HandOn
 }
 
 /// The user's latest input, in the same look as the close, can't be what
-/// closed the window, so it took them somewhere: Cmd+Tab, a click that
-/// missed the closed window (the Dock, the desktop, another window; the click
-/// that closed it hit it), or a key press that brought up another app (a
+/// closed the window, so it took them somewhere: Cmd+Tab, the Dock, a click
+/// that missed the closed window (the desktop, another window; the click that
+/// closed it hit it), or a key press that brought up another app (a
 /// launcher). A key press within the closed window's app is Cmd+W, and a
-/// menu's click may be its Close item. A key press that leaves the closed
-/// window's app with no windows is Cmd+Q, after which macOS keys whichever
-/// app it likes, often on the other monitor: that other app is the quit's
-/// fallout, not a launcher's pick.
+/// menu's click may be its Close item. A key press or Dock click that leaves
+/// the closed window's app with no windows is Cmd+Q or the Dock menu's Quit,
+/// after which macOS keys whichever app it likes, often on the other monitor
+/// or a hidden workspace: that other app is the quit's fallout, not where the
+/// user went.
 fn went_elsewhere(pre: &State, s: &State, closed: &WindowRecord) -> bool {
-    let Landing { away, into } = &pre.unseen_landing;
+    let Landing { away, awaited } = &pre.unseen_landing;
     let root = pre.root_of(closed.id);
+    let quit = !s.windows.values().any(|r| r.app == closed.app);
     match away.as_ref().map(|a| a.by) {
         Some(Input::Switcher) => true,
-        Some(Input::Click) => into.as_ref().is_none_or(|(roots, _)| !roots.contains(&root)),
-        Some(Input::Key) => {
-            let quit = !s.windows.values().any(|r| r.app == closed.app);
-            !quit && key_app(s).is_some_and(|app| app != closed.app)
-        }
-        Some(Input::MenuBar) | None => false,
+        Some(Input::Dock) => !quit,
+        Some(Input::Click) => !awaited
+            .iter()
+            .any(|a| a.by == Input::Click && a.roots.contains(&root)),
+        Some(Input::Key) => !quit && key_app(s).is_some_and(|app| app != closed.app),
+        Some(Input::MenuBar | Input::Birth) | None => false,
     }
 }
 
@@ -1892,6 +1921,26 @@ fn enforce_focus(
     let Some(here) = s.current_workspace() else {
         return false;
     };
+    // A window born without focus is awaited (see `Landing::awaited`), and
+    // what its app keys meanwhile, a hidden sibling of it or nothing, is the
+    // opening, not to be fought or followed. Nothing keyed is a vacuum
+    // whichever app holds it, so it is left alone too. A newborn out of
+    // sight was not asked for here, and a visible sibling keyed is ordinary
+    // focus, which the rules below already judge.
+    let keyed = s.focused.and_then(|f| s.windows.get(&f));
+    let opening = s
+        .unseen_landing
+        .awaited
+        .iter()
+        .filter(|a| a.by == Input::Birth)
+        .flat_map(|a| &a.roots)
+        .filter_map(|w| s.windows.get(w))
+        .any(|born| {
+            s.is_visible(born) && keyed.is_none_or(|r| r.app == born.app && !s.is_visible(r))
+        });
+    if opening {
+        return false;
+    }
 
     let landed_hidden = s
         .focused

@@ -266,6 +266,10 @@ fn click(x: f64, y: f64) -> Event {
     gesture(Gesture::MouseDown { at: Point { x, y } })
 }
 
+fn dock(x: f64, y: f64) -> Event {
+    gesture(Gesture::Dock { at: Point { x, y } })
+}
+
 /// Boot the standard world, then click each window in `focus_seq` in order,
 /// so the MRU history is exactly `focus_seq` reversed-into-front order.
 fn booted(focus_seq: &[u32]) -> State {
@@ -1624,10 +1628,11 @@ fn a_click_into_a_visible_window_does_not_license_a_follow_but_a_click_elsewhere
     assert_eq!(count_switches(&fling.effects), 0);
     assert_eq!(focus_targets(&fling.effects), vec![wid(1)]);
 
-    // A click outside every visible window — the Dock, say — can be aimed at
-    // anything, and a hidden landing right after it is the user navigating.
-    let dock = update(&s, &click(960.0, 1075.0));
-    assert!(dock.notes.contains(&Note::GestureClassified {
+    // A click outside every visible window — the desktop, say — can be
+    // aimed at anything, and a hidden landing right after it is the user
+    // navigating.
+    let elsewhere = update(&s, &click(960.0, 1075.0));
+    assert!(elsewhere.notes.contains(&Note::GestureClassified {
         gesture: Gesture::MouseDown {
             at: Point {
                 x: 960.0,
@@ -1637,8 +1642,8 @@ fn a_click_into_a_visible_window_does_not_license_a_follow_but_a_click_elsewhere
         armed: true,
         within: None,
     }));
-    let clicked_dock = dock.state;
-    let followed = update(&clicked_dock, &obs(2));
+    let clicked_out = elsewhere.state;
+    let followed = update(&clicked_out, &obs(2));
     assert_eq!(count_switches(&followed.effects), 1);
     assert!(followed
         .notes
@@ -1647,17 +1652,17 @@ fn a_click_into_a_visible_window_does_not_license_a_follow_but_a_click_elsewhere
 
     // A gesture explains exactly the observation after it. One uneventful
     // observation later, the same landing is a fling again.
-    let quiet = update(&clicked_dock, &obs(1)).state;
+    let quiet = update(&clicked_out, &obs(1)).state;
     let late = update(&quiet, &obs(2));
     assert_eq!(count_switches(&late.effects), 0, "the gesture was spent");
     assert_eq!(focus_targets(&late.effects), vec![wid(1)]);
 
-    // A command in between spends it too: Dock click, then Cmd+Right to the
+    // A command in between spends it too: that click, then Cmd+Right to the
     // empty workspace 3. Its own post-effect snapshot shows w1 still focused
     // — parking does not defocus — and now hidden. That is the switch's
     // doing, not the click's; bouncing back to workspace 1 would be wrong.
     let switched = update(
-        &clicked_dock,
+        &clicked_out,
         &hotkey(HotkeyAction::WorkspaceSwitchTo(ws(3))),
     )
     .state;
@@ -2051,7 +2056,7 @@ fn a_dock_click_or_a_launcher_after_cmd_w_is_where_the_user_went() {
         )
     };
 
-    let docked = look_at(&update(&typed, &click(960.0, 1075.0)).state, 1);
+    let docked = look_at(&update(&typed, &dock(960.0, 1075.0)).state, 1);
     assert!(focus_targets(&docked.effects).is_empty());
     assert_eq!(history(&docked.state)[0], wid(1));
 
@@ -2088,6 +2093,208 @@ fn quitting_the_focused_app_hands_focus_on_within_its_monitor() {
     );
     assert_eq!(focus_targets(&step.effects), vec![wid(2)]);
     assert_eq!(step.state.focus_intent(), FocusIntent::Window(wid(2)));
+}
+
+/// kitty (app 200) has a window w2 parked on workspace 2; the user works in
+/// w1 on workspace 1. App 300 has w5 parked too. Returned with the windows
+/// once kitty has opened w4 on workspace 1.
+fn kitty_at_work() -> (State, Vec<Win>) {
+    let before = vec![
+        win(1, 100, 1, rect(100.0, 100.0)),
+        win(2, 200, 2, rect(2000.0, 100.0)),
+        win(3, 300, 1, rect(2400.0, 300.0)),
+        win(5, 300, 2, rect(2600.0, 400.0)),
+    ];
+    let mons = || vec![mon_a(1), mon_b(1)];
+    let s = update(&State::new(), &observed(mons(), before.clone(), None, RescanTrigger::Startup)).state;
+    let s = used(&s, 1, mons(), before.clone());
+    let mut after = before;
+    after.push(win(4, 200, 1, rect(2100.0, 200.0)));
+    (s, after)
+}
+
+/// The user asks kitty for a new window. The new w4 is born unfocused, kitty
+/// then keys w2, the window it last had key, and only about a second later
+/// keys w4 (runs 54 and 55).
+fn kitty_opening_a_window() -> (State, Vec<Win>, Ts) {
+    let (s, after) = kitty_at_work();
+    let mons = || vec![mon_a(1), mon_b(1)];
+    let born_at = ts();
+    let born = update(
+        &s,
+        &observed_at(born_at, mons(), after.clone(), None, RescanTrigger::Periodic),
+    );
+    assert!(focus_targets(&born.effects).is_empty());
+    (born.state, after, born_at)
+}
+
+#[test]
+fn a_new_window_its_app_keys_a_beat_late_is_where_focus_goes() {
+    // While kitty is keying its old, parked window on the way to the new
+    // one, Ordo neither takes focus back nor follows it to workspace 2. Once
+    // kitty keys the new window, it is declared as a birth with focus would
+    // be: top of the MRU order and of the restack.
+    let (s, wins, born_at) = kitty_opening_a_window();
+    let mons = || vec![mon_a(1), mon_b(1)];
+    let detour = update(
+        &s,
+        &observed_at(plus_ms(born_at, 30), mons(), wins.clone(), Some(2), RescanTrigger::Periodic),
+    );
+    assert!(focus_targets(&detour.effects).is_empty(), "{:?}", detour.effects);
+    assert_eq!(count_switches(&detour.effects), 0);
+
+    let keyed = update(
+        &detour.state,
+        &observed_at(plus_ms(born_at, 1_300), mons(), wins, Some(4), RescanTrigger::Periodic),
+    );
+    assert_eq!(keyed.state.focus_intent(), FocusIntent::Window(wid(4)));
+    assert_eq!(history(&keyed.state)[0], wid(4));
+    // kitty raised and keyed it itself: nothing to grant or restack.
+    assert!(focus_targets(&keyed.effects).is_empty());
+    assert!(restacks(&keyed.effects).is_empty());
+}
+
+#[test]
+fn the_grace_covers_only_the_opening_app_and_ends_at_a_command() {
+    // Another app flinging focus to its parked window during kitty's beat is
+    // held as ever. And once the user commands elsewhere, kitty keying its
+    // new window later is kitty's doing, not the opening the user asked for.
+    let (s, wins, born_at) = kitty_opening_a_window();
+    let mons = || vec![mon_a(1), mon_b(1)];
+    let fling = update(
+        &s,
+        &observed_at(plus_ms(born_at, 30), mons(), wins.clone(), Some(5), RescanTrigger::Periodic),
+    );
+    assert_eq!(focus_targets(&fling.effects), vec![wid(1)]);
+
+    let moved_on = update(&s, &hotkey(HotkeyAction::MruWorkspace)).state;
+    let keyed = update(
+        &moved_on,
+        &observed_at(plus_ms(born_at, 1_300), mons(), wins, Some(4), RescanTrigger::Periodic),
+    );
+    assert!(!keyed.notes.iter().any(|n| matches!(n, Note::LandingExplained { by: Input::Birth, .. })));
+    assert_ne!(keyed.state.focus_intent(), FocusIntent::Window(wid(4)));
+}
+
+#[test]
+fn an_app_that_never_keys_its_new_window_is_held_after_the_grace() {
+    // kitty still has its parked window key three seconds after the birth:
+    // that is a fling after all, and focus goes back to the visible MRU head.
+    let (s, wins, born_at) = kitty_opening_a_window();
+    let held = update(
+        &s,
+        &observed_at(plus_ms(born_at, 3_100), vec![mon_a(1), mon_b(1)], wins, Some(2), RescanTrigger::Periodic),
+    );
+    assert_eq!(focus_targets(&held.effects), vec![wid(1)]);
+}
+
+/// Run 55 seq 3205-3213: the user clicks kitty's icon in the Dock, then New
+/// Window in its Dock menu. Both clicks are the Dock's, which license a
+/// follow, and kitty keys its parked w2 in the very look that shows w4 born,
+/// the one those clicks arm. That is the opening, not the user going to
+/// workspace 2: nothing is followed or fought, and when kitty keys w4 it is
+/// declared.
+#[test]
+fn a_window_opened_from_the_dock_menu_is_where_focus_goes_with_no_follow() {
+    let (s, wins) = kitty_at_work();
+    let mons = || vec![mon_a(1), mon_b(1)];
+    let s = update(&s, &dock(1053.0, 1050.0)).state;
+    let s = update(&s, &dock(1120.0, 850.0)).state;
+    let born_at = ts();
+    let detour = update(
+        &s,
+        &observed_at(born_at, mons(), wins.clone(), Some(2), RescanTrigger::Periodic),
+    );
+    assert_eq!(count_switches(&detour.effects), 0);
+    assert!(focus_targets(&detour.effects).is_empty(), "{:?}", detour.effects);
+
+    let keyed = update(
+        &detour.state,
+        &observed_at(plus_ms(born_at, 1_300), mons(), wins, Some(4), RescanTrigger::Periodic),
+    );
+    assert!(keyed.notes.contains(&Note::LandingExplained {
+        window: wid(4),
+        by: Input::Birth,
+    }));
+    assert_eq!(keyed.state.focus_intent(), FocusIntent::Window(wid(4)));
+    assert_eq!(count_switches(&keyed.effects), 0);
+}
+
+/// The Dock is how the user goes to an app whose window lives elsewhere. A
+/// click on it, even where it lies over a window (here w1, as an auto-hidden
+/// Dock does), is no click into that window: the app keying its window
+/// parked on workspace 2 is followed there, as after Cmd+Tab.
+#[test]
+fn a_dock_click_over_a_window_is_navigation() {
+    let mut wins = std_windows();
+    wins[1].workspace = ws(2);
+    let obs = |focused: u32| {
+        observed(vec![mon_a(1), mon_b(1)], wins.clone(), Some(focused), RescanTrigger::Periodic)
+    };
+    let s = update(&booted(&[1]), &obs(1)).state;
+    let docked = update(&s, &dock(200.0, 200.0));
+    assert!(docked.notes.contains(&Note::GestureClassified {
+        gesture: Gesture::Dock {
+            at: Point { x: 200.0, y: 200.0 }
+        },
+        armed: true,
+        within: None,
+    }));
+    let followed = update(&docked.state, &obs(2));
+    assert!(followed
+        .effects
+        .iter()
+        .any(|e| matches!(e, Effect::SwitchWorkspace { target, .. } if *target == ws(2))));
+    assert!(followed.notes.contains(&Note::FollowedFocus {
+        window: wid(2),
+        target: ws(2),
+        monitor: None,
+    }));
+}
+
+/// A Dock click names no window, not even the one it fell over. The app it
+/// brings up keying w3 is its doing, and where the user went; w1, beneath the
+/// click, coming up key a look later is not.
+#[test]
+fn a_dock_click_explains_where_focus_goes_but_not_the_window_beneath_it() {
+    let s = booted(&[3, 1]);
+    let obs = |focused: u32| {
+        observed(vec![mon_a(1), mon_b(1)], std_windows(), Some(focused), RescanTrigger::Periodic)
+    };
+    let docked = update(&s, &dock(300.0, 250.0)).state;
+    let brought_up = update(&docked, &obs(3));
+    assert!(brought_up.notes.contains(&Note::LandingExplained {
+        window: wid(3),
+        by: Input::Dock,
+    }));
+    let beneath = update(&brought_up.state, &obs(1));
+    assert!(!beneath
+        .notes
+        .iter()
+        .any(|n| matches!(n, Note::LandingExplained { .. })));
+    assert_eq!(history(&beneath.state)[0], wid(3));
+}
+
+/// Quit from kitty's Dock menu while kitty's w4 is key on the right monitor.
+/// Every kitty window goes, and macOS keys w5, which app 300 has parked on
+/// workspace 2. The Dock click licenses a follow, but that pick is the quit's
+/// fallout, as after Cmd+Q: focus goes to the right monitor's next window.
+#[test]
+fn quitting_the_focused_app_from_the_dock_hands_focus_on_within_its_monitor() {
+    let (s, wins, _) = kitty_opening_a_window();
+    let mons = || vec![mon_a(1), mon_b(1)];
+    let s = used(&s, 4, mons(), wins.clone());
+    let docked = update(&s, &dock(1120.0, 850.0)).state;
+    let quit = update(
+        &docked,
+        &observed(mons(), without(&wins, &[2, 4]), Some(5), RescanTrigger::Periodic),
+    );
+    assert_eq!(count_switches(&quit.effects), 0);
+    assert_eq!(focus_targets(&quit.effects), vec![wid(3)]);
+    assert!(quit.notes.contains(&Note::FocusHandedOn {
+        closed: wid(4),
+        to: Some(wid(3)),
+    }));
 }
 
 #[test]

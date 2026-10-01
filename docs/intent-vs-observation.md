@@ -225,9 +225,22 @@ by 500ms, so any "recent input" rule would have blessed it.
 2. A gesture with no nameable target writes `Deferred`. A mouse-down INTO a
    window on the visible workspace keys that window (or a sheet or child Ordo
    does not model), so it does NOT license a follow — a hidden landing after
-   it is a fling. A mouse-down outside every visible window (Dock, menu bar,
-   a notification) can be aimed at anything and does. This is the only
-   point-to-window question asked, and it needs no z-order.
+   it is a fling. A mouse-down outside every visible window (the desktop, a
+   notification) can be aimed at anything and does. This is the only
+   point-to-window question the core asks, and it needs no z-order. The Dock
+   is not asked about by point: it hides, sits on any edge or display, and
+   lies over windows, so the core alone took a click on it for a click into
+   the window beneath (run 55 seq 3205: Slack's, under an auto-hidden Dock).
+   The tap asks the window server which window the click is routed to
+   (`kCGMouseEventWindowUnderMousePointerThatCanHandleThisEvent`), and when
+   that window is the Dock's (its icons, its menus) reports `Gesture::Dock`,
+   which licenses a follow as Cmd+Tab does and hits no window. The Dock draws
+   its icons in one window spanning its display, so a click routed to that
+   window counts only near an edge the Dock can sit on: were the routing to
+   name it for clicks that fall through to the windows beneath, every click
+   on the display would otherwise arm a follow. The tap prints its first 20
+   Dock clicks and first 20 refusals per run to stderr. A menu bar click
+   (`Gesture::MenuBar`) licenses no follow.
 3. NO gesture: the declaration stands. A focus change contradicting
    `Window(w)` is a violation, re-asserted under `DAMPING_LIMIT` exactly like
    a parked frame. Because this is the default, a fling cause nobody has
@@ -242,8 +255,8 @@ Evidence: every gesture leaves `Note::GestureClassified { gesture, armed,
 within }` in the log — the verdict, not just the event. An unarmed follow is
 otherwise invisible (the gesture row is there, the hidden landing is held,
 nothing says why), `within` names the visible window that swallowed a click
-(a Dock click over an auto-hidden Dock lands inside the window beneath it and
-will show up here), and a `SystemSwitch` row is the proof that the Cmd-release
+(a Dock click shown as a `MouseDown` with a `within` is one the tap failed to
+see was the Dock's), and a `SystemSwitch` row is the proof that the Cmd-release
 path fires on real hardware at all. `Note::HeldFocus { window, from, from_app }`
 records the hidden window the invariant pulled away from.
 
