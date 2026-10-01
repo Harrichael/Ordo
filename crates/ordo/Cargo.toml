@@ -59,6 +59,7 @@ objc2-app-kit = { version = "0.3", features = [
     "NSAttributedString",
     "NSAccessibilityProtocols",
     "NSEvent",
+    "NSTrackingArea",
     "block2",
 ] }
 objc2-core-foundation = { version = "0.3", features = [

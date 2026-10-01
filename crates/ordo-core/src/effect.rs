@@ -68,6 +68,19 @@ pub enum Effect {
     AddMonitor {
         op: OpId,
     },
+    /// Renumber the workspaces (see [`crate::after_move`]).
+    MoveWorkspace {
+        op: OpId,
+        from: WorkspaceId,
+        to: WorkspaceId,
+    },
+    /// Renumber the virtual monitors (see [`crate::after_move`]). The backend
+    /// moves what the new order moves on screen.
+    MoveMonitor {
+        op: OpId,
+        from: VirtualMonitorId,
+        to: VirtualMonitorId,
+    },
     /// The core computes target geometry itself (pure math over monitor
     /// frames); the shell only performs the AX write.
     SetWindowFrame {
@@ -157,6 +170,14 @@ pub enum Expectation {
     /// A merge or an add landed: this many monitors now.
     MonitorCount {
         count: u8,
+    },
+    /// A workspace move landed: the current workspace goes by this number.
+    WorkspacesMoved {
+        current: WorkspaceId,
+    },
+    /// A monitor move landed: the anchor goes by this number.
+    MonitorsMoved {
+        viewed: VirtualMonitorId,
     },
 }
 

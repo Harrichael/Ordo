@@ -192,6 +192,18 @@ impl WorkspaceBackend for EmulatedBackend {
             .map_err(|_| BackendError("no room for another virtual monitor".into()))
     }
 
+    fn move_workspace(&mut self, from: WorkspaceId, to: WorkspaceId) -> Result<()> {
+        self.model
+            .move_workspace(&self.desktop, from, to)
+            .map_err(|_| BackendError(format!("cannot move workspace {} to {}", from.0, to.0)))
+    }
+
+    fn move_monitor(&mut self, from: VirtualMonitorId, to: VirtualMonitorId) -> Result<()> {
+        self.model
+            .move_monitor(&self.desktop, from, to)
+            .map_err(|_| BackendError(format!("cannot move monitor {} to {}", from.0, to.0)))
+    }
+
     fn assign_window_to_monitor(&mut self, window: WindowId, target: VirtualMonitorId) -> Result<()> {
         self.model
             .assign_window_to_monitor(window, target)

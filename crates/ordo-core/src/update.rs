@@ -9,7 +9,7 @@ use crate::event::{
 use crate::ids::{
     MonitorId, OpId, Pid, Rect, VirtualMonitorId, WindowId, WorkspaceId, FRAME_EPSILON,
 };
-use crate::project::{after_merge, project, Projection};
+use crate::project::{after_merge, after_move, project, Projection};
 use crate::reconcile::{self, Delta};
 use crate::state::{Away, FocusIntent, Landing, Mode, PendingOp, State, WindowRecord};
 
@@ -519,6 +519,14 @@ enum Command {
         into: VirtualMonitorId,
     },
     AddMonitor,
+    MoveWorkspace {
+        from: WorkspaceId,
+        to: WorkspaceId,
+    },
+    MoveMonitor {
+        from: VirtualMonitorId,
+        to: VirtualMonitorId,
+    },
 }
 
 fn handle_hotkey(
@@ -671,6 +679,22 @@ fn resolve(s: &State, action: HotkeyAction) -> Option<Command> {
         HotkeyAction::AddMonitor => {
             let v = s.virtual_monitors?;
             (v.count < u8::MAX).then_some(Command::AddMonitor)
+        }
+
+        // Refused while a switch or a view change is on its way: what it
+        // aims at is a number the move would change under it.
+        HotkeyAction::MoveWorkspace { from, to } => {
+            let exists = |w: WorkspaceId| (1..=s.workspace_count).contains(&w.0);
+            (from != to && exists(from) && exists(to) && s.workspace_intent.is_none())
+                .then_some(Command::MoveWorkspace { from, to })
+        }
+
+        HotkeyAction::MoveMonitor { from, to } => {
+            let v = s.virtual_monitors?;
+            let exists = |m: VirtualMonitorId| (1..=v.count).contains(&m.0);
+            let viewing = s.pending.iter().any(|p| matches!(p.expect, Expectation::Viewing(_)));
+            (from != to && exists(from) && exists(to) && !viewing)
+                .then_some(Command::MoveMonitor { from, to })
         }
     }
 }
@@ -1038,6 +1062,59 @@ fn execute(
                 expect: Expectation::MonitorCount { count: v.count + 1 },
                 issued_ns: now_ns,
             });
+            fx.push(Effect::RequestRescan {
+                reason: RescanTrigger::PostEffect { op },
+            });
+            s.focus_intent()
+        }
+
+        // Nothing on screen changes: only the numbers do.
+        Command::MoveWorkspace { from, to } => {
+            let current = s.current_workspace().map_or(from, |c| {
+                WorkspaceId(after_move(c.0, from.0, to.0))
+            });
+            let op = s.mint_op();
+            fx.push(Effect::MoveWorkspace { op, from, to });
+            s.pending.push(PendingOp {
+                op,
+                expect: Expectation::WorkspacesMoved { current },
+                issued_ns: now_ns,
+            });
+            fx.push(Effect::RequestRescan {
+                reason: RescanTrigger::PostEffect { op },
+            });
+            s.focus_intent()
+        }
+
+        Command::MoveMonitor { from, to } => {
+            let v = s.virtual_monitors.expect("resolved against a virtual layer");
+            let moved = |m: VirtualMonitorId| VirtualMonitorId(after_move(m.0, from.0, to.0));
+            let viewed = moved(v.viewed);
+            let op = s.mint_op();
+            fx.push(Effect::MoveMonitor { op, from, to });
+            s.pending.push(PendingOp {
+                op,
+                expect: Expectation::MonitorsMoved { viewed },
+                issued_ns: now_ns,
+            });
+            // What the new order brings into view comes up through app
+            // un-hiding, which scrambles z-order, as a merge's does.
+            if let Some(ws) = s.current_workspace() {
+                let after = project(v.count, viewed, v.enabled, s.monitors.len());
+                let order: Vec<WindowId> = s
+                    .focus_history
+                    .iter()
+                    .filter(|w| {
+                        s.windows.get(w).is_some_and(|r| {
+                            r.workspace == ws && after.is_hosted(moved(r.vmonitor))
+                        })
+                    })
+                    .collect();
+                if order.len() >= 2 {
+                    let focus_top = order.first().copied() == s.declared_focus();
+                    fx.push(restack(s, order, focus_top));
+                }
+            }
             fx.push(Effect::RequestRescan {
                 reason: RescanTrigger::PostEffect { op },
             });
@@ -2135,6 +2212,12 @@ fn expectation_satisfied(e: &Expectation, s: &State) -> bool {
         }
         Expectation::MonitorCount { count } => {
             s.virtual_monitors.is_some_and(|v| v.count == *count)
+        }
+        Expectation::WorkspacesMoved { current } => {
+            !s.monitor_ws.is_empty() && s.monitor_ws.values().all(|w| w == current)
+        }
+        Expectation::MonitorsMoved { viewed } => {
+            s.virtual_monitors.is_some_and(|v| v.viewed == *viewed)
         }
     }
 }

@@ -25,6 +25,7 @@ pub mod emulated_backend;
 pub mod look_gate;
 pub mod mission_control;
 pub mod monitor_map;
+pub mod workspace_list;
 pub mod mouse;
 pub mod native_backend;
 pub mod observer;

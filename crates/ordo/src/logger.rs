@@ -425,6 +425,8 @@ fn effect_kind(e: &Effect) -> &'static str {
         Effect::SetVirtualMonitors { .. } => "set_virtual_monitors",
         Effect::MergeMonitors { .. } => "merge_monitors",
         Effect::AddMonitor { .. } => "add_monitor",
+        Effect::MoveWorkspace { .. } => "move_workspace",
+        Effect::MoveMonitor { .. } => "move_monitor",
         Effect::SetWindowFrame { .. } => "set_window_frame",
         Effect::FocusWindow { .. } => "focus_window",
         Effect::FocusDesktop { .. } => "focus_desktop",
@@ -445,6 +447,8 @@ fn effect_op(e: &Effect) -> Option<OpId> {
         | Effect::SetVirtualMonitors { op, .. }
         | Effect::MergeMonitors { op, .. }
         | Effect::AddMonitor { op }
+        | Effect::MoveWorkspace { op, .. }
+        | Effect::MoveMonitor { op, .. }
         | Effect::SetWindowFrame { op, .. }
         | Effect::FocusWindow { op, .. }
         | Effect::FocusDesktop { op, .. } => Some(*op),

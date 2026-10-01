@@ -11,7 +11,8 @@
 //! reshuffles the rows under the pointer.
 //!
 //! A pick reaches the engine as the same `WorkspaceSwitchTo` that Cmd+Alt+digit
-//! mints: the menu is a second keyboard, not a second decision path.
+//! mints, and a drag as a `MoveWorkspace`: the menu is a second keyboard, not
+//! a second decision path.
 
 use std::cell::{Cell, OnceCell};
 use std::sync::{Arc, Mutex};
@@ -34,11 +35,11 @@ use objc2_foundation::{
     ns_string, MainThreadMarker, NSAttributedString, NSDictionary, NSObject, NSObjectProtocol,
     NSPoint, NSRect, NSSize, NSString,
 };
-use ordo_core::{HotkeyAction, WorkspaceId};
 
 use crate::engine::Msg;
 use crate::menubar::{MenuBarView, MonitorsView};
 use crate::platform::monitor_map::MonitorMap;
+use crate::platform::workspace_list::{Row, WorkspaceList};
 
 /// Image height; the status bar centers it vertically.
 const HEIGHT: f64 = 16.0;
@@ -454,6 +455,7 @@ struct Ivars {
     mailbox: Arc<Mailbox>,
     /// Kept across rebuilds so a view change can slide the frame it drew.
     map: OnceCell<Retained<MonitorMap>>,
+    list: OnceCell<Retained<WorkspaceList>>,
     open: Cell<bool>,
 }
 
@@ -467,19 +469,6 @@ define_class!(
     struct Controller;
 
     impl Controller {
-        // SAFETY: the signature matches the action selector's.
-        #[unsafe(method(selectWorkspace:))]
-        fn select_workspace(&self, sender: &NSMenuItem) {
-            let Ok(n) = u8::try_from(sender.tag()) else {
-                return;
-            };
-            let _ = self
-                .ivars()
-                .mailbox
-                .tx
-                .send(Msg::hotkey(HotkeyAction::WorkspaceSwitchTo(WorkspaceId(n))));
-        }
-
         // SAFETY: the signature matches the action selector's.
         #[unsafe(method(toggleDebug:))]
         fn toggle_debug(&self, _sender: &NSMenuItem) {
@@ -515,6 +504,7 @@ impl Controller {
         let this = Self::alloc(mtm).set_ivars(Ivars {
             mailbox,
             map: OnceCell::new(),
+            list: OnceCell::new(),
             open: Cell::new(false),
         });
         unsafe { msg_send![super(this), init] }
@@ -532,14 +522,30 @@ impl Controller {
         })
     }
 
-    /// A view that changed under an open menu: only the diagram follows it,
-    /// sliding, while the rows stay put under the pointer.
+    fn list(&self) -> &WorkspaceList {
+        self.ivars().list.get_or_init(|| {
+            let tx = self.ivars().mailbox.tx.clone();
+            WorkspaceList::new(
+                self.mtm(),
+                Box::new(move |action| {
+                    let _ = tx.send(Msg::hotkey(action));
+                }),
+            )
+        })
+    }
+
+    /// A view that changed under an open menu: the diagram follows it,
+    /// sliding, and so do the workspace rows, which keep their places (a
+    /// count that changed would need the menu's height to change too).
     fn follow(&self, view: &MenuBarView) {
         if !self.ivars().open.get() {
             return;
         }
         if let (Some(monitors), Some(map)) = (&view.monitors, self.ivars().map.get()) {
             map.show(monitors, view.engaged, true);
+        }
+        if let Some(list) = self.ivars().list.get() {
+            list.show(rows(view), current_row(view), view.engaged, false);
         }
     }
 
@@ -550,53 +556,11 @@ impl Controller {
             ns_string!("Workspaces"),
             mtm,
         ));
-        for entry in &view.workspaces {
-            let n = entry.id.0;
-            let current = view.current == Some(entry.id);
-            // The chord is shown, not bound — the event tap answers it before
-            // any menu could — so the menu doubles as the shortcut's legend.
-            let key = if (1..=9).contains(&n) {
-                n.to_string()
-            } else {
-                String::new()
-            };
-            let item = unsafe {
-                NSMenuItem::initWithTitle_action_keyEquivalent(
-                    NSMenuItem::alloc(mtm),
-                    &NSString::from_str(&apps_title(&entry.apps)),
-                    Some(sel!(selectWorkspace:)),
-                    &NSString::from_str(&key),
-                )
-            };
-            item.setKeyEquivalentModifierMask(
-                NSEventModifierFlags::Command | NSEventModifierFlags::Option,
-            );
-            unsafe { item.setTarget(Some(self)) };
-            item.setTag(n as isize);
-            item.setEnabled(view.engaged);
-            item.setState(if current {
-                NSControlStateValueOn
-            } else {
-                NSControlStateValueOff
-            });
-            // Filled for the current workspace, echoing its pill in the icon.
-            let symbol = format!("{n}.square{}", if current { ".fill" } else { "" });
-            item.setImage(
-                NSImage::imageWithSystemSymbolName_accessibilityDescription(
-                    &NSString::from_str(&symbol),
-                    Some(&NSString::from_str(&format!("Workspace {n}"))),
-                )
-                .as_deref(),
-            );
-            if entry.apps.is_empty() {
-                item.setAttributedTitle(Some(&attributed(
-                    "Empty",
-                    &NSFont::menuFontOfSize(0.0),
-                    &NSColor::secondaryLabelColor(),
-                )));
-            }
-            menu.addItem(&item);
-        }
+        let list = self.list();
+        list.show(rows(view), current_row(view), view.engaged, true);
+        let item = NSMenuItem::new(mtm);
+        item.setView(Some(list));
+        menu.addItem(&item);
         if let Some(monitors) = &view.monitors {
             menu.addItem(&NSMenuItem::separatorItem(mtm));
             fill_monitors(menu, self.map(), monitors, view.engaged, mtm);
@@ -705,6 +669,20 @@ fn app_name(pid: ordo_core::Pid) -> Option<String> {
     NSRunningApplication::runningApplicationWithProcessIdentifier(pid.0)
         .and_then(|a| a.localizedName())
         .map(|n| n.to_string())
+}
+
+fn rows(view: &MenuBarView) -> Vec<Row> {
+    view.workspaces
+        .iter()
+        .map(|e| Row {
+            apps: apps_title(&e.apps),
+        })
+        .collect()
+}
+
+fn current_row(view: &MenuBarView) -> Option<usize> {
+    let current = view.current?;
+    view.workspaces.iter().position(|e| e.id == current)
 }
 
 /// "Safari, Slack, Terminal +2", most recently used first.

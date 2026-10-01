@@ -169,6 +169,20 @@ pub enum HotkeyAction {
     /// every workspace. Nothing on screen changes (see
     /// [`crate::anchor_after_add`]); it is room to move windows into.
     AddMonitor,
+    /// From the menu bar: workspace `from` moves to position `to`, and the
+    /// ones between step over (see [`crate::after_move`]). Nothing on screen
+    /// changes; the workspaces are renumbered, the current one with them.
+    MoveWorkspace {
+        from: WorkspaceId,
+        to: WorkspaceId,
+    },
+    /// From the menu bar: virtual monitor `from` moves to position `to` on
+    /// every workspace, the anchor with it. The displays then show whichever
+    /// monitors the new order puts in view.
+    MoveMonitor {
+        from: VirtualMonitorId,
+        to: VirtualMonitorId,
+    },
 }
 
 /// Why a rescan ran. Purely diagnostic except for `AxHint(WindowCreated)`,

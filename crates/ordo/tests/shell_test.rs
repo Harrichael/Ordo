@@ -16,7 +16,7 @@ use ordo::menubar::{MenuBarView, MonitorEntry, MonitorsView, WorkspaceEntry};
 use ordo::ports::{Effector, LookGate, NullEffector, SnapshotStats, WorldSource};
 use ordo::replay::replay;
 use ordo_core::{
-    after_merge, anchor_after_add, AxHintKind, Effect, Event, FocusIntent, Gesture, HotkeyAction, MonitorId, MonitorSnap, MonitorWs, OpOutcome, Pid,
+    after_merge, after_move, anchor_after_add, AxHintKind, Effect, Event, FocusIntent, Gesture, HotkeyAction, MonitorId, MonitorSnap, MonitorWs, OpOutcome, Pid,
     Rect, RescanTrigger, VirtualMonitorId, VirtualMonitors, VirtualMonitorsWord, WindowId,
     WindowSnap, WorkspaceId, WorkspaceSnap, WorldSnapshot,
 };
@@ -187,6 +187,20 @@ impl Effector for FakeEffector {
             Effect::AddMonitor { .. } => {
                 os.view.viewed = anchor_after_add(os.view.count, os.view.viewed, os.view.enabled, os.displays);
                 os.view.count += 1;
+            }
+            Effect::MoveWorkspace { from, to, .. } => {
+                let moved = |w: WorkspaceId| WorkspaceId(after_move(w.0, from.0, to.0));
+                for w in os.assignments.values_mut() {
+                    *w = moved(*w);
+                }
+                os.active = moved(os.active);
+            }
+            Effect::MoveMonitor { from, to, .. } => {
+                let moved = |m: VirtualMonitorId| VirtualMonitorId(after_move(m.0, from.0, to.0));
+                for m in os.monitors.values_mut() {
+                    *m = moved(*m);
+                }
+                os.view.viewed = moved(os.view.viewed);
             }
             Effect::FocusWindow { window, .. } => match os.policy {
                 FocusPolicy::Lands => os.focused = Some(*window),

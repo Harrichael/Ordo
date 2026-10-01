@@ -667,6 +667,42 @@ impl EmulatedWorkspaces {
         Ok(())
     }
 
+    pub fn move_workspace(
+        &mut self,
+        d: &dyn Desktop,
+        from: WorkspaceId,
+        to: WorkspaceId,
+    ) -> Result<(), WorkspaceOutOfRange> {
+        let plan = self
+            .ledger
+            .move_workspace(from, to)
+            .ok_or(WorkspaceOutOfRange(from))?;
+        let current = self.ledger.current();
+        let boundary = ParkTrace::new(WindowId(0), ParkTraceKind::View)
+            .ws(current, current)
+            .detail(format!("workspace {} moved to {}", from.0, to.0));
+        self.apply_plan(d, plan, boundary);
+        Ok(())
+    }
+
+    pub fn move_monitor(
+        &mut self,
+        d: &dyn Desktop,
+        from: VirtualMonitorId,
+        to: VirtualMonitorId,
+    ) -> Result<(), MonitorOutOfRange> {
+        let plan = self
+            .ledger
+            .move_monitor(from, to)
+            .ok_or(MonitorOutOfRange(from))?;
+        let current = self.ledger.current();
+        let boundary = ParkTrace::new(WindowId(0), ParkTraceKind::View)
+            .ws(current, current)
+            .detail(format!("monitor {} moved to {}", from.0, to.0));
+        self.apply_plan(d, plan, boundary);
+        Ok(())
+    }
+
     pub fn move_window_to_workspace(
         &mut self,
         d: &dyn Desktop,
@@ -3983,6 +4019,41 @@ mod tests {
         assert!(on(SECOND, d.frame(w(3))), "revealed on the right");
         assert!(in_park_corner(&d.frame(w4), &geo()), "workspace 2 stays hidden");
         assert!(b.merge_monitors(&d, vm(2), vm(1)).is_err());
+    }
+
+    /// Dragging hidden monitor 3 between 1 and 2 makes it the second, in
+    /// view on the right display, and the old 2, now third, goes out of
+    /// view. The anchor stays with its monitor.
+    #[test]
+    fn moving_a_monitor_shows_what_the_new_order_puts_in_view() {
+        let (d, mut b) = three_on_two();
+
+        b.move_monitor(&d, vm(3), vm(2)).unwrap();
+
+        let m = b.window_monitors();
+        assert_eq!((m[&w(1)], m[&w(2)], m[&w(3)]), (vm(1), vm(3), vm(2)));
+        assert_eq!(b.monitors().viewed, vm(1));
+        assert!(on(SECOND, d.frame(w(3))), "came into view on the right");
+        assert!(in_park_corner(&d.frame(w(2)), &geo()), "went out of view");
+        assert_eq!(d.frame(w(1)), rect(100.0, 100.0));
+    }
+
+    /// Moving workspace 2 to the front renumbers: the current workspace is
+    /// now 2, and the window that lived on 2 is on 1. Not a window moves.
+    #[test]
+    fn moving_a_workspace_renumbers_and_moves_no_window() {
+        let (d, mut b) = three_on_two();
+        b.move_window_to_workspace(&d, w(4), ws(2)).unwrap();
+        let before: Vec<Rect> = (1..=4).map(|n| d.frame(w(n))).collect();
+
+        b.move_workspace(&d, ws(2), ws(1)).unwrap();
+
+        assert_eq!(b.current(), ws(2));
+        let on_ws = b.window_ws();
+        assert_eq!((on_ws[&w(1)], on_ws[&w(4)]), (ws(2), ws(1)));
+        let after: Vec<Rect> = (1..=4).map(|n| d.frame(w(n))).collect();
+        assert_eq!(after, before);
+        assert!(b.move_workspace(&d, ws(4), ws(1)).is_err());
     }
 
     /// Viewing monitor 3 of three on two displays pins the viewport against

@@ -516,6 +516,8 @@ fn effect_op(e: &Effect) -> Option<OpId> {
         | Effect::SetVirtualMonitors { op, .. }
         | Effect::MergeMonitors { op, .. }
         | Effect::AddMonitor { op }
+        | Effect::MoveWorkspace { op, .. }
+        | Effect::MoveMonitor { op, .. }
         | Effect::SetWindowFrame { op, .. }
         | Effect::FocusWindow { op, .. }
         | Effect::FocusDesktop { op, .. } => Some(*op),

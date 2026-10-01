@@ -127,6 +127,20 @@ pub trait WorkspaceBackend {
         Err(BackendError("this backend has no virtual monitors".into()))
     }
 
+    /// Renumber the workspaces (see `ordo_core::after_move`). Native Spaces
+    /// are macOS's to order.
+    fn move_workspace(&mut self, from: WorkspaceId, to: WorkspaceId) -> Result<()> {
+        let _ = (from, to);
+        Err(BackendError("this backend can't reorder workspaces".into()))
+    }
+
+    /// Renumber the virtual monitors (see `ordo_core::after_move`), and make
+    /// the screen match.
+    fn move_monitor(&mut self, from: VirtualMonitorId, to: VirtualMonitorId) -> Result<()> {
+        let _ = (from, to);
+        Err(BackendError("this backend has no virtual monitors".into()))
+    }
+
     /// Rewrite the window's virtual-monitor declaration WITHOUT touching its
     /// frame — the monitor twin of `assign_window_to_workspace`.
     fn assign_window_to_monitor(&mut self, window: WindowId, target: VirtualMonitorId) -> Result<()> {

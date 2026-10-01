@@ -22,7 +22,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use ordo_core::{
-    after_merge, anchor_after_add, project, Pid, Projection, VirtualMonitorId, VirtualMonitors, WindowId, WorkspaceId,
+    after_merge, after_move, anchor_after_add, project, Pid, Projection, VirtualMonitorId, VirtualMonitors, WindowId, WorkspaceId,
 };
 
 /// What a change requires: hide the windows that left the screen, reveal the
@@ -338,6 +338,45 @@ impl Ledger {
             let m = l.monitors;
             l.monitors.viewed = anchor_after_add(n, m.viewed, m.enabled, l.physical);
             l.monitors.count = count;
+        }))
+    }
+
+    /// Workspace `from` to position `to` (see [`after_move`]), the current
+    /// one renumbered with the rest, so the plan is empty. `None` when either
+    /// is out of range.
+    pub fn move_workspace(&mut self, from: WorkspaceId, to: WorkspaceId) -> Option<SwitchPlan> {
+        let n = self.count;
+        let exists = |w: WorkspaceId| (1..=n).contains(&w.0);
+        if !exists(from) || !exists(to) {
+            return None;
+        }
+        let moved = |w: WorkspaceId| WorkspaceId(after_move(w.0, from.0, to.0));
+        Some(self.retarget(|l| {
+            for c in l.assign.values_mut() {
+                c.ws = moved(c.ws);
+            }
+            l.current = moved(l.current);
+        }))
+    }
+
+    /// Monitor `from` to position `to` on every workspace (see
+    /// [`after_move`]), the anchor following its monitor.
+    pub fn move_monitor(
+        &mut self,
+        from: VirtualMonitorId,
+        to: VirtualMonitorId,
+    ) -> Option<SwitchPlan> {
+        let n = self.monitors.count;
+        let exists = |m: VirtualMonitorId| (1..=n).contains(&m.0);
+        if !exists(from) || !exists(to) {
+            return None;
+        }
+        let moved = |m: VirtualMonitorId| VirtualMonitorId(after_move(m.0, from.0, to.0));
+        Some(self.retarget(|l| {
+            for c in l.assign.values_mut() {
+                c.monitor = moved(c.monitor);
+            }
+            l.monitors.viewed = moved(l.monitors.viewed);
         }))
     }
 

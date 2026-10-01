@@ -97,6 +97,22 @@ pub fn after_merge(m: VirtualMonitorId, from: VirtualMonitorId, into: VirtualMon
     close(if m == from { into } else { m })
 }
 
+/// Where slot `n` stands once the one at `from` is lifted out and put back
+/// in at `to`: the slots between step over to close the gap it left. For
+/// reordering workspaces and monitors, shared by the core and the backend as
+/// `after_merge` is.
+pub fn after_move(n: u8, from: u8, to: u8) -> u8 {
+    if n == from {
+        to
+    } else if from < to && (from + 1..=to).contains(&n) {
+        n - 1
+    } else if to < from && (to..from).contains(&n) {
+        n + 1
+    } else {
+        n
+    }
+}
+
 /// The anchor once a monitor is added after the last: the one that keeps
 /// every display showing what it showed. The viewport starts at the anchor
 /// unless pinned against the end, and a new last monitor unpins it — so a

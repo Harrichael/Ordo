@@ -216,6 +216,83 @@ pub fn match_chord(keycode: u16, m: Mods) -> Option<Chord> {
     }
 }
 
+/// A key and the modifiers held with it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Key {
+    pub code: u16,
+    pub mods: Mods,
+}
+
+impl Key {
+    /// As a menu shows it ("⌥⌘1"); `None` for a key with no plain glyph.
+    pub fn legend(&self) -> Option<String> {
+        let glyph = match self.code {
+            c if code::DIGITS.contains(&c) => {
+                let i = code::DIGITS.iter().position(|d| *d == c)?;
+                char::from_digit(i as u32 + 1, 10)?
+            }
+            code::J => 'J',
+            code::K => 'K',
+            code::V => 'V',
+            code::LEFT => '←',
+            code::RIGHT => '→',
+            code::TAB => '⇥',
+            code::GRAVE => '`',
+            code::END => '↘',
+            _ => return None,
+        };
+        let m = self.mods;
+        let mut s = String::new();
+        for (held, sym) in [(m.ctrl, '⌃'), (m.alt, '⌥'), (m.shift, '⇧'), (m.cmd, '⌘')] {
+            if held {
+                s.push(sym);
+            }
+        }
+        s.push(glyph);
+        Some(s)
+    }
+}
+
+/// The key each action answers to, or `None` for one that is the menu
+/// bar's alone. Total over the actions, so a new one is given a key or
+/// explicitly none; where a config one day binds keys, it overrides this.
+/// [`match_chord`] is its inverse (tested).
+pub fn key_for(action: &HotkeyAction) -> Option<Key> {
+    use HotkeyAction::*;
+    let key = |code: u16, cmd: bool, alt: bool, shift: bool, ctrl: bool| {
+        Some(Key {
+            code,
+            mods: Mods {
+                cmd,
+                alt,
+                shift,
+                ctrl,
+            },
+        })
+    };
+    match *action {
+        WorkspacePrev => key(code::LEFT, true, false, false, false),
+        WorkspaceNext => key(code::RIGHT, true, false, false, false),
+        WorkspaceSwitchTo(ws) => {
+            let c = *code::DIGITS.get(usize::from(ws.0).checked_sub(1)?)?;
+            key(c, true, true, false, false)
+        }
+        MruWorkspace => key(code::TAB, false, true, false, false),
+        MruMonitor => key(code::TAB, false, true, true, false),
+        MruApp => key(code::GRAVE, false, true, false, false),
+        MruOtherMonitor => key(code::TAB, false, true, false, true),
+        MruDemote => key(code::END, false, true, false, false),
+        MoveFocusedToMonitorPrev => key(code::LEFT, true, false, true, false),
+        MoveFocusedToMonitorNext => key(code::RIGHT, true, false, true, false),
+        ViewMonitorPrev => key(code::J, true, true, false, false),
+        ViewMonitorNext => key(code::K, true, true, false, false),
+        ToggleVirtualMonitors => key(code::V, true, true, false, true),
+        CarryFocusedToWorkspacePrev => key(code::LEFT, true, false, false, true),
+        CarryFocusedToWorkspaceNext => key(code::RIGHT, true, false, false, true),
+        MergeMonitors { .. } | AddMonitor | MoveWorkspace { .. } | MoveMonitor { .. } => None,
+    }
+}
+
 /// Cmd, and none of the others — so Cmd+Alt/Ctrl+arrow keeps working.
 fn only_cmd(m: Mods) -> bool {
     m.cmd && !m.alt && !m.shift && !m.ctrl
@@ -482,6 +559,44 @@ mod tests {
         assert_eq!(witness(code::TAB, mods(false, false, false, true)), None);
         assert_eq!(witness(code::TAB, mods(true, true, false, false)), None);
         assert_eq!(witness(code::LEFT, mods(true, false, false, false)), None);
+    }
+
+    /// Every key `key_for` names reaches its action through the tap, and
+    /// the menu bar's own actions have none.
+    #[test]
+    fn every_bound_action_answers_to_its_key() {
+        let mut actions = vec![
+            WorkspacePrev,
+            WorkspaceNext,
+            MruWorkspace,
+            MruMonitor,
+            MruApp,
+            MruOtherMonitor,
+            MruDemote,
+            MoveFocusedToMonitorPrev,
+            MoveFocusedToMonitorNext,
+            ViewMonitorPrev,
+            ViewMonitorNext,
+            ToggleVirtualMonitors,
+            CarryFocusedToWorkspacePrev,
+            CarryFocusedToWorkspaceNext,
+        ];
+        actions.extend((1..=9).map(|n| WorkspaceSwitchTo(WorkspaceId(n))));
+        for a in actions {
+            let k = key_for(&a).unwrap_or_else(|| panic!("{a:?} has no key"));
+            assert_eq!(match_chord(k.code, k.mods), Some(Chord::Hotkey(a)), "{a:?}");
+        }
+        assert_eq!(key_for(&WorkspaceSwitchTo(WorkspaceId(10))), None);
+        let moved = MoveWorkspace {
+            from: WorkspaceId(1),
+            to: WorkspaceId(2),
+        };
+        assert_eq!(key_for(&moved), None);
+        assert_eq!(key_for(&AddMonitor), None);
+        assert_eq!(
+            key_for(&WorkspaceSwitchTo(WorkspaceId(3))).and_then(|k| k.legend()),
+            Some("⌥⌘3".to_string())
+        );
     }
 
     #[test]

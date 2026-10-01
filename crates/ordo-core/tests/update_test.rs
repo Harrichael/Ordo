@@ -4067,6 +4067,122 @@ fn adding_a_monitor_from_the_menu_is_our_own_echo_when_the_backend_reports_it() 
 }
 
 #[test]
+fn moving_a_workspace_from_the_menu_renumbers_them_and_the_echo_is_our_own() {
+    // On workspace 3, the user drags it to the front. Nothing on screen
+    // moves: the backend renumbers, 3 becomes 1 and 1 and 2 step over, and
+    // its word is the echo of our own command, not a switch to follow. While
+    // a switch is on its way the move is refused, since the switch aims at a
+    // number the move would change.
+    let before = vec![
+        win(1, 100, 1, rect(100.0, 100.0)),
+        win(2, 200, 2, rect(2000.0, 100.0)),
+        win(3, 300, 3, rect(600.0, 500.0)),
+    ];
+    let s = update(
+        &State::new(),
+        &observed(vec![mon_a(3), mon_b(3)], before, Some(3), RescanTrigger::Periodic),
+    )
+    .state;
+    let to_front = hotkey(HotkeyAction::MoveWorkspace {
+        from: WorkspaceId(3),
+        to: WorkspaceId(1),
+    });
+
+    let switching = update(&s, &hotkey(HotkeyAction::WorkspacePrev)).state;
+    assert!(update(&switching, &to_front).effects.is_empty());
+
+    let moved = update(&s, &to_front);
+    assert!(moved.effects.iter().any(|e| matches!(
+        e,
+        Effect::MoveWorkspace { from, to, .. } if *from == WorkspaceId(3) && *to == WorkspaceId(1)
+    )));
+    assert_eq!(count_switches(&moved.effects), 0);
+
+    let after = vec![
+        win(1, 100, 2, rect(100.0, 100.0)),
+        win(2, 200, 3, rect(2000.0, 100.0)),
+        win(3, 300, 1, rect(600.0, 500.0)),
+    ];
+    let landed = update(
+        &moved.state,
+        &observed(vec![mon_a(1), mon_b(1)], after, Some(3), RescanTrigger::Periodic),
+    );
+    assert_eq!(landed.state.current_workspace(), Some(WorkspaceId(1)));
+    assert!(landed.state.pending.is_empty(), "{:?}", landed.state.pending);
+    assert!(
+        !landed.notes.iter().any(|n| matches!(n, Note::External { .. })),
+        "{:?}",
+        landed.notes
+    );
+    assert_eq!(count_switches(&landed.effects), 0);
+}
+
+#[test]
+fn moving_a_monitor_from_the_menu_shows_what_the_new_order_puts_in_view() {
+    // Three monitors on two displays, 1 and 2 in view. Dragging monitor 3
+    // between 1 and 2 makes it the second, so it comes into view and the old
+    // 2, now 3, goes out. What comes up is restacked in MRU order, and the
+    // backend's word is our own echo.
+    let view = VirtualMonitors {
+        count: 3,
+        viewed: vm(1),
+        enabled: true,
+    };
+    let s = update(
+        &State::new(),
+        &observed_view(
+            view,
+            vec![mon_a(1), mon_b(1)],
+            vec![
+                win(1, 100, 1, rect(100.0, 100.0)),
+                on_monitor(win(2, 200, 1, rect(2000.0, 100.0)), 2),
+                on_monitor(win(3, 300, 1, rect(2400.0, 300.0)), 3),
+            ],
+            Some(1),
+            RescanTrigger::Periodic,
+        ),
+    )
+    .state;
+    let moved = update(
+        &s,
+        &hotkey(HotkeyAction::MoveMonitor {
+            from: vm(3),
+            to: vm(2),
+        }),
+    );
+    assert!(moved.effects.iter().any(|e| matches!(
+        e,
+        Effect::MoveMonitor { from, to, .. } if *from == vm(3) && *to == vm(2)
+    )));
+    assert!(moved.effects.iter().any(|e| matches!(
+        e,
+        Effect::RestackWindows { order, .. } if order.contains(&wid(3)) && !order.contains(&wid(2))
+    )));
+
+    let landed = update(
+        &moved.state,
+        &observed_view(
+            view,
+            vec![mon_a(1), mon_b(1)],
+            vec![
+                win(1, 100, 1, rect(100.0, 100.0)),
+                on_monitor(win(2, 200, 1, rect(2000.0, 100.0)), 3),
+                on_monitor(win(3, 300, 1, rect(2400.0, 300.0)), 2),
+            ],
+            Some(1),
+            RescanTrigger::Periodic,
+        ),
+    );
+    assert_eq!(landed.state.windows[&wid(3)].vmonitor, vm(2));
+    assert!(landed.state.pending.is_empty(), "{:?}", landed.state.pending);
+    assert!(
+        !landed.notes.iter().any(|n| matches!(n, Note::External { .. })),
+        "{:?}",
+        landed.notes
+    );
+}
+
+#[test]
 fn toggling_virtualization_on_views_the_focused_windows_monitor() {
     let s = undocked(&[1]);
     // Off: everything collapses onto the display; no view change needed.

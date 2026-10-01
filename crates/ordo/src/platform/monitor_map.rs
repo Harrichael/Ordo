@@ -6,11 +6,12 @@
 //! The frame is its own subview, so a view change animates as one thing
 //! moving rather than a redraw.
 //!
-//! While some monitor is spare (more monitors than displays), a tile can be
-//! dragged onto another to merge the two; the drop asks first, in place of
-//! the tiles, because a merge renumbers monitors on every workspace. The plus
-//! after the last tile adds a monitor without asking: it is empty and moves
-//! nothing, so there is nothing to confirm.
+//! A tile dropped between two others moves its monitor there, at once: a
+//! move is undone by moving it back. While some monitor is spare (more
+//! monitors than displays), a tile dropped on the middle of another merges
+//! the two; that drop asks first, in place of the tiles, because a merge
+//! can't be undone. The plus after the last tile adds a monitor without
+//! asking: it is empty and moves nothing, so there is nothing to confirm.
 
 use std::cell::{Cell, OnceCell, RefCell};
 
@@ -26,7 +27,7 @@ use objc2_foundation::{
     MainThreadMarker, NSAttributedString, NSDictionary, NSPoint, NSRect, NSSize, NSString,
 };
 
-use ordo_core::HotkeyAction;
+use ordo_core::{after_move, HotkeyAction, VirtualMonitorId};
 
 use crate::menubar::{MonitorEntry, MonitorsView};
 
@@ -53,6 +54,15 @@ const BUTTON_GAP: f64 = 8.0;
 const BUTTON_R: f64 = 6.0;
 const ADD_W: f64 = 28.0;
 
+/// Where a tile in the hand would go if let go now.
+#[derive(Clone, Copy, PartialEq)]
+enum Placement {
+    /// Onto this tile.
+    Merge(usize),
+    /// Into this gap: 0 before the first tile, n after the last.
+    Insert(usize),
+}
+
 /// A tile in the hand: which one, where the pointer holds it, and where the
 /// pointer is now.
 #[derive(Clone, Copy)]
@@ -68,6 +78,8 @@ pub struct MapIvars {
     frame: OnceCell<Retained<DisplayFrame>>,
     engaged: Cell<bool>,
     mergeable: Cell<bool>,
+    /// Two monitors or more, so there is an order to change.
+    movable: Cell<bool>,
     drag: Cell<Option<Drag>>,
     /// The plus is held down.
     adding: Cell<bool>,
@@ -102,20 +114,24 @@ define_class!(
                 return;
             }
             let drag = self.ivars().drag.get().filter(|d| d.moved);
-            let target = drag.and_then(|d| tile_at(n, d.at).filter(|t| *t != d.from));
+            let mergeable = self.ivars().mergeable.get();
+            let target = drag.and_then(|d| drop_at(n, d.from, d.at, mergeable));
             for (i, m) in view.monitors.iter().enumerate() {
                 let r = tile_rect(i);
                 if drag.is_some_and(|d| d.from == i) {
                     draw_slot(r);
                     continue;
                 }
-                if target == Some(i) {
+                if target == Some(Placement::Merge(i)) {
                     draw_target(r);
                 }
                 draw_tile(r, m.id.0, m.windows, m.display.is_some(), m.id == view.viewed);
             }
             if self.ivars().engaged.get() && drag.is_none() {
                 draw_add(add_rect(n), self.ivars().adding.get());
+            }
+            if let Some(Placement::Insert(g)) = target {
+                draw_insertion(g);
             }
             if let Some(d) = drag {
                 let m = &view.monitors[d.from];
@@ -141,7 +157,7 @@ define_class!(
                 self.redraw();
                 return;
             }
-            if !ivars.mergeable.get() {
+            if !ivars.movable.get() {
                 return;
             }
             if let Some(i) = tile_at(n, p) {
@@ -192,8 +208,10 @@ define_class!(
             let Some(d) = self.ivars().drag.take() else {
                 return;
             };
-            match tile_at(n, p).filter(|t| d.moved && *t != d.from) {
-                Some(into) => self.ask(d.from, into),
+            let target = drop_at(n, d.from, p, self.ivars().mergeable.get()).filter(|_| d.moved);
+            match target {
+                Some(Placement::Merge(into)) => self.ask(d.from, into),
+                Some(Placement::Insert(g)) => self.reorder(d.from, if g > d.from { g - 1 } else { g }),
                 None => self.redraw(),
             }
         }
@@ -242,6 +260,7 @@ impl MonitorMap {
             frame: OnceCell::new(),
             engaged: Cell::new(false),
             mergeable: Cell::new(false),
+            movable: Cell::new(false),
             drag: Cell::new(None),
             adding: Cell::new(false),
             confirm: Cell::new(None),
@@ -279,10 +298,14 @@ impl MonitorMap {
         ivars.engaged.set(engaged);
         let mergeable = engaged && n > view.displays.len().max(1);
         ivars.mergeable.set(mergeable);
-        let tip = match (engaged, mergeable) {
-            (_, true) => Some("Drag a monitor onto another to merge them; + adds a monitor"),
-            (true, false) => Some("+ adds a monitor"),
-            (false, _) => None,
+        ivars.movable.set(engaged && n >= 2);
+        let tip = match (engaged, mergeable, n >= 2) {
+            (false, _, _) => None,
+            (true, true, _) => Some(
+                "Drag a monitor between two others to move it, or onto one to merge them; + adds a monitor",
+            ),
+            (true, false, true) => Some("Drag a monitor between two others to move it; + adds a monitor"),
+            (true, false, false) => Some("+ adds a monitor"),
         };
         self.setToolTip(tip.map(NSString::from_str).as_deref());
         let frame_h = TILE_H + 2.0 * FRAME_PAD;
@@ -349,6 +372,33 @@ impl MonitorMap {
         self.redraw();
     }
 
+    /// Moves the tile's monitor to place `to`, and shows the tiles as the
+    /// move leaves them until the engine's own view arrives: each monitor
+    /// takes its new place's number, and the displays keep their places.
+    fn reorder(&self, from: usize, to: usize) {
+        if from == to {
+            self.redraw();
+            return;
+        }
+        let Some(mut view) = self.ivars().view.borrow().clone() else {
+            return;
+        };
+        let id = |i: usize| VirtualMonitorId(i as u8 + 1);
+        (self.ivars().on_command)(HotkeyAction::MoveMonitor {
+            from: id(from),
+            to: id(to),
+        });
+        let displays: Vec<Option<usize>> = view.monitors.iter().map(|m| m.display).collect();
+        let m = view.monitors.remove(from);
+        view.monitors.insert(to, m);
+        for (i, m) in view.monitors.iter_mut().enumerate() {
+            m.id = id(i);
+            m.display = displays[i];
+        }
+        view.viewed = VirtualMonitorId(after_move(view.viewed.0, id(from).0, id(to).0));
+        self.show(&view, self.ivars().engaged.get(), true);
+    }
+
     /// Back to the tiles, as they were.
     fn answer(&self) {
         self.ivars().confirm.set(None);
@@ -392,6 +442,34 @@ fn contains(r: NSRect, p: NSPoint) -> bool {
 
 fn tile_at(n: usize, p: NSPoint) -> Option<usize> {
     (0..n).find(|i| contains(tile_rect(*i), p))
+}
+
+/// The middle half of a tile merges, while a monitor is spare; anywhere
+/// else, the nearest gap takes the tile. A drop back where it came from is
+/// nothing.
+fn drop_at(n: usize, from: usize, p: NSPoint, mergeable: bool) -> Option<Placement> {
+    if let Some(i) = tile_at(n, p).filter(|i| *i != from && mergeable) {
+        let r = tile_rect(i);
+        let into = (p.x - r.origin.x - TILE_W / 4.0).clamp(0.0, TILE_W / 2.0);
+        if into > 0.0 && into < TILE_W / 2.0 {
+            return Some(Placement::Merge(i));
+        }
+    }
+    let step = TILE_W + TILE_GAP;
+    let g = ((p.x - MARGIN_X - FRAME_PAD + TILE_GAP / 2.0) / step).round();
+    let g = (g.max(0.0) as usize).min(n);
+    (g != from && g != from + 1).then_some(Placement::Insert(g))
+}
+
+/// Where a drop would move the tile: a bar down the gap.
+fn draw_insertion(gap: usize) {
+    let x = tile_rect(gap).origin.x - TILE_GAP / 2.0;
+    let r = NSRect::new(
+        NSPoint::new(x - 1.5, TOP + FRAME_PAD - 2.0),
+        NSSize::new(3.0, TILE_H + 4.0),
+    );
+    NSColor::controlAccentColor().setFill();
+    rounded(r, 1.5).fill();
 }
 
 fn inset(r: NSRect, d: f64) -> NSRect {

@@ -74,6 +74,7 @@ impl Effector for MacEffector {
                 | Effect::ViewMonitor { .. }
                 | Effect::SetVirtualMonitors { .. }
                 | Effect::MergeMonitors { .. }
+                | Effect::MoveMonitor { .. }
         ) {
             self.restack.supersede();
         }
@@ -140,6 +141,12 @@ impl Effector for MacEffector {
             Effect::AddMonitor { .. } => {
                 Some(result_outcome(self.backend.borrow_mut().add_monitor()))
             }
+            Effect::MoveWorkspace { from, to, .. } => Some(result_outcome(
+                self.backend.borrow_mut().move_workspace(*from, *to),
+            )),
+            Effect::MoveMonitor { from, to, .. } => Some(result_outcome(
+                self.backend.borrow_mut().move_monitor(*from, *to),
+            )),
             Effect::WarpMouse { to } => {
                 mouse::warp_to(*to);
                 None
