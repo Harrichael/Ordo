@@ -72,6 +72,10 @@ pub enum ParkTraceKind {
     /// windows as a side effect, and nothing else records the order they
     /// leave behind for the stacking worker to repair.
     Stack,
+    /// A window its app's scan missed, kept because the window server still
+    /// lists it: when that began, whether it turned ghost (kept while its
+    /// app answers for longer than a dropped read lasts), and when it ended.
+    Unread,
 }
 
 /// What holding an app's parked windows through its un-hide cost.

@@ -114,7 +114,22 @@ pub struct MacWorldSource {
     last_windows: HashMap<WindowId, Pid>,
     /// Blind scans are being discarded; said once per episode.
     blind: bool,
+    /// The windows now kept as `unread`: since when, and whether they've
+    /// been called ghosts yet.
+    unread_since: HashMap<WindowId, Unread>,
 }
+
+struct Unread {
+    app: Pid,
+    since: Instant,
+    ghost: bool,
+}
+
+/// A window its app stops listing while the window server still has it, and
+/// while the app answers, may never come back: an app that orders a window
+/// out instead of closing it leaves it in the window server's list for good,
+/// and the core keeps it in the MRU order and on its workspace.
+const GHOST_AFTER: Duration = Duration::from_secs(10);
 
 impl MacWorldSource {
     pub fn new(
@@ -134,6 +149,63 @@ impl MacWorldSource {
             facts: HashMap::new(),
             last_windows: HashMap::new(),
             blind: false,
+            unread_since: HashMap::new(),
+        }
+    }
+}
+
+impl MacWorldSource {
+    /// One `Unread` row when a window starts being kept unread, one if it
+    /// turns ghost, and one when it is seen again or gone.
+    fn note_unread(&mut self, unread: &[WindowId], scan: &ax::AxScan) {
+        let now = Instant::now();
+        let row = |w: WindowId, app: Pid, detail: String| {
+            let mut t = ParkTrace::new(w, ParkTraceKind::Unread).detail(detail);
+            t.pid = Some(app);
+            t
+        };
+        let ended: Vec<WindowId> = self
+            .unread_since
+            .keys()
+            .filter(|w| !unread.contains(w))
+            .copied()
+            .collect();
+        for w in ended {
+            let Some(u) = self.unread_since.remove(&w) else {
+                continue;
+            };
+            let fate = if scan.windows.iter().any(|s| s.id == w) {
+                "seen again"
+            } else {
+                "gone"
+            };
+            let ms = now.duration_since(u.since).as_millis();
+            self.trace.push(row(w, u.app, format!("{fate} after {ms} ms")));
+        }
+        for w in unread {
+            let Some(app) = self.last_windows.get(w).copied() else {
+                continue;
+            };
+            let answered = !scan.walk.unanswered.contains(&app);
+            let u = self.unread_since.entry(*w).or_insert_with(|| {
+                let said = if answered { "app answered" } else { "app didn't answer" };
+                self.trace.push(row(*w, app, format!("missed, {said}")));
+                Unread {
+                    app,
+                    since: now,
+                    ghost: false,
+                }
+            });
+            if !u.ghost && answered && now.duration_since(u.since) >= GHOST_AFTER {
+                u.ghost = true;
+                eprintln!(
+                    "ordo: window {} of app {} is unlisted by its app for {} s but still in the window server's list; kept as a ghost",
+                    w.0,
+                    app.0,
+                    GHOST_AFTER.as_secs()
+                );
+                self.trace.push(row(*w, app, "ghost".into()));
+            }
         }
     }
 }
@@ -202,6 +274,7 @@ impl WorldSource for MacWorldSource {
             .chain(unread.iter().filter_map(|w| self.last_windows.get(w).map(|p| (*w, *p))))
             .collect();
         self.last_windows = last_windows;
+        self.note_unread(&unread, &scan);
         let frames: HashMap<WindowId, (Pid, Rect)> = scan
             .windows
             .iter()

@@ -1596,14 +1596,20 @@ fn hand_on_from_close(pre: &State, s: &State, deltas: &[Delta]) -> Option<HandOn
 /// missed the closed window (the Dock, the desktop, another window; the click
 /// that closed it hit it), or a key press that brought up another app (a
 /// launcher). A key press within the closed window's app is Cmd+W, and a
-/// menu's click may be its Close item.
+/// menu's click may be its Close item. A key press that leaves the closed
+/// window's app with no windows is Cmd+Q, after which macOS keys whichever
+/// app it likes, often on the other monitor: that other app is the quit's
+/// fallout, not a launcher's pick.
 fn went_elsewhere(pre: &State, s: &State, closed: &WindowRecord) -> bool {
     let Landing { away, into } = &pre.unseen_landing;
     let root = pre.root_of(closed.id);
     match away.as_ref().map(|a| a.by) {
         Some(Input::Switcher) => true,
         Some(Input::Click) => into.as_ref().is_none_or(|(roots, _)| !roots.contains(&root)),
-        Some(Input::Key) => key_app(s).is_some_and(|app| app != closed.app),
+        Some(Input::Key) => {
+            let quit = !s.windows.values().any(|r| r.app == closed.app);
+            !quit && key_app(s).is_some_and(|app| app != closed.app)
+        }
         Some(Input::MenuBar) | None => false,
     }
 }

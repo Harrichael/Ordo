@@ -1924,6 +1924,29 @@ fn a_dock_click_or_a_launcher_after_cmd_w_is_where_the_user_went() {
 }
 
 #[test]
+fn quitting_the_focused_app_hands_focus_on_within_its_monitor() {
+    // Cmd+Q in app 100 (w4 key, right monitor) takes all its windows, and
+    // macOS keys an app of its own choosing (w5's). That looks like a
+    // launcher's pick after a key press, but nothing was launched: the app
+    // the key was typed into is gone. Focus goes to the right monitor's next
+    // window in the MRU order, as for Cmd+W.
+    let wins = closing_world();
+    let s = booted_with(&wins, &[5, 2, 1, 4]);
+    let typed = update(&s, &gesture(Gesture::Key)).state;
+    let step = update(
+        &typed,
+        &observed(
+            vec![mon_a(1), mon_b(1)],
+            without(&wins, &[1, 3, 4]),
+            Some(5),
+            RescanTrigger::Periodic,
+        ),
+    );
+    assert_eq!(focus_targets(&step.effects), vec![wid(2)]);
+    assert_eq!(step.state.focus_intent(), FocusIntent::Window(wid(2)));
+}
+
+#[test]
 fn closing_an_attached_window_leaves_focus_to_its_root() {
     // w6 hangs off w4 (an omnibox popup, a find bar). When it is dismissed
     // the app keys w4 again by itself, so there is nothing to hand on.
