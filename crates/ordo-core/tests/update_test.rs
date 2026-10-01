@@ -1044,17 +1044,6 @@ fn a_window_moved_by_its_app_gets_its_stack_checked_once_it_settles() {
             ),
         )
     };
-    let restacks = |fx: &[Effect]| {
-        fx.iter()
-            .filter_map(|e| match e {
-                Effect::RestackWindows {
-                    order, focus_top, ..
-                } => Some((order.clone(), *focus_top)),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-    };
-
     let moving = see(&booted(&[2, 3, 1]), at(400.0, 300.0));
     let still_moving = see(&moving.state, at(200.0, 150.0));
     let settled = see(&still_moving.state, at(200.0, 150.0));
@@ -1119,6 +1108,159 @@ fn an_attached_popup_travels_with_its_root_window() {
         restacks(&settled.effects),
         vec![(vec![wid(1), wid(3), wid(2)], vec![(wid(4), wid(1))])]
     );
+}
+
+fn restacks(effects: &[Effect]) -> Vec<(Vec<WindowId>, bool)> {
+    effects
+        .iter()
+        .filter_map(|e| match e {
+            Effect::RestackWindows {
+                order, focus_top, ..
+            } => Some((order.clone(), *focus_top)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// w1 alone on workspace 1, w3 and w2 on workspace 2; history [1, 3, 2].
+fn split_workspaces() -> (State, Vec<Win>) {
+    let mut wins = std_windows();
+    wins[1].workspace = ws(2);
+    wins[2].workspace = ws(2);
+    let s = update(
+        &booted(&[2, 3, 1]),
+        &observed(
+            vec![mon_a(1), mon_b(1)],
+            wins.clone(),
+            Some(1),
+            RescanTrigger::Periodic,
+        ),
+    )
+    .state;
+    (s, wins)
+}
+
+/// A world first seen with w1 key: every window is new, and w1, born
+/// focused, is declared.
+fn born(view: VirtualMonitors, monitors: Vec<Mon>, windows: Vec<Win>) -> State {
+    update(
+        &State::new(),
+        &observed_view(view, monitors, windows, Some(1), RescanTrigger::Periodic),
+    )
+    .state
+}
+
+/// Commands only declare; the stack follows from what they declared. Each
+/// command that changes what is on screen, or who is on top, ends in one
+/// restack: the declared focus on top and, behind it, what the declared
+/// workspace and monitors show, by MRU. It comes after the switches, views
+/// and grants it orders, since the shell waits for those to land.
+#[test]
+fn every_command_leaves_its_focus_on_top_of_the_visible_mru_order() {
+    let (split, _) = split_workspaces();
+    let together = booted(&[2, 3, 1]); // history [1, 3, 2], all on ws 1
+    // w1 born focused, so declared; w2 hidden on monitor 2 until the toggle.
+    let laptop_declared = born(laptop(1, true), vec![mon_a(1)], undocked_windows());
+    let laptop = undocked(&[3, 2, 1]); // history [1, 2, 3]; w2 hidden on monitor 2
+    // Three monitors on two displays; w2 on hidden monitor 3 until the merge.
+    let three = born(
+        VirtualMonitors {
+            count: 3,
+            viewed: vm(1),
+            enabled: true,
+        },
+        vec![mon_a(1), mon_b(1)],
+        vec![
+            win(1, 100, 1, rect(100.0, 100.0)),
+            on_monitor(win(2, 200, 1, rect(2000.0, 100.0)), 3),
+            win(3, 100, 1, rect(2400.0, 500.0)),
+        ],
+    );
+    let merge = HotkeyAction::MergeMonitors {
+        from: vm(3),
+        into: vm(1),
+    };
+    let cases = [
+        ("switch", &split, HotkeyAction::WorkspaceNext, vec![3, 2]),
+        ("carry", &split, HotkeyAction::CarryFocusedToWorkspaceNext, vec![1, 3, 2]),
+        ("alt-tab", &together, HotkeyAction::MruWorkspace, vec![3, 1, 2]),
+        ("demote", &together, HotkeyAction::MruDemote, vec![3, 2, 1]),
+        ("view", &laptop, HotkeyAction::ViewMonitorNext, vec![2]),
+        ("move to monitor", &laptop, HotkeyAction::MoveFocusedToMonitorNext, vec![1, 2]),
+        ("toggle off", &laptop_declared, HotkeyAction::ToggleVirtualMonitors, vec![1, 2, 3]),
+        ("merge", &three, merge, vec![1, 2, 3]),
+    ];
+    for (name, s, action, expected) in cases {
+        let step = update(s, &hotkey(action));
+        let expected: Vec<WindowId> = expected.into_iter().map(wid).collect();
+        assert_eq!(step.state.focus_intent(), FocusIntent::Window(expected[0]), "{name}");
+        assert_eq!(restacks(&step.effects), vec![(expected, true)], "{name}");
+        let restack_at = step
+            .effects
+            .iter()
+            .position(|e| matches!(e, Effect::RestackWindows { .. }))
+            .unwrap();
+        let ordered = step.effects.iter().rposition(|e| {
+            matches!(
+                e,
+                Effect::SwitchWorkspace { .. }
+                    | Effect::ViewMonitor { .. }
+                    | Effect::FocusWindow { .. }
+            )
+        });
+        assert!(ordered.is_none_or(|i| i < restack_at), "{name}: {:?}", step.effects);
+    }
+}
+
+/// Every restack supersedes the one in flight. So a look that only sees the
+/// world — before a command, while a switch lands, after it has — never
+/// sends one, or it would cut the switch's restack short.
+#[test]
+fn a_look_that_changes_no_intent_emits_no_restack() {
+    let (s, wins) = split_workspaces();
+    let quiet = update(
+        &s,
+        &observed(vec![mon_a(1), mon_b(1)], wins.clone(), Some(1), RescanTrigger::Periodic),
+    );
+    assert_eq!(restacks(&quiet.effects), vec![]);
+
+    let switched = update(&s, &hotkey(HotkeyAction::WorkspaceNext));
+    assert_eq!(restacks(&switched.effects).len(), 1);
+    let mut s = switched.state;
+    for focused in [1, 3, 3] {
+        let step = update(
+            &s,
+            &observed(vec![mon_a(2), mon_b(2)], wins.clone(), Some(focused), RescanTrigger::Periodic),
+        );
+        assert_eq!(restacks(&step.effects), vec![], "focus on w{focused}");
+        s = step.state;
+    }
+}
+
+/// An app moving a window while a switch is landing must not restack over
+/// the switch's own restack, which would lose its focus take-back. The
+/// settled move is checked once the switch's grant has landed, against the
+/// stack the switch declared.
+#[test]
+fn a_settled_outside_move_waits_for_the_switch_in_flight() {
+    let (s, mut wins) = split_workspaces();
+    let switched = update(&s, &hotkey(HotkeyAction::WorkspaceNext)).state;
+    let look = |s: &State, wins: &[Win], focused| {
+        update(
+            s,
+            &observed(vec![mon_a(2), mon_b(2)], wins.to_vec(), Some(focused), RescanTrigger::Periodic),
+        )
+    };
+
+    // The grant to w3 is still on its way while w2's app re-places it.
+    wins[1].snap.frame = rect(2200.0, 300.0);
+    let moving = look(&switched, &wins, 1);
+    let settled = look(&moving.state, &wins, 1);
+    let landed = look(&settled.state, &wins, 3);
+
+    assert_eq!(restacks(&moving.effects), vec![]);
+    assert_eq!(restacks(&settled.effects), vec![]);
+    assert_eq!(restacks(&landed.effects), vec![(vec![wid(3), wid(2)], true)]);
 }
 
 /// An app's AX read fails now and then, and one scan misses a window that is
@@ -1716,8 +1858,9 @@ fn closing_the_focused_window_hands_focus_to_its_monitors_next_window() {
     // monitor, the look shows it gone and nothing key, and 2.7 s later
     // macOS fronts Chrome's window on the LEFT monitor. The user was working
     // on the right. Focus goes to the right monitor's next window in the MRU
-    // order (w2), not the next one overall (w1, on the left), and the right
-    // monitor is restacked under it; the left one is left alone.
+    // order (w2), not the next one overall (w1, on the left), and it heads
+    // the workspace's restack. The left display's order is unchanged, which
+    // the stacking worker sees and leaves alone.
     let wins = closing_world();
     let s = booted_with(&wins, &[5, 2, 1, 4]); // history [4, 1, 2, 5, 3]
     let s = click_on(&s, &wins, 4);
@@ -1733,7 +1876,8 @@ fn closing_the_focused_window_hands_focus_to_its_monitors_next_window() {
     assert_eq!(focus_targets(&step.effects), vec![wid(2)]);
     assert!(step.effects.iter().any(|e| matches!(
         e,
-        Effect::RestackWindows { order, focus_top: true, .. } if *order == vec![wid(2), wid(5)]
+        Effect::RestackWindows { order, focus_top: true, .. }
+            if *order == vec![wid(2), wid(1), wid(5), wid(3)]
     )));
     assert_eq!(step.state.focus_intent(), FocusIntent::Window(wid(2)));
     assert!(step.notes.contains(&Note::FocusHandedOn {
@@ -3827,11 +3971,12 @@ fn mru_chords_reach_hidden_monitors_and_view_them_first() {
     assert_eq!(focus_targets(&step.effects), vec![wid(2)]);
     assert_eq!(view_targets(&step.effects), vec![vm(2)]);
     // Nothing hidden is ever restacked: on one display the revealed set is w2
-    // alone, so there is no order to impose.
-    assert!(!step
-        .effects
-        .iter()
-        .any(|e| matches!(e, Effect::RestackWindows { .. })));
+    // alone, handed over all the same so the stacking worker can take focus
+    // back from whatever the view's un-hides key.
+    assert!(step.effects.iter().any(|e| matches!(
+        e,
+        Effect::RestackWindows { order, focus_top: true, .. } if *order == vec![wid(2)]
+    )));
 
     // Ctrl+Alt+Tab: the OTHER monitor is the hidden one.
     let other = update(&s, &hotkey(HotkeyAction::MruOtherMonitor));
@@ -4154,10 +4299,7 @@ fn moving_a_monitor_from_the_menu_shows_what_the_new_order_puts_in_view() {
         e,
         Effect::MoveMonitor { from, to, .. } if *from == vm(3) && *to == vm(2)
     )));
-    assert!(moved.effects.iter().any(|e| matches!(
-        e,
-        Effect::RestackWindows { order, .. } if order.contains(&wid(3)) && !order.contains(&wid(2))
-    )));
+    assert_eq!(restacks(&moved.effects), vec![(vec![wid(1), wid(3)], true)]);
 
     let landed = update(
         &moved.state,

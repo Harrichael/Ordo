@@ -167,16 +167,27 @@ pub enum Expectation {
     },
     Viewing(VirtualMonitorId),
     VirtualMonitorsEnabled(bool),
-    /// A merge or an add landed: this many monitors now.
+    /// An add landed: this many monitors now.
     MonitorCount {
+        count: u8,
+    },
+    /// A merge landed: this many monitors now. The fold itself is kept so
+    /// that what it puts on screen can be read before the backend's word
+    /// carries it back (`State::declared_projection`).
+    MonitorsMerged {
+        from: VirtualMonitorId,
+        into: VirtualMonitorId,
         count: u8,
     },
     /// A workspace move landed: the current workspace goes by this number.
     WorkspacesMoved {
         current: WorkspaceId,
     },
-    /// A monitor move landed: the anchor goes by this number.
+    /// A monitor move landed: the anchor goes by this number. The move is
+    /// kept, as a merge's fold is.
     MonitorsMoved {
+        from: VirtualMonitorId,
+        to: VirtualMonitorId,
         viewed: VirtualMonitorId,
     },
 }

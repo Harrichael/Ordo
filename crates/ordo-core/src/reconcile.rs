@@ -376,7 +376,9 @@ pub(crate) fn explains(e: &Expectation, d: &Delta) -> bool {
         // A merge renumbers monitors wholesale, the anchor with them; an add
         // may move the anchor within the viewport.
         (
-            Expectation::MonitorCount { .. } | Expectation::MonitorsMoved { .. },
+            Expectation::MonitorCount { .. }
+            | Expectation::MonitorsMerged { .. }
+            | Expectation::MonitorsMoved { .. },
             Delta::WindowMonitorAssigned { .. } | Delta::ViewedMonitorChanged { .. },
         ) => true,
         // A move renumbers workspaces wholesale, the current one with them.

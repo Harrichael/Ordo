@@ -6,7 +6,7 @@ use crate::effect::Expectation;
 use crate::event::Input;
 use crate::ids::{MonitorId, OpId, Pid, Point, Rect, VirtualMonitorId, WindowId, WorkspaceId};
 use crate::mru::FocusHistory;
-use crate::project::{project, Projection};
+use crate::project::{after_merge, after_move, project, Projection};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Mode {
@@ -386,6 +386,49 @@ impl State {
                 _ => None,
             })
             .or_else(|| self.windows.get(&window).map(|r| r.workspace))
+    }
+
+    /// The virtual monitor a window is going to, once Ordo's word on it
+    /// lands: its unconfirmed assignment, else the one the backend gave it,
+    /// renumbered by any merge or monitor move issued since. The monitor
+    /// twin of `declared_workspace_of`, read from `pending` for its reason.
+    pub fn declared_vmonitor_of(&self, window: WindowId) -> Option<VirtualMonitorId> {
+        let mut m = self.windows.get(&window)?.vmonitor;
+        for p in &self.pending {
+            match p.expect {
+                Expectation::WindowOnMonitor { window: w, monitor } if w == window => m = monitor,
+                Expectation::MonitorsMerged { from, into, .. } => m = after_merge(m, from, into),
+                Expectation::MonitorsMoved { from, to, .. } => {
+                    m = VirtualMonitorId(after_move(m.0, from.0, to.0))
+                }
+                _ => {}
+            }
+        }
+        Some(m)
+    }
+
+    /// The projection once Ordo's word on the layout lands: the views, the
+    /// virtualization switch, the merges and the monitor moves still
+    /// pending, applied in the order they were issued. Read with
+    /// `declared_vmonitor_of`, whose numbering it shares. An add is left
+    /// out: it changes nothing on screen (see `anchor_after_add`).
+    pub fn declared_projection(&self) -> Projection {
+        let Some(mut v) = self.virtual_monitors else {
+            return self.projection();
+        };
+        for p in &self.pending {
+            match p.expect {
+                Expectation::Viewing(t) => v.viewed = t,
+                Expectation::VirtualMonitorsEnabled(e) => v.enabled = e,
+                Expectation::MonitorsMerged { from, into, count } => {
+                    v.viewed = after_merge(v.viewed, from, into);
+                    v.count = count;
+                }
+                Expectation::MonitorsMoved { viewed, .. } => v.viewed = viewed,
+                _ => {}
+            }
+        }
+        project(v.count, v.viewed, v.enabled, self.monitors.len())
     }
 
     /// The monitor the user is "at": the focused window's monitor, falling

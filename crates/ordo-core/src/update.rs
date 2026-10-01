@@ -9,7 +9,7 @@ use crate::event::{
 use crate::ids::{
     MonitorId, OpId, Pid, Rect, VirtualMonitorId, WindowId, WorkspaceId, FRAME_EPSILON,
 };
-use crate::project::{after_merge, after_move, project, Projection};
+use crate::project::{after_move, Projection};
 use crate::reconcile::{self, Delta};
 use crate::state::{Away, FocusIntent, Landing, Mode, PendingOp, State, WindowRecord};
 
@@ -205,19 +205,12 @@ pub fn update(state: &State, event: &Event) -> Step {
     }
 }
 
-/// The workspace's visual stacking, front-to-back, as the MRU history implies
-/// it — restricted to the windows the projection puts on screen, since a
-/// raise is a focus and a parked window must not be handed either. Emitted
-/// alongside anything that reveals a workspace: parking and app-hiding
-/// scramble real z-order, and MRU is the single source of truth for what "on
-/// top" means here.
+/// The windows of `ws` the projection in force puts on screen, most recently
+/// used first: where a command looks for the window to hand focus to. It
+/// reads belief, not declarations, on purpose: a window handed focus must be
+/// on screen now. `desired_stack` reads declarations.
 fn mru_stack(s: &State, ws: WorkspaceId) -> Vec<WindowId> {
-    visible_stack(s, ws, &s.projection())
-}
-
-/// `mru_stack` under a projection that is not (yet) the one in force — what a
-/// view change is about to show.
-fn visible_stack(s: &State, ws: WorkspaceId, proj: &Projection) -> Vec<WindowId> {
+    let proj = s.projection();
     s.focus_history
         .iter()
         .filter(|w| {
@@ -226,6 +219,62 @@ fn visible_stack(s: &State, ws: WorkspaceId, proj: &Projection) -> Vec<WindowId>
                 .is_some_and(|r| r.workspace == ws && proj.is_hosted(r.vmonitor))
         })
         .collect()
+}
+
+/// The stacking the declarations call for, front to back: the windows the
+/// declared workspace and layout put on screen, in MRU order — and since
+/// declaring a window's focus puts it at the head of that order, the declared
+/// focus heads it. Read from declarations alone, so a command never builds a
+/// stack of its own: it declares, and this says what the screen should show.
+/// A window whose move or assignment is still pending stands where it is
+/// going (run 51: a carry's restack, headed by a resident sibling, made
+/// AppKit key that sibling instead of the carried window).
+fn desired_stack(s: &State) -> Vec<WindowId> {
+    let Some(here) = s.declared_workspace() else {
+        return Vec::new();
+    };
+    let proj = s.declared_projection();
+    s.focus_history
+        .iter()
+        .filter(|w| {
+            s.declared_workspace_of(*w) == Some(here)
+                && s.declared_vmonitor_of(*w).is_some_and(|m| proj.is_hosted(m))
+        })
+        .collect()
+}
+
+/// The effects that reveal windows. Each scrambles the real stack (parking
+/// and app-hiding leave it in whatever order the un-hides land) without
+/// changing the desired one.
+fn reveals(e: &Effect) -> bool {
+    matches!(
+        e,
+        Effect::SwitchWorkspace { .. }
+            | Effect::ViewMonitor { .. }
+            | Effect::SetVirtualMonitors { .. }
+            | Effect::MergeMonitors { .. }
+            | Effect::MoveMonitor { .. }
+    )
+}
+
+/// Push the desired stack if it differs from the one the step began under, or
+/// if something was revealed. Emitted last, because the shell takes the
+/// landing it waits on when the restack is submitted; never for nothing,
+/// because each one supersedes the restack in flight.
+///
+/// A lone window is sent only after a reveal: there is nothing to order it
+/// against, but an un-hide in the same step may have stolen focus, and the
+/// stacking worker takes it back.
+fn restack_to_intent(s: &State, before: &[WindowId], revealed: bool, fx: &mut Vec<Effect>) {
+    let order = desired_stack(s);
+    let changed = order.len() >= 2 && order != before;
+    if !(changed || (revealed && !order.is_empty())) {
+        return;
+    }
+    // Under a desktop declaration, or with the slot the OS's, the top is
+    // only the most recent window, and focus is not the worker's to take.
+    let focus_top = s.focus_intent() == FocusIntent::Window(order[0]);
+    fx.push(restack(s, order, focus_top));
 }
 
 /// The one way a restack is asked for: with each root in `order`, the visible
@@ -489,7 +538,9 @@ fn handle_gesture(s: &mut State, gesture: Gesture, now_ns: u64, notes: &mut Vec<
 /// command arm must produce the focus declaration it leaves behind, and a new
 /// hotkey cannot be added without deciding it — the match on `HotkeyAction`
 /// in `resolve` and the match on `Command` in `execute` are both exhaustive,
-/// and `execute` returns a bare `FocusIntent`, not an `Option`.
+/// and `execute` returns a `FocusIntent`, never an `Option` of one. What the
+/// screen stacks is no arm's business: it follows from the declarations,
+/// once they are all made (`restack_to_intent`).
 enum Command {
     Switch {
         target: WorkspaceId,
@@ -502,7 +553,6 @@ enum Command {
         target: WindowId,
     },
     Demote {
-        workspace: WorkspaceId,
         from: WindowId,
         to: WindowId,
     },
@@ -541,8 +591,14 @@ fn handle_hotkey(
     let Some(cmd) = resolve(s, action) else {
         return;
     };
-    let focus = execute(s, cmd, now_ns, fx, notes);
+    let before = desired_stack(s);
+    let (focus, op) = execute(s, cmd, now_ns, fx, notes);
     s.declare_focus(focus);
+    let revealed = fx.iter().any(reveals);
+    restack_to_intent(s, &before, revealed, fx);
+    fx.push(Effect::RequestRescan {
+        reason: RescanTrigger::PostEffect { op },
+    });
 }
 
 fn resolve(s: &State, action: HotkeyAction) -> Option<Command> {
@@ -630,11 +686,7 @@ fn resolve(s: &State, action: HotkeyAction) -> Option<Command> {
             let to = s.focus_history.most_recent(Some(from), |w| {
                 s.windows.get(&w).is_some_and(|r| r.workspace == workspace)
             })?;
-            Some(Command::Demote {
-                workspace,
-                from,
-                to,
-            })
+            Some(Command::Demote { from, to })
         }
 
         HotkeyAction::MoveFocusedToMonitorPrev | HotkeyAction::MoveFocusedToMonitorNext => {
@@ -700,14 +752,15 @@ fn resolve(s: &State, action: HotkeyAction) -> Option<Command> {
 }
 
 /// Carry out a resolved command and return the focus declaration it leaves
-/// behind. Total over `Command` by construction — see the type's doc.
+/// behind, with the op whose landing the look after it is for. Total over
+/// `Command` by construction — see the type's doc.
 fn execute(
     s: &mut State,
     cmd: Command,
     now_ns: u64,
     fx: &mut Vec<Effect>,
     notes: &mut Vec<Note>,
-) -> FocusIntent {
+) -> (FocusIntent, OpId) {
     match cmd {
         Command::Switch { target } => {
             // Hand focus to the destination's MRU window, emitted AFTER the
@@ -718,21 +771,15 @@ fn execute(
             // core's frame belief for that window is its parked sliver
             // position, so a warp would aim at the corner.
             //
-            // The focus target IS the head of the restack order — one list
-            // feeds both. The restack's physics require its designated top to
-            // be the key window, and this must hold even when the focused
-            // window never left (a round trip through an empty workspace):
-            // alt-tab's skip-the-focused selection here handed focus to the
-            // SECOND MRU window on each return while the restack still named
-            // the first, which made the ordering unsatisfiable and flipped
-            // the top window every round trip.
+            // The focus target must be the destination's MRU head, even when
+            // it never left: the restack puts that head on top, and the top of
+            // a restack must be the key window.
             //
             // Monitor selection is global, so a switch never moves the view —
             // not even onto a destination whose windows all sit on hidden
             // monitors. The user chose the monitor they are on; that
             // destination is empty here, and is treated as any empty one.
-            let stack = mru_stack(s, target);
-            let head = stack.first().copied();
+            let head = mru_stack(s, target).first().copied();
             // An empty workspace (here) is still a place to be: the desktop
             // takes focus, as on an empty monitor — the anchor's display, the one
             // a desktop declaration holds and new windows are corralled onto.
@@ -759,19 +806,12 @@ fn execute(
             if let Some(display) = desktop {
                 push_desktop(s, display, now_ns, fx, notes);
             }
-            // Even a lone window goes to the stacking worker: it owns the top,
-            // and takes focus back if an un-hide in this switch stole it.
-            if !stack.is_empty() {
-                fx.push(restack(s, stack, true));
-            }
-            fx.push(Effect::RequestRescan {
-                reason: RescanTrigger::PostEffect { op },
-            });
-            match (head, desktop) {
+            let focus = match (head, desktop) {
                 (Some(fw), _) => FocusIntent::Window(fw),
                 (None, Some(_)) => FocusIntent::Desktop,
                 (None, None) => FocusIntent::Deferred,
-            }
+            };
+            (focus, op)
         }
 
         Command::Carry { window, target } => {
@@ -797,25 +837,12 @@ fn execute(
                 notes,
             );
             let switch_op = push_switch(s, target, now_ns, fx, notes);
-            // The carried window rides on top. Its assignment is only pending,
-            // so the destination's MRU stack does not contain it yet — and a
-            // restack headed by a resident sibling makes AppKit key THAT
-            // window instead (run 51: every carry's restack omitted the
-            // carried window, and the next chord found focus on a sibling).
-            let mut order = vec![window];
-            order.extend(mru_stack(s, target).into_iter().filter(|w| *w != window));
-            if order.len() >= 2 {
-                fx.push(restack(s, order, true));
-            }
-            fx.push(Effect::RequestRescan {
-                reason: RescanTrigger::PostEffect { op: switch_op },
-            });
-            FocusIntent::Window(window)
+            (FocusIntent::Window(window), switch_op)
         }
 
         Command::Focus { target } => {
             // A target on a hidden monitor gets its monitor viewed just before
-            // the grant, and the newly visible set restacked with it on top.
+            // the grant.
             let (view, proj) = view_for(s, target);
             let center = s.projected_frame_in(&s.windows[&target], &proj).center();
             if let Some(vm) = view {
@@ -828,26 +855,10 @@ fn execute(
             // Ordo-initiated switches only; warping on external focus changes
             // (the user clicking a window!) would fight the pointer.
             fx.push(Effect::WarpMouse { to: center });
-            if view.is_some() {
-                if let Some(ws) = s.current_workspace() {
-                    let mut order = vec![target];
-                    order.extend(visible_stack(s, ws, &proj).into_iter().filter(|w| *w != target));
-                    if order.len() >= 2 {
-                        fx.push(restack(s, order, true));
-                    }
-                }
-            }
-            fx.push(Effect::RequestRescan {
-                reason: RescanTrigger::PostEffect { op },
-            });
-            FocusIntent::Window(target)
+            (FocusIntent::Window(target), op)
         }
 
-        Command::Demote {
-            workspace,
-            from,
-            to,
-        } => {
+        Command::Demote { from, to } => {
             let root = s.root_of(from);
             s.focus_history.demote(root);
             let (view, proj) = view_for(s, to);
@@ -857,19 +868,7 @@ fn execute(
             }
             let op = push_focus(s, to, true, now_ns, fx, notes);
             fx.push(Effect::WarpMouse { to: center });
-            // Bury it visually too, AFTER the focus: restacking raises
-            // everything above the demoted window, and raises land below the
-            // key window — so the new focus must already be key. The history
-            // was demoted above, so the MRU order now ends with `from`.
-            let order = visible_stack(s, workspace, &proj);
-            if order.len() >= 2 {
-                let focus_top = order.first() == Some(&to);
-                fx.push(restack(s, order, focus_top));
-            }
-            fx.push(Effect::RequestRescan {
-                reason: RescanTrigger::PostEffect { op },
-            });
-            FocusIntent::Window(to)
+            (FocusIntent::Window(to), op)
         }
 
         Command::MoveToMonitor { window, target } => {
@@ -914,26 +913,13 @@ fn execute(
                 });
             }
             fx.push(Effect::WarpMouse { to: frame.center() });
-            if proj != before {
-                if let Some(ws) = s.current_workspace() {
-                    let mut order = vec![window];
-                    order.extend(visible_stack(s, ws, &proj).into_iter().filter(|w| *w != window));
-                    if order.len() >= 2 {
-                        fx.push(restack(s, order, true));
-                    }
-                }
-            }
-            fx.push(Effect::RequestRescan {
-                reason: RescanTrigger::PostEffect { op },
-            });
-            FocusIntent::Window(window)
+            (FocusIntent::Window(window), op)
         }
 
         Command::View { target } => {
             // The monitor twin of a workspace switch: focus goes to the
             // target monitor's MRU window on the current workspace once the
-            // view has moved (emitted after it, for the switch's reason), and
-            // the newly visible set is restacked under it.
+            // view has moved (emitted after it, for the switch's reason).
             // A monitor with nothing on it gets its display's desktop instead:
             // an empty monitor is still a place to be.
             let ws = s.current_workspace().expect("resolved against a workspace");
@@ -963,19 +949,12 @@ fn execute(
                     });
                 }
             }
-            let mut order: Vec<WindowId> = head.into_iter().collect();
-            order.extend(visible_stack(s, ws, &proj).into_iter().filter(|w| Some(*w) != head));
-            if order.len() >= 2 {
-                fx.push(restack(s, order, head.is_some()));
-            }
-            fx.push(Effect::RequestRescan {
-                reason: RescanTrigger::PostEffect { op },
-            });
-            match (head, desktop) {
+            let focus = match (head, desktop) {
                 (Some(fw), _) => FocusIntent::Window(fw),
                 (None, Some(_)) => FocusIntent::Desktop,
                 (None, None) => FocusIntent::Deferred,
-            }
+            };
+            (focus, op)
         }
 
         Command::ToggleVirtualMonitors => {
@@ -990,26 +969,14 @@ fn execute(
             });
             // Turning virtualization on must not hide the window the user is
             // in: the anchor moves to its monitor first.
-            let mut viewed = v.viewed;
             if enabled {
                 if let Some(vm) = s.declared_focus().and_then(|w| s.windows.get(&w)).map(|r| r.vmonitor) {
                     if vm != v.viewed {
                         push_view(s, vm, now_ns, fx);
-                        viewed = vm;
                     }
                 }
             }
-            if let Some(ws) = s.current_workspace() {
-                let order = visible_stack(s, ws, &s.projection_with(Some(viewed), Some(enabled)));
-                if order.len() >= 2 {
-                    let focus_top = order.first().copied() == s.declared_focus();
-                    fx.push(restack(s, order, focus_top));
-                }
-            }
-            fx.push(Effect::RequestRescan {
-                reason: RescanTrigger::PostEffect { op },
-            });
-            s.focus_intent()
+            (s.focus_intent(), op)
         }
 
         Command::Merge { from, into } => {
@@ -1018,41 +985,18 @@ fn execute(
             fx.push(Effect::MergeMonitors { op, from, into });
             s.pending.push(PendingOp {
                 op,
-                expect: Expectation::MonitorCount { count: v.count - 1 },
+                expect: Expectation::MonitorsMerged {
+                    from,
+                    into,
+                    count: v.count - 1,
+                },
                 issued_ns: now_ns,
             });
-            // What a merge reveals comes up through app un-hiding, which
-            // scrambles z-order, as a view change's does.
-            if let Some(ws) = s.current_workspace() {
-                let merged = project(
-                    v.count - 1,
-                    after_merge(v.viewed, from, into),
-                    v.enabled,
-                    s.monitors.len(),
-                );
-                let order: Vec<WindowId> = s
-                    .focus_history
-                    .iter()
-                    .filter(|w| {
-                        s.windows.get(w).is_some_and(|r| {
-                            r.workspace == ws
-                                && merged.is_hosted(after_merge(r.vmonitor, from, into))
-                        })
-                    })
-                    .collect();
-                if order.len() >= 2 {
-                    let focus_top = order.first().copied() == s.declared_focus();
-                    fx.push(restack(s, order, focus_top));
-                }
-            }
-            fx.push(Effect::RequestRescan {
-                reason: RescanTrigger::PostEffect { op },
-            });
-            s.focus_intent()
+            (s.focus_intent(), op)
         }
 
-        // Nothing on screen changes, so nothing to restack: the new monitor
-        // is empty and the anchor moves only within the viewport.
+        // Nothing on screen changes: the new monitor is empty and the anchor
+        // moves only within the viewport.
         Command::AddMonitor => {
             let v = s.virtual_monitors.expect("resolved against a virtual layer");
             let op = s.mint_op();
@@ -1062,10 +1006,7 @@ fn execute(
                 expect: Expectation::MonitorCount { count: v.count + 1 },
                 issued_ns: now_ns,
             });
-            fx.push(Effect::RequestRescan {
-                reason: RescanTrigger::PostEffect { op },
-            });
-            s.focus_intent()
+            (s.focus_intent(), op)
         }
 
         // Nothing on screen changes: only the numbers do.
@@ -1080,10 +1021,7 @@ fn execute(
                 expect: Expectation::WorkspacesMoved { current },
                 issued_ns: now_ns,
             });
-            fx.push(Effect::RequestRescan {
-                reason: RescanTrigger::PostEffect { op },
-            });
-            s.focus_intent()
+            (s.focus_intent(), op)
         }
 
         Command::MoveMonitor { from, to } => {
@@ -1094,31 +1032,10 @@ fn execute(
             fx.push(Effect::MoveMonitor { op, from, to });
             s.pending.push(PendingOp {
                 op,
-                expect: Expectation::MonitorsMoved { viewed },
+                expect: Expectation::MonitorsMoved { from, to, viewed },
                 issued_ns: now_ns,
             });
-            // What the new order brings into view comes up through app
-            // un-hiding, which scrambles z-order, as a merge's does.
-            if let Some(ws) = s.current_workspace() {
-                let after = project(v.count, viewed, v.enabled, s.monitors.len());
-                let order: Vec<WindowId> = s
-                    .focus_history
-                    .iter()
-                    .filter(|w| {
-                        s.windows.get(w).is_some_and(|r| {
-                            r.workspace == ws && after.is_hosted(moved(r.vmonitor))
-                        })
-                    })
-                    .collect();
-                if order.len() >= 2 {
-                    let focus_top = order.first().copied() == s.declared_focus();
-                    fx.push(restack(s, order, focus_top));
-                }
-            }
-            fx.push(Effect::RequestRescan {
-                reason: RescanTrigger::PostEffect { op },
-            });
-            s.focus_intent()
+            (s.focus_intent(), op)
         }
     }
 }
@@ -1273,6 +1190,7 @@ fn handle_snapshot(
 
     let mut last_op: Option<OpId> = None;
 
+    let handed_on = hand_on.is_some();
     if let Some(hand_on) = hand_on {
         hand_on_focus(s, hand_on, now_ns, notes, &mut last_op, fx);
     }
@@ -1458,7 +1376,7 @@ fn handle_snapshot(
         fx,
     );
 
-    enforce_focus(s, navigation_gesture, now_ns, notes, &mut last_op, fx);
+    let followed = enforce_focus(s, navigation_gesture, now_ns, notes, &mut last_op, fx);
 
     // Tear re-alignment: the product invariant is that a workspace spans all
     // monitors, so an externally-swiped display gets pulled back to the
@@ -1492,7 +1410,14 @@ fn handle_snapshot(
         }
     }
 
-    restack_settled_moves(s, &deltas, &entry_expectations, fx);
+    // A look restacks only for what it decided itself, never for what it
+    // merely sees. A hand-on may still supersede a switch's restack in
+    // flight; that is fine, as its own restack takes focus for the window
+    // it declared.
+    let settled = settled_moves(s, &deltas, &entry_expectations);
+    if handed_on || followed || settled {
+        restack_to_intent(s, &desired_stack(pre), followed || settled, fx);
+    }
 
     if let Some(op) = last_op {
         fx.push(Effect::RequestRescan {
@@ -1580,14 +1505,14 @@ fn record_landing(s: &mut State, trigger: &RescanTrigger, now_ns: u64, notes: &m
 }
 
 /// Where focus goes when the window holding it closes: the next window in
-/// the MRU order on its monitor, which tops the restack `order`, or that
-/// monitor's desktop. A desktop on a monitor that is not the anchor is
-/// viewed first, so the anchor moves to it, and with it where new windows
-/// are corralled: the user is at that monitor now.
+/// the MRU order on its monitor, or that monitor's desktop. A desktop on a
+/// monitor that is not the anchor is viewed first, so the anchor moves to
+/// it, and with it where new windows are corralled: the user is at that
+/// monitor now.
 enum HandOn {
     Window {
         closed: WindowId,
-        order: Vec<WindowId>,
+        next: WindowId,
     },
     Desktop {
         closed: WindowId,
@@ -1643,12 +1568,11 @@ fn hand_on_from_close(pre: &State, s: &State, deltas: &[Delta]) -> Option<HandOn
         return None;
     }
     let ws = s.current_workspace().filter(|ws| *ws == rec.workspace)?;
-    let order: Vec<WindowId> = mru_stack(s, ws)
+    if let Some(next) = mru_stack(s, ws)
         .into_iter()
-        .filter(|w| s.windows[w].vmonitor == rec.vmonitor)
-        .collect();
-    if !order.is_empty() {
-        return Some(HandOn::Window { closed, order });
+        .find(|w| s.windows[w].vmonitor == rec.vmonitor)
+    {
+        return Some(HandOn::Window { closed, next });
     }
     // The desktop declaration is held on the anchor's display, so another
     // monitor's desktop needs the anchor moved there, which is only a focus
@@ -1703,12 +1627,8 @@ fn hand_on_focus(
     fx: &mut Vec<Effect>,
 ) {
     match hand_on {
-        HandOn::Window { closed, order } => {
-            let next = order[0];
+        HandOn::Window { closed, next } => {
             let op = push_focus(s, next, s.focused != Some(next), now_ns, fx, notes);
-            if order.len() >= 2 {
-                fx.push(restack(s, order, true));
-            }
             s.declare_focus(FocusIntent::Window(next));
             notes.push(Note::FocusHandedOn {
                 closed,
@@ -1763,20 +1683,13 @@ fn keep_vanished_places(pre: &State, s: &mut State, now_ns: u64) {
     s.vanished = vanished;
 }
 
-/// A window moved or resized by a hand that wasn't Ordo's may now overlap
-/// windows it didn't, in whatever order the stack happens to have. A user's
-/// drag clicks the window first, which puts it on top; this is for the moves
-/// nobody clicked, like an app re-applying its saved frame. The check waits
-/// until the window holds still for one observation, so a drag in progress
-/// isn't restacked on every snapshot, and while any op is pending, so it
-/// doesn't cut into a switch's own restack. It costs one stack read when the
-/// order is already right.
-fn restack_settled_moves(
-    s: &mut State,
-    deltas: &[Delta],
-    entry_expectations: &[Expectation],
-    fx: &mut Vec<Effect>,
-) {
+/// A window moved by a hand that wasn't Ordo's may now overlap others in any
+/// order: as good as a reveal, for the stack. A user's drag clicks the window
+/// on top first, so this matters for moves nobody clicked. It counts once the
+/// window holds still, so a drag isn't restacked every look, and only with
+/// no op pending, so it can't supersede a switch's restack and lose its
+/// focus take-back.
+fn settled_moves(s: &mut State, deltas: &[Delta], entry_expectations: &[Expectation]) -> bool {
     let visible = |s: &State, w: &WindowId| s.windows.get(w).is_some_and(|r| s.is_visible(r));
     let moved: BTreeSet<WindowId> = deltas
         .iter()
@@ -1798,28 +1711,15 @@ fn restack_settled_moves(
         .filter(|w| !moved.contains(w) && visible(s, w))
         .copied()
         .collect();
-    let covered = fx
-        .iter()
-        .any(|e| matches!(e, Effect::RestackWindows { .. }));
     s.moving = moved;
-    if settled.is_empty() || covered {
-        return;
+    if settled.is_empty() {
+        return false;
     }
     if !s.pending.is_empty() {
         s.moving.extend(settled);
-        return;
+        return false;
     }
-    let Some(here) = s.current_workspace() else {
-        return;
-    };
-    let order = mru_stack(s, here);
-    if order.len() >= 2 {
-        // Taking focus only where Ordo already declares it: this can
-        // supersede a switch's restack still in flight, which would otherwise
-        // lose its focus take-back.
-        let focus_top = s.focus_intent() == FocusIntent::Window(order[0]);
-        fx.push(restack(s, order, focus_top));
-    }
+    true
 }
 
 /// How long a window must stand on another display before its monitor
@@ -1979,7 +1879,7 @@ fn enforce_focus(
     notes: &mut Vec<Note>,
     last_op: &mut Option<OpId>,
     fx: &mut Vec<Effect>,
-) {
+) -> bool {
     // Spent only by another app taking the slot. A vacuum says nothing about
     // whether the conceding app relented, and the invariant cannot fire on
     // one anyway; clearing there would only re-arm the loop for the app's
@@ -1990,7 +1890,7 @@ fn enforce_focus(
         s.conceded = None;
     }
     let Some(here) = s.current_workspace() else {
-        return;
+        return false;
     };
 
     let landed_hidden = s
@@ -2001,7 +1901,7 @@ fn enforce_focus(
     if let (Some(rec), None) = (&landed_hidden, s.focus_target()) {
         // Neither the user going there nor a fling: see `State::menu_open`.
         if s.menu_open {
-            return;
+            return false;
         }
         if navigation_gesture {
             // Follow on whichever axes hide the window: the workspace, the
@@ -2011,26 +1911,19 @@ fn enforce_focus(
             if target != here {
                 op = Some(push_switch(s, target, now_ns, fx, notes));
             }
-            let mut proj = s.projection();
             let mut monitor = None;
-            if !proj.is_hosted(rec.vmonitor) {
+            if !s.projection().is_hosted(rec.vmonitor) {
                 op = Some(push_view(s, rec.vmonitor, now_ns, fx));
-                proj = s.projection_with(Some(rec.vmonitor), None);
                 monitor = Some(rec.vmonitor);
             }
-            // Declared first so the window the user chose heads the restack.
             s.declare_focus(FocusIntent::Window(rec.id));
-            let order = visible_stack(s, target, &proj);
-            if order.len() >= 2 {
-                fx.push(restack(s, order, true));
-            }
             notes.push(Note::FollowedFocus {
                 window: rec.id,
                 target,
                 monitor,
             });
             *last_op = op;
-            return;
+            return true;
         }
         // An empty visible workspace has nothing to hold focus: leave it, the
         // next birth here declares itself. Under a desktop declaration the
@@ -2049,27 +1942,27 @@ fn enforce_focus(
 
     if s.focus_intent() == FocusIntent::Desktop {
         enforce_desktop(s, now_ns, notes, last_op, fx);
-        return;
+        return false;
     }
     let Some(w) = s.focus_target() else {
-        return;
+        return false;
     };
     if s.focused == Some(w) {
         s.focus_corrections = 0;
-        return;
+        return false;
     }
     // A declaration for a window that is not on screen is unenforceable (its
     // switch or view has not landed, or never will); granting it would put
     // the keyboard into an invisible window.
     if !s.is_visible(&s.windows[&w]) {
-        return;
+        return false;
     }
     // The grant is in flight; apps land it on their own schedule.
     if s.pending
         .iter()
         .any(|p| p.expect == Expectation::Focused(w))
     {
-        return;
+        return false;
     }
     if s.focus_corrections >= DAMPING_LIMIT {
         // The app has won the slot. Unlike a parked frame — where the
@@ -2088,12 +1981,13 @@ fn enforce_focus(
         s.declare_focus(FocusIntent::Deferred);
         // After the declaration, which clears it.
         s.conceded = key_app(s);
-        return;
+        return false;
     }
     s.focus_corrections += 1;
     let op = push_focus(s, w, true, now_ns, fx, notes);
     notes.push(Note::FocusReasserted { window: w });
     *last_op = Some(op);
+    false
 }
 
 /// The desktop twin of window enforcement: a window taking focus from the
@@ -2210,13 +2104,13 @@ fn expectation_satisfied(e: &Expectation, s: &State) -> bool {
         Expectation::VirtualMonitorsEnabled(e) => {
             s.virtual_monitors.is_some_and(|v| v.enabled == *e)
         }
-        Expectation::MonitorCount { count } => {
+        Expectation::MonitorCount { count } | Expectation::MonitorsMerged { count, .. } => {
             s.virtual_monitors.is_some_and(|v| v.count == *count)
         }
         Expectation::WorkspacesMoved { current } => {
             !s.monitor_ws.is_empty() && s.monitor_ws.values().all(|w| w == current)
         }
-        Expectation::MonitorsMoved { viewed } => {
+        Expectation::MonitorsMoved { viewed, .. } => {
             s.virtual_monitors.is_some_and(|v| v.viewed == *viewed)
         }
     }
