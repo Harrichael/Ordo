@@ -37,6 +37,8 @@ use objc2_foundation::{
     NSPoint, NSRect, NSSize, NSString,
 };
 
+use ordo_core::{Gesture, HotkeyAction};
+
 use crate::engine::Msg;
 use crate::menubar::{MenuBarView, MonitorsView};
 use crate::platform::monitor_map::MonitorMap;
@@ -64,6 +66,8 @@ const FRAME_LINE: f64 = 1.0;
 const FRAME_R: f64 = 3.0;
 const SLIDE_SECS: f64 = 0.12;
 const SLIDE_FRAMES: u32 = 8;
+/// Long enough for the engine's view of a move that landed to arrive first.
+const RESHOW_AFTER: Duration = Duration::from_millis(500);
 /// App names a menu row spells out before summarizing the rest as "+N".
 const NAMED_APPS: usize = 3;
 
@@ -227,6 +231,32 @@ fn slide(mailbox: &Arc<Mailbox>, ui: &Ui, from: Strip, to: Strip) {
             })
         });
     }
+}
+
+/// What the menu's views ask for, sent to the engine. A drop shows its move
+/// at once, before the engine's view; one the core refused (a switch was on
+/// its way) would leave the rows moved, since a refusal changes no view and
+/// so sends none. So the latest view is shown again a moment later: the same
+/// rows if the move landed, the old ones if not.
+fn commands(mailbox: &Arc<Mailbox>) -> Box<dyn Fn(HotkeyAction)> {
+    let mailbox = mailbox.clone();
+    Box::new(move |action| {
+        let _ = mailbox.tx.send(Msg::hotkey(action));
+        if matches!(action, HotkeyAction::MoveWorkspace { .. } | HotkeyAction::MoveMonitor { .. }) {
+            let mailbox = mailbox.clone();
+            let at = DispatchTime::try_from(RESHOW_AFTER).unwrap_or(DispatchTime::NOW);
+            let _ = DispatchQueue::main().after(at, move || {
+                let Some(view) = mailbox.latest.lock().unwrap().clone() else {
+                    return;
+                };
+                UI.with(|ui| {
+                    if let Some(ui) = ui.get() {
+                        ui.controller.follow(&view);
+                    }
+                });
+            });
+        }
+    })
 }
 
 fn summary(view: &MenuBarView) -> String {
@@ -509,12 +539,14 @@ define_class!(
         fn menu_will_open(&self, _menu: &NSMenu) {
             self.ivars().open.set(true);
             self.ivars().mailbox.own_menu.set(true);
+            let _ = self.ivars().mailbox.tx.send(Msg::Gesture(Gesture::OwnMenu { open: true }));
         }
 
         #[unsafe(method(menuDidClose:))]
         fn menu_did_close(&self, _menu: &NSMenu) {
             self.ivars().open.set(false);
             self.ivars().mailbox.own_menu.set(false);
+            let _ = self.ivars().mailbox.tx.send(Msg::Gesture(Gesture::OwnMenu { open: false }));
         }
 
         #[unsafe(method(menuNeedsUpdate:))]
@@ -539,27 +571,15 @@ impl Controller {
     }
 
     fn map(&self) -> &MonitorMap {
-        self.ivars().map.get_or_init(|| {
-            let tx = self.ivars().mailbox.tx.clone();
-            MonitorMap::new(
-                self.mtm(),
-                Box::new(move |action| {
-                    let _ = tx.send(Msg::hotkey(action));
-                }),
-            )
-        })
+        self.ivars()
+            .map
+            .get_or_init(|| MonitorMap::new(self.mtm(), commands(&self.ivars().mailbox)))
     }
 
     fn list(&self) -> &WorkspaceList {
-        self.ivars().list.get_or_init(|| {
-            let tx = self.ivars().mailbox.tx.clone();
-            WorkspaceList::new(
-                self.mtm(),
-                Box::new(move |action| {
-                    let _ = tx.send(Msg::hotkey(action));
-                }),
-            )
-        })
+        self.ivars()
+            .list
+            .get_or_init(|| WorkspaceList::new(self.mtm(), commands(&self.ivars().mailbox)))
     }
 
     /// A view that changed under an open menu: the diagram follows it,

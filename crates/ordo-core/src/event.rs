@@ -90,6 +90,11 @@ pub enum Gesture {
     /// Control and Launchpad are the Dock's too, and so are their clicks,
     /// rightly: they are navigation. (Stage Manager is not the Dock's.)
     Dock { at: Point },
+    /// Ordo's own menu opened or closed. Picks in it arrive as hotkeys, while
+    /// it stays open; what the screen shows meanwhile is the apps reacting to
+    /// losing the keyboard to it (kitty names another, parked window as
+    /// focused), not the user going anywhere.
+    OwnMenu { open: bool },
     /// macOS's app switcher completed (Cmd released after Cmd+Tab) or its
     /// in-app window cycle fired (Cmd+`). The target is the OS's to know; a
     /// focus landing on a hidden workspace right after is the user going there.
@@ -120,7 +125,7 @@ impl From<Gesture> for Input {
     fn from(g: Gesture) -> Self {
         match g {
             Gesture::MouseDown { .. } => Input::Click,
-            Gesture::MenuBar { .. } => Input::MenuBar,
+            Gesture::MenuBar { .. } | Gesture::OwnMenu { .. } => Input::MenuBar,
             Gesture::Dock { .. } => Input::Dock,
             Gesture::SystemSwitch => Input::Switcher,
             Gesture::Key => Input::Key,

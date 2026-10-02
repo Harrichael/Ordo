@@ -227,6 +227,11 @@ pub struct State {
     /// menu item, which can open anything.
     #[serde(default)]
     pub(crate) menu_open: bool,
+    /// Ordo's own menu is open: the user is in it, so focus is neither
+    /// recorded nor enforced (refocusing would close it), and its picks,
+    /// which arrive as hotkeys, leave `menu_open` standing.
+    #[serde(default)]
+    pub(crate) own_menu: bool,
     /// The app that kept the key window when enforcement last stood down,
     /// while it still holds the slot. Retiring to `Deferred` alone does not
     /// end a standoff against a window on a HIDDEN workspace: the
@@ -296,6 +301,7 @@ impl State {
             navigation_gesture: false,
             unseen_landing: Landing::default(),
             menu_open: false,
+            own_menu: false,
             conceded: None,
             focus_history: FocusHistory::new(),
             misplaced_since: BTreeMap::new(),

@@ -158,7 +158,9 @@ pub fn update(state: &State, event: &Event) -> Step {
 
     match event {
         Event::Hotkey { at, action } => {
-            s.menu_open = false;
+            if !s.own_menu {
+                s.menu_open = false;
+            }
             if s.mode == Mode::Active {
                 handle_hotkey(&mut s, *action, at.mono_ns, &mut effects, &mut notes);
             }
@@ -492,6 +494,22 @@ fn view_for(s: &State, target: WindowId) -> (Option<VirtualMonitorId>, Projectio
 /// within the app it was typed into (see `Away::within`), and leaves a
 /// click's own landing waiting.
 fn handle_gesture(s: &mut State, gesture: Gesture, now_ns: u64, notes: &mut Vec<Note>) {
+    if let Gesture::OwnMenu { open } = gesture {
+        s.own_menu = open;
+        s.menu_open = open;
+        // What the click that opened it left waiting is spent: the user was
+        // in the menu, not on the screen.
+        if !open {
+            s.unseen_landing = Landing::default();
+            s.navigation_gesture = false;
+        }
+        return;
+    }
+    // The tap drops clicks while Ordo's menu is open, so one reaching here
+    // means it has closed, even if its close was never heard.
+    if gesture != Gesture::Key {
+        s.own_menu = false;
+    }
     if gesture == Gesture::Key {
         s.unseen_landing.away = Some(Away {
             from: s.focused,
@@ -518,7 +536,7 @@ fn handle_gesture(s: &mut State, gesture: Gesture, now_ns: u64, notes: &mut Vec<
     let within = hit.first().copied();
     let armed = match gesture {
         Gesture::SystemSwitch | Gesture::Dock { .. } => true,
-        Gesture::MenuBar { .. } | Gesture::Key => false,
+        Gesture::MenuBar { .. } | Gesture::Key | Gesture::OwnMenu { .. } => false,
         Gesture::MouseDown { .. } => within.is_none(),
     };
     // The shell saw the Dock take the click, so it was no menu item.
@@ -1134,7 +1152,7 @@ fn handle_snapshot(
     // the close's fallout, even inside the second after the click that
     // closed it: where focus goes next is Ordo's to say.
     let hand_on = hand_on_from_close(pre, s, &deltas);
-    if hand_on.is_none() {
+    if hand_on.is_none() && !s.own_menu {
         record_landing(s, trigger, now_ns, notes);
     }
     // A display came or went. Every window on the vanished display was just
@@ -1925,6 +1943,10 @@ fn enforce_focus(
     let Some(here) = s.current_workspace() else {
         return false;
     };
+    // See `State::own_menu`.
+    if s.own_menu {
+        return false;
+    }
     // A window born without focus is awaited (see `Landing::awaited`), and
     // what its app keys meanwhile, a hidden sibling of it or nothing, is the
     // opening, not to be fought or followed. Nothing keyed is a vacuum

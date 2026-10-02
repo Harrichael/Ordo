@@ -2322,6 +2322,59 @@ fn a_window_floating_above_the_ordinary_layer_is_never_restacked() {
     assert_eq!(back.state.windows[&wid(4)].workspace, WorkspaceId(1));
 }
 
+/// kitty (app 100) is key in w1; its w2 is parked on workspace 2. The user
+/// opens Ordo's menu, and kitty, losing the keyboard to it, names w2 as
+/// focused (run 54, on every opening).
+fn ordos_menu_opened_over_kitty() -> (State, Vec<Win>) {
+    let wins = vec![
+        win(1, 100, 1, rect(100.0, 100.0)),
+        win(2, 100, 2, rect(2000.0, 100.0)),
+        win(3, 300, 1, rect(2400.0, 300.0)),
+    ];
+    let mons = || vec![mon_a(1), mon_b(1)];
+    let s = update(&State::new(), &observed(mons(), wins.clone(), None, RescanTrigger::Startup)).state;
+    let s = used(&s, 1, mons(), wins.clone());
+    let s = update(&s, &gesture(Gesture::MenuBar { at: Point { x: 1500.0, y: 10.0 } })).state;
+    let s = update(&s, &gesture(Gesture::OwnMenu { open: true })).state;
+    (s, wins)
+}
+
+#[test]
+fn ordos_own_menu_neither_records_nor_fights_focus_while_open() {
+    // Taking focus back while the menu is open closed it (run 54: after each
+    // add-monitor pick, kitty's w2 was "held" against and the menu closed),
+    // and the flip was written into the MRU order as the user's. A pick from
+    // the menu, which arrives as a hotkey, changes neither.
+    let (s, wins) = ordos_menu_opened_over_kitty();
+    let mons = || vec![mon_a(1), mon_b(1)];
+    let flipped = update(&s, &observed(mons(), wins.clone(), Some(2), RescanTrigger::Periodic));
+    assert!(focus_targets(&flipped.effects).is_empty(), "{:?}", flipped.effects);
+    let picked = update(
+        &flipped.state,
+        &hotkey(HotkeyAction::MoveWorkspace {
+            from: WorkspaceId(3),
+            to: WorkspaceId(2),
+        }),
+    );
+    let after_pick = update(&picked.state, &observed(mons(), wins.clone(), Some(2), RescanTrigger::Periodic));
+    assert!(focus_targets(&after_pick.effects).is_empty(), "{:?}", after_pick.effects);
+
+    let closed = update(&after_pick.state, &gesture(Gesture::OwnMenu { open: false })).state;
+    let back = update(&closed, &observed(mons(), wins, Some(1), RescanTrigger::Periodic));
+    assert!(focus_targets(&back.effects).is_empty());
+    assert_eq!(history(&back.state)[0], wid(1));
+}
+
+#[test]
+fn a_flip_that_outlasts_ordos_menu_is_held_as_ever() {
+    // Once the menu has closed, kitty still naming its parked window is an
+    // ordinary fling, and focus goes back to the visible MRU head.
+    let (s, wins) = ordos_menu_opened_over_kitty();
+    let closed = update(&s, &gesture(Gesture::OwnMenu { open: false })).state;
+    let held = update(&closed, &observed(vec![mon_a(1), mon_b(1)], wins, Some(2), RescanTrigger::Periodic));
+    assert_eq!(focus_targets(&held.effects), vec![wid(1)]);
+}
+
 #[test]
 fn closing_an_attached_window_leaves_focus_to_its_root() {
     // w6 hangs off w4 (an omnibox popup, a find bar). When it is dismissed

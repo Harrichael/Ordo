@@ -12,6 +12,8 @@
 //! the two; that drop asks first, in place of the tiles, because a merge
 //! can't be undone. The plus after the last tile adds a monitor without
 //! asking: it is empty and moves nothing, so there is nothing to confirm.
+//! The menu stays open through all of these, the tiles following the
+//! engine's view as it arrives.
 
 use std::cell::{Cell, OnceCell, RefCell};
 
@@ -201,7 +203,6 @@ define_class!(
                 self.redraw();
                 if contains(add_rect(n), p) {
                     (self.ivars().on_command)(HotkeyAction::AddMonitor);
-                    self.close_menu();
                 }
                 return;
             }
@@ -318,6 +319,16 @@ impl MonitorMap {
                 + plus,
             TOP + frame_h + BOTTOM,
         ));
+        // An open menu measures an item's view when it opens; a monitor added
+        // or merged away under it changes the width the tiles need.
+        if animate && !same {
+            if let Some(item) = self.enclosingMenuItem() {
+                // SAFETY: the item is in the menu that is showing this view.
+                if let Some(menu) = unsafe { item.menu() } {
+                    menu.itemChanged(&item);
+                }
+            }
+        }
 
         let hosted: Vec<usize> = view
             .monitors
@@ -404,11 +415,12 @@ impl MonitorMap {
         self.ivars().confirm.set(None);
         let view = self.ivars().view.borrow().clone();
         if let Some(view) = view {
-            self.show(&view, self.ivars().mergeable.get(), true);
+            self.show(&view, self.ivars().engaged.get(), true);
         }
     }
 
-    /// Closes the menu too: the merge renumbers the very tiles it drew.
+    /// Back to the tiles, which the engine's view of the merged monitors
+    /// then redraws.
     fn merge(&self, from: usize, into: usize) {
         let ids = self
             .ivars()
@@ -416,20 +428,10 @@ impl MonitorMap {
             .borrow()
             .as_ref()
             .map(|v| (v.monitors[from].id, v.monitors[into].id));
-        self.ivars().confirm.set(None);
         if let Some((from, into)) = ids {
             (self.ivars().on_command)(HotkeyAction::MergeMonitors { from, into });
         }
-        self.close_menu();
-    }
-
-    /// After a merge or an add the tiles no longer match the monitors, and an
-    /// open menu doesn't take a new width from its item's view.
-    fn close_menu(&self) {
-        // SAFETY: the item is in the menu that is showing this view.
-        if let Some(menu) = self.enclosingMenuItem().and_then(|item| unsafe { item.menu() }) {
-            menu.cancelTracking();
-        }
+        self.answer();
     }
 }
 
