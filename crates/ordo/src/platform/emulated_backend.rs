@@ -54,6 +54,10 @@ impl Desktop for AxDesktop {
         ax::app_hidden(pid)
     }
 
+    fn can_hide(&self, pid: Pid) -> bool {
+        ax::has_dock_icon(pid)
+    }
+
     fn stack(&self) -> Vec<WindowId> {
         zorder::stack_front_to_back()
     }

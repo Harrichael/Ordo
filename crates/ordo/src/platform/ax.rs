@@ -20,7 +20,7 @@ use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::time::{Duration, Instant};
 
-use objc2_app_kit::{NSApplicationActivationPolicy, NSWorkspace};
+use objc2_app_kit::{NSApplicationActivationPolicy, NSRunningApplication, NSWorkspace};
 use objc2_application_services::{AXError, AXUIElement, AXValue, AXValueType};
 use objc2_core_foundation::{CFBoolean, CFString, CFType, CGPoint, CGSize};
 use ordo_core::{Pid, Point, Rect, WindowId};
@@ -107,7 +107,7 @@ fn walk() -> (Vec<AxWindow>, Walk) {
     let apps: Vec<(i32, Option<String>)> = NSWorkspace::sharedWorkspace()
         .runningApplications()
         .iter()
-        .filter(|a| a.activationPolicy() == NSApplicationActivationPolicy::Regular)
+        .filter(|a| managed(a))
         .map(|a| (a.processIdentifier(), a.bundleIdentifier().map(|b| b.to_string())))
         .filter(|(pid, _)| *pid > 0)
         .collect();
@@ -256,7 +256,7 @@ pub fn is_key(w: WindowId, pid: i32) -> bool {
 pub fn frontmost_claims() -> Vec<Pid> {
     let apps = NSWorkspace::sharedWorkspace().runningApplications();
     apps.iter()
-        .filter(|a| a.activationPolicy() == NSApplicationActivationPolicy::Regular)
+        .filter(|a| managed(a))
         .map(|a| a.processIdentifier())
         .filter(|pid| *pid > 0)
         .filter(|pid| {
@@ -273,6 +273,31 @@ pub fn frontmost_claims() -> Vec<Pid> {
         .collect()
 }
 
+/// Background apps (no Dock icon) whose windows the user works in like any
+/// app's, so Ordo manages them: named, because nothing a window reports tells
+/// these from a launcher's panel or a menu-bar popover.
+const MANAGED_BACKGROUND_APPS: &[&str] = &["com.apple.screencaptureui"];
+
+/// Whether Ordo manages an app's windows: every regular app, and the named
+/// background ones.
+pub fn manages(regular: bool, bundle_id: Option<&str>) -> bool {
+    regular || bundle_id.is_some_and(|b| MANAGED_BACKGROUND_APPS.contains(&b))
+}
+
+pub(crate) fn managed(app: &NSRunningApplication) -> bool {
+    let bundle = app.bundleIdentifier().map(|b| b.to_string());
+    manages(
+        app.activationPolicy() == NSApplicationActivationPolicy::Regular,
+        bundle.as_deref(),
+    )
+}
+
+/// Whether the app has a Dock icon, so a hide can be undone from there.
+pub fn has_dock_icon(pid: Pid) -> bool {
+    NSRunningApplication::runningApplicationWithProcessIdentifier(pid.0)
+        .is_some_and(|a| a.activationPolicy() == NSApplicationActivationPolicy::Regular)
+}
+
 pub fn frontmost_app() -> Option<Pid> {
     // Ask each app's live `AXFrontmost` attribute — NOT
     // NSWorkspace.frontmostApplication, which is a cache that refreshes only
@@ -280,11 +305,14 @@ pub fn frontmost_app() -> Option<Pid> {
     // report the frontmost app from boot forever). The system-wide element's
     // AXFocusedApplication would be cleaner but returns
     // kAXErrorCannotComplete here (observed on Tahoe).
+    // A background app's window being key leaves the regular app before it
+    // still answering frontmost (the screenshot tool's window: probed), so the
+    // background apps are asked first. Footgun: a hung background app costs
+    // every focus read its messaging timeout.
     let apps = NSWorkspace::sharedWorkspace().runningApplications();
-    for app in apps.iter() {
-        if app.activationPolicy() != NSApplicationActivationPolicy::Regular {
-            continue;
-        }
+    let mut apps: Vec<_> = apps.iter().filter(|a| managed(a)).collect();
+    apps.sort_by_key(|a| a.activationPolicy() == NSApplicationActivationPolicy::Regular);
+    for app in apps {
         let pid = app.processIdentifier();
         if pid <= 0 {
             continue;
@@ -762,6 +790,8 @@ fn holds_at(w: WindowId, at: Point) -> bool {
 pub fn unhide_all_apps() {
     let apps = NSWorkspace::sharedWorkspace().runningApplications();
     for app in apps.iter() {
+        // Regular apps only: a background app Ordo manages is never hidden
+        // (`has_dock_icon`, asked before every hide).
         if app.activationPolicy() != NSApplicationActivationPolicy::Regular {
             continue;
         }
@@ -788,7 +818,7 @@ pub fn raise_sequenced(targets: &[WindowId], mut after_each: impl FnMut(WindowId
     let mut found: HashMap<WindowId, *const AXUIElement> = HashMap::new();
     let apps = NSWorkspace::sharedWorkspace().runningApplications();
     for app in apps.iter() {
-        if app.activationPolicy() != NSApplicationActivationPolicy::Regular {
+        if !managed(&app) {
             continue;
         }
         let pid = app.processIdentifier();
@@ -1094,7 +1124,7 @@ fn with_window<T>(
     }
     let apps = NSWorkspace::sharedWorkspace().runningApplications();
     for app in apps.iter() {
-        if app.activationPolicy() != NSApplicationActivationPolicy::Regular {
+        if !managed(&app) {
             continue;
         }
         let pid = app.processIdentifier();
@@ -1188,4 +1218,18 @@ unsafe fn disable_enhanced_ui(app: &AXUIElement) -> bool {
         set_bool(app, "AXEnhancedUserInterface", false);
     }
     was_on
+}
+
+#[cfg(test)]
+mod tests {
+    use super::manages;
+
+    #[test]
+    fn every_regular_app_and_only_the_named_background_ones_are_managed() {
+        assert!(manages(true, Some("com.google.Chrome")));
+        assert!(manages(true, None));
+        assert!(manages(false, Some("com.apple.screencaptureui")));
+        assert!(!manages(false, Some("com.raycast.macos")));
+        assert!(!manages(false, None));
+    }
 }

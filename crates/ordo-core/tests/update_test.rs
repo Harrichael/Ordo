@@ -2298,6 +2298,31 @@ fn quitting_the_focused_app_from_the_dock_hands_focus_on_within_its_monitor() {
 }
 
 #[test]
+fn a_window_floating_above_the_ordinary_layer_is_never_restacked() {
+    // The screenshot tool's window (w4) floats at layer 3, above every
+    // ordinary window whatever is raised; the restack worker reads only layer
+    // 0 and would wait for it on every restack. It belongs to workspace 1 all
+    // the same.
+    let mut floating = win(4, 400, 1, rect(300.0, 600.0));
+    floating.snap.layer = Some(3);
+    let wins = vec![
+        win(1, 100, 1, rect(100.0, 100.0)),
+        floating,
+        win(2, 200, 2, rect(2000.0, 100.0)),
+    ];
+    let mons = || vec![mon_a(1), mon_b(1)];
+    let s = update(&State::new(), &observed(mons(), wins.clone(), None, RescanTrigger::Startup)).state;
+    let s = used(&s, 1, mons(), wins.clone());
+    let s = used(&s, 4, mons(), wins);
+    let away = update(&s, &hotkey(HotkeyAction::WorkspaceSwitchTo(WorkspaceId(2))));
+    let back = update(&away.state, &hotkey(HotkeyAction::WorkspaceSwitchTo(WorkspaceId(1))));
+    let orders: Vec<_> = restacks(&away.effects).into_iter().chain(restacks(&back.effects)).collect();
+    assert!(!orders.is_empty());
+    assert!(orders.iter().all(|(order, _)| !order.contains(&wid(4))), "{orders:?}");
+    assert_eq!(back.state.windows[&wid(4)].workspace, WorkspaceId(1));
+}
+
+#[test]
 fn closing_an_attached_window_leaves_focus_to_its_root() {
     // w6 hangs off w4 (an omnibox popup, a find bar). When it is dismissed
     // the app keys w4 again by itself, so there is nothing to hand on.

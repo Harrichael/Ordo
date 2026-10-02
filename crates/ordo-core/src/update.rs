@@ -236,11 +236,15 @@ fn desired_stack(s: &State) -> Vec<WindowId> {
         return Vec::new();
     };
     let proj = s.declared_projection();
+    // A window floating above the ordinary layer (the screenshot tool's
+    // window is layer 3) is above every ordinary one whatever is raised, and
+    // the worker, reading only layer 0, would wait for it on every restack.
     s.focus_history
         .iter()
         .filter(|w| {
             s.declared_workspace_of(*w) == Some(here)
                 && s.declared_vmonitor_of(*w).is_some_and(|m| proj.is_hosted(m))
+                && s.windows.get(w).is_some_and(|r| r.layer == 0)
         })
         .collect()
 }

@@ -110,6 +110,12 @@ pub trait Desktop {
     /// it doesn't answer.
     fn app_hidden(&self, pid: Pid) -> Option<bool>;
 
+    /// Whether Ordo may hide this app. A background app (no Dock icon) whose
+    /// windows Ordo manages may not: nothing would show it again, rescue
+    /// included, if Ordo stopped while it was hidden. Its windows are parked
+    /// all the same.
+    fn can_hide(&self, pid: Pid) -> bool;
+
     /// On-screen windows front to back, per the window server. A hidden
     /// app's windows are not in it.
     fn stack(&self) -> Vec<WindowId>;

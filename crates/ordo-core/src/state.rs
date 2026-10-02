@@ -63,6 +63,10 @@ pub struct WindowRecord {
     /// per the window server. See [`State::root_of`].
     #[serde(default)]
     pub parent: Option<WindowId>,
+    /// OBSERVED: the window server's layer, 0 for ordinary windows. Only
+    /// windows on one layer overlap each other in the stack.
+    #[serde(default)]
+    pub layer: i32,
     /// Placement correctives issued without the world staying put, damped per
     /// axis: workspace assignment and on-screen frame are independent fights
     /// (a new window can be wrong on both at once), so a single counter would

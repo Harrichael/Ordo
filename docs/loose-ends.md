@@ -109,6 +109,7 @@ Run 21: every press was a full switch, because the engine keeps up with presses 
 
 - **Startup "re-parks" that move nothing.** 10–14 per restart, `Reassert` rows with observed == requested; every restart on 2026-09-28/29 had them. The at-park check disagrees with an exact park position right after launch. Harmless but noisy.
 - **`docs/desired-state-reconciler.md` still orders its plan with Focus first.** Before anything there is built, it should adopt the rule that the stacking worker makes the top key before the other raises (9d93a0f).
+- **The restack conflates the top window with the key window.** `RestackWindows { focus_top }` takes focus back only for `order[0]`. A floating declared focus (the screenshot window, layer 3) is left out of the order, so the worker never takes focus back to it after an un-hide; `enforce_focus` re-grants it on the next look instead, damped. The fix is `focus: Option<WindowId>` on the effect, taken back whether or not it is in the order: one line in the worker's take-back.
 - **Shutdown takes up to 2s.** After SIGINT, the periodic-rescan thread only sends `Msg::Shutdown` between sleeps (`main.rs`, `period` = the rescan interval), so hotkeys keep being handled meanwhile. A restart during a burst saw 8 switches land after the signal.
 
 ## 9. Windows the scans miss, and holds on windows that aren't there

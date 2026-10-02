@@ -27,7 +27,7 @@ use std::ffi::c_void;
 use std::ptr::NonNull;
 
 use crossbeam_channel::Sender;
-use objc2_app_kit::{NSApplicationActivationPolicy, NSWorkspace};
+use objc2_app_kit::NSWorkspace;
 use objc2_application_services::{AXError, AXObserver, AXUIElement};
 use objc2_core_foundation::{kCFRunLoopDefaultMode, CFRetained, CFRunLoop, CFString};
 use ordo_core::{AxHintKind, Pid, RescanTrigger};
@@ -105,7 +105,7 @@ fn attach_new(
 ) {
     let apps = NSWorkspace::sharedWorkspace().runningApplications();
     for app in apps.iter() {
-        if app.activationPolicy() != NSApplicationActivationPolicy::Regular {
+        if !super::ax::managed(&app) {
             continue;
         }
         let pid = app.processIdentifier();

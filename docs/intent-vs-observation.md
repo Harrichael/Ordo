@@ -241,6 +241,15 @@ by 500ms, so any "recent input" rule would have blessed it.
    on the display would otherwise arm a follow. The tap prints its first 20
    Dock clicks and first 20 refusals per run to stderr. A menu bar click
    (`Gesture::MenuBar`) licenses no follow.
+   Ordo manages the windows of regular apps (those with a Dock icon) and of
+   a short named list of background apps whose windows the user works in like
+   any app's: today the screenshot tool (`MANAGED_BACKGROUND_APPS` in
+   `ax.rs`). It is a list because nothing a window reports tells the
+   screenshot window (an `AXSystemDialog` at layer 3) from a launcher's panel
+   or a menu-bar popover; which one the user works in is the user's word. Such
+   an app is parked like any other but never hidden: no Dock icon would show
+   it again, rescue included. Its window floats above layer 0, so the restack
+   leaves it out.
 3. NO gesture: the declaration stands. A focus change contradicting
    `Window(w)` is a violation, re-asserted under `DAMPING_LIMIT` exactly like
    a parked frame. Because this is the default, a fling cause nobody has

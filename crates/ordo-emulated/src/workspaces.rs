@@ -1541,11 +1541,14 @@ impl EmulatedWorkspaces {
                 p != pid || !self.ledger.visible(*w, &proj) || !listed.contains(w)
             })
         };
+        // An app Ordo never hides needs no showing; its windows may float
+        // above the layer the window server's list is read at, which would
+        // read as a hide nobody announced.
         let (shows, showing): (Vec<Pid>, Vec<Pid>) = here_by_app
             .into_iter()
             .filter(|(_, here)| *here)
             .map(|(pid, _)| pid)
-            .partition(|pid| hidden.contains(pid) || unlisted(pid));
+            .partition(|pid| d.can_hide(*pid) && (hidden.contains(pid) || unlisted(pid)));
         // Any other app is showing, and nothing un-hidden needs holding.
         for pid in showing {
             self.note(
@@ -1599,7 +1602,11 @@ impl EmulatedWorkspaces {
         let focused_app = d.frontmost_app();
         let hidden = self.hidden_apps(d, frames).clone();
         for (pid, has_window_here) in here_by_app {
-            if has_window_here || Some(pid) == focused_app || hidden.contains(&pid) {
+            if has_window_here
+                || Some(pid) == focused_app
+                || hidden.contains(&pid)
+                || !d.can_hide(pid)
+            {
                 continue;
             }
             let parked = elsewhere.get(&pid).map_or(0, |h| h.len());
@@ -2073,6 +2080,8 @@ mod tests {
         /// Times an app was asked whether it is hidden: a round trip to the
         /// app's main thread each, which a busy app is slow to answer.
         asked: std::cell::Cell<u32>,
+        /// Background apps whose windows are managed but which Ordo may not hide.
+        unhideable: std::cell::RefCell<HashSet<Pid>>,
         /// While set, moves wait in `queue` until `land_queued`, as the real
         /// port's writes wait on each app's thread; a queued window is in
         /// flight.
@@ -2096,6 +2105,7 @@ mod tests {
                 front: std::cell::Cell::new(None),
                 now: std::cell::Cell::new(Instant::now()),
                 asked: std::cell::Cell::new(0),
+                unhideable: std::cell::RefCell::new(HashSet::new()),
                 queueing: std::cell::Cell::new(false),
                 queue: std::cell::RefCell::new(Vec::new()),
             }
@@ -2285,6 +2295,10 @@ mod tests {
         fn app_hidden(&self, pid: Pid) -> Option<bool> {
             self.asked.set(self.asked.get() + 1);
             Some(self.hidden.borrow().contains(&pid))
+        }
+
+        fn can_hide(&self, pid: Pid) -> bool {
+            !self.unhideable.borrow().contains(&pid)
         }
 
         fn now(&self) -> Instant {
@@ -3544,6 +3558,35 @@ mod tests {
         d.settle(&mut b);
         assert!(d.is_hidden(Pid(10)));
         assert!(!d.is_hidden(Pid(30)), "the front app is spared");
+    }
+
+    /// The screenshot tool is a background app: no Dock icon would show it
+    /// again, so it is never hidden, nor sent an un-hide. Its window is parked
+    /// and brought back like any other.
+    #[test]
+    fn a_background_app_is_parked_but_never_hidden() {
+        let d = FakeDesktop::new(&[
+            (w(1), Pid(10), rect(100.0, 100.0)),
+            (w(4), Pid(40), rect(300.0, 300.0)),
+        ]);
+        d.unhideable.borrow_mut().insert(Pid(40));
+        let mut b = EmulatedWorkspaces::new(3);
+        rescan(&d, &mut b);
+        b.switch_workspace(&d, ws(2));
+        d.settle(&mut b);
+        assert!(in_park_corner(&d.frame(w(4)), &geo()));
+        assert!(d.is_hidden(Pid(10)));
+        assert!(!d.is_hidden(Pid(40)));
+        b.take_trace();
+
+        b.switch_workspace(&d, ws(1));
+        assert_eq!(d.frame(w(4)), rect(300.0, 300.0));
+        let unhid_40 = b.take_trace().iter().any(|t| {
+            t.kind == ParkTraceKind::AppShown
+                && t.pid == Some(Pid(40))
+                && t.detail.as_deref().is_some_and(|d| d.starts_with("un-hiding"))
+        });
+        assert!(!unhid_40);
     }
 
     /// A switch focuses the destination's window before it un-hides, and
