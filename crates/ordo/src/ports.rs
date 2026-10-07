@@ -9,7 +9,7 @@
 use std::time::Duration;
 
 use ordo_core::{Effect, OpOutcome, Pid, Rect, RescanTrigger, WindowId, WorldSnapshot};
-use ordo_emulated::ParkTrace;
+use ordo_emulated::{Hiding, ParkTrace};
 
 /// Where the engine sends a look at the screen it shouldn't take yet. An
 /// Accessibility read waits behind every write already sent to that app, so
@@ -94,6 +94,10 @@ pub trait Effector {
     /// An app was hidden or shown, by anyone; for the workspace backend,
     /// which alone decides what is hidden. Default no-op.
     fn note_app_visibility(&mut self, _pid: Pid, _hidden: bool) {}
+
+    /// The user's setting for when apps are hidden; for the workspace
+    /// backend. Default no-op.
+    fn set_hiding(&mut self, _hiding: Hiding) {}
 }
 
 /// One restack's timing breakdown. The point is the question it exists to

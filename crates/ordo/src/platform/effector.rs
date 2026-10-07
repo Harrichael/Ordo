@@ -62,6 +62,10 @@ impl Effector for MacEffector {
         self.backend.borrow_mut().note_app_visibility(pid, hidden);
     }
 
+    fn set_hiding(&mut self, hiding: ordo_emulated::Hiding) {
+        self.backend.borrow_mut().set_hiding(hiding);
+    }
+
     fn execute(&mut self, effect: &Effect) -> Option<OpOutcome> {
         // These change what is on screen, so the order in flight is stale
         // before the new one is submitted after them: left running, its
