@@ -183,6 +183,7 @@ fn world_view(
         windows: windows.iter().map(|w| w.snap.clone()).collect(),
         focused: focused.map(wid),
         unread: Vec::new(),
+        key_unmanaged: false,
         workspaces: WorkspaceSnap {
             monitors: monitors
                 .iter()
@@ -2373,6 +2374,40 @@ fn a_flip_that_outlasts_ordos_menu_is_held_as_ever() {
     let closed = update(&s, &gesture(Gesture::OwnMenu { open: false })).state;
     let held = update(&closed, &observed(vec![mon_a(1), mon_b(1)], wins, Some(2), RescanTrigger::Periodic));
     assert_eq!(focus_targets(&held.effects), vec![wid(1)]);
+}
+
+#[test]
+fn a_key_window_ordo_does_not_manage_is_left_alone() {
+    // Cmd+Shift+5 (a key press, so the declaration stands) brings up the
+    // screenshot tool's capture bar, which Ordo does not manage: focus reads
+    // as no window of the model, yet someone holds it. Taking it back for w1
+    // would front w1's app over the capture. When the capture ends and w1 is
+    // key again, nothing was fought and nothing recorded.
+    let wins = std_windows();
+    let mons = || vec![mon_a(1), mon_b(1)];
+    let s = update(&State::new(), &observed(mons(), wins.clone(), None, RescanTrigger::Startup)).state;
+    let s = used(&s, 1, mons(), wins.clone());
+    let s = used(&s, 3, mons(), wins.clone());
+    let s = update(&s, &hotkey(HotkeyAction::MruWorkspace)).state;
+    assert_eq!(s.focus_intent(), FocusIntent::Window(wid(1)));
+    let s = update(&s, &observed(mons(), wins.clone(), Some(1), RescanTrigger::Periodic)).state;
+    let s = update(&s, &gesture(Gesture::Key)).state;
+    let mut snap = world(&mons(), &wins, None);
+    snap.key_unmanaged = true;
+    let capturing = update(
+        &s,
+        &Event::WorldObserved {
+            at: ts(),
+            trigger: RescanTrigger::Periodic,
+            snap,
+        },
+    );
+    assert!(focus_targets(&capturing.effects).is_empty(), "{:?}", capturing.effects);
+    assert_eq!(capturing.state.focus_intent(), FocusIntent::Window(wid(1)));
+
+    let done = update(&capturing.state, &observed(mons(), wins, Some(1), RescanTrigger::Periodic));
+    assert!(focus_targets(&done.effects).is_empty());
+    assert_eq!(history(&done.state)[0], wid(1));
 }
 
 #[test]

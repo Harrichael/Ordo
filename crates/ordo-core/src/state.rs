@@ -232,6 +232,11 @@ pub struct State {
     /// which arrive as hotkeys, leave `menu_open` standing.
     #[serde(default)]
     pub(crate) own_menu: bool,
+    /// The last look found the key window to be one Ordo does not manage
+    /// (see `WorldSnapshot::key_unmanaged`): focus is held, by no window in
+    /// the model, and is neither recorded nor taken back.
+    #[serde(default)]
+    pub(crate) key_unmanaged: bool,
     /// The app that kept the key window when enforcement last stood down,
     /// while it still holds the slot. Retiring to `Deferred` alone does not
     /// end a standoff against a window on a HIDDEN workspace: the
@@ -302,6 +307,7 @@ impl State {
             unseen_landing: Landing::default(),
             menu_open: false,
             own_menu: false,
+            key_unmanaged: false,
             conceded: None,
             focus_history: FocusHistory::new(),
             misplaced_since: BTreeMap::new(),

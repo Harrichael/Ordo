@@ -130,8 +130,33 @@ impl Geometry {
     }
 
     /// The display holding a point, if any.
-    fn display_at(&self, p: Point) -> Option<Rect> {
-        self.displays.iter().copied().find(|d| d.contains(p))
+    /// The display holding the largest share of `f`, by area; none if it
+    /// overlaps none. Not the one under its centre: a window the user hung
+    /// off a display's bottom edge has its centre on no display, and was
+    /// taken for one made on another display and clamped back in (run 58).
+    fn display_of(&self, f: &Rect) -> Option<Rect> {
+        self.displays
+            .iter()
+            .copied()
+            .map(|d| (overlap(&d, f), d))
+            .filter(|(a, _)| *a > 0.0)
+            .max_by(|a, b| a.0.total_cmp(&b.0))
+            .map(|(_, d)| d)
+    }
+
+    fn display_index_of(&self, f: &Rect) -> Option<usize> {
+        let d = self.display_of(f)?;
+        self.displays.iter().position(|x| *x == d)
+    }
+}
+
+fn overlap(a: &Rect, b: &Rect) -> f64 {
+    let w = (a.x + a.w).min(b.x + b.w) - a.x.max(b.x);
+    let h = (a.y + a.h).min(b.y + b.h) - a.y.max(b.y);
+    if w > 0.0 && h > 0.0 {
+        w * h
+    } else {
+        0.0
     }
 }
 
@@ -355,7 +380,7 @@ impl EmulatedWorkspaces {
         let adopt = |id: WindowId| {
             frames
                 .get(&id)
-                .and_then(|(_, f)| g.displays.iter().position(|d| d.contains(f.center())))
+                .and_then(|(_, f)| g.display_index_of(f))
                 .and_then(|i| proj.canonical_vm(i))
                 .unwrap_or(viewed)
         };
@@ -442,7 +467,7 @@ impl EmulatedWorkspaces {
                 None => self.saved.get(&id).copied(),
             };
             let Some(f) = standing else { continue };
-            let Some(i) = g.displays.iter().position(|d| d.contains(f.center())) else {
+            let Some(i) = g.display_index_of(&f) else {
                 continue;
             };
             if let Some(vm) = proj.canonical_vm(i) {
@@ -1153,7 +1178,7 @@ impl EmulatedWorkspaces {
             let Some(host) = self.host_rect(*w, g) else {
                 continue;
             };
-            let Some(hm) = self.home.get(w).copied().filter(|hm| host.contains(hm.center())) else {
+            let Some(hm) = self.home.get(w).copied().filter(|hm| g.display_of(hm) == Some(host)) else {
                 continue;
             };
             if same_position(f, &hm) {
@@ -1425,18 +1450,18 @@ impl EmulatedWorkspaces {
                         .home
                         .get(&window)
                         .copied()
-                        .filter(|hm| h.contains(hm.center()) && !same_position(hm, &s));
+                        .filter(|hm| g.display_of(hm) == Some(h) && !same_position(hm, &s));
                     match home {
                         Some(hm) => {
                             let want = Rect { x: hm.x, y: hm.y, ..s };
                             self.saved.insert(window, want);
                             (ParkTraceKind::Rehost, want)
                         }
-                        None if h.contains(s.center()) => (ParkTraceKind::Restore, s),
+                        None if g.display_of(&s) == Some(h) => (ParkTraceKind::Restore, s),
                         None => self.carry_over(window, s, h, g),
                     }
                 }
-                Some(h) if h.contains(s.center()) => (ParkTraceKind::Restore, s),
+                Some(h) if g.display_of(&s) == Some(h) => (ParkTraceKind::Restore, s),
                 Some(h) => self.carry_over(window, s, h, g),
                 None => (ParkTraceKind::Restore, s),
             },
@@ -1470,11 +1495,11 @@ impl EmulatedWorkspaces {
     ) -> Option<(Pid, WindowId, Rect)> {
         let (pid, f) = frames.get(&window).copied()?;
         let host = self.host_rect(window, g)?;
-        if host.contains(f.center()) {
+        if g.display_of(&f) == Some(host) {
             return None;
         }
-        let home = self.home.get(&window).filter(|hm| host.contains(hm.center()));
-        let want = match (home, g.display_at(f.center())) {
+        let home = self.home.get(&window).filter(|hm| g.display_of(hm) == Some(host));
+        let want = match (home, g.display_of(&f)) {
             (Some(hm), _) => Rect { x: hm.x, y: hm.y, ..f },
             (None, Some(from)) => {
                 let t = f.translate_between(&from, &host);
@@ -1498,8 +1523,8 @@ impl EmulatedWorkspaces {
         host: Rect,
         g: &Geometry,
     ) -> (ParkTraceKind, Rect) {
-        let home = self.home.get(&window).filter(|hm| host.contains(hm.center()));
-        let want = match (home, g.display_at(s.center())) {
+        let home = self.home.get(&window).filter(|hm| g.display_of(hm) == Some(host));
+        let want = match (home, g.display_of(&s)) {
             (Some(hm), _) => Rect { x: hm.x, y: hm.y, ..s },
             (None, Some(from)) => {
                 let t = s.translate_between(&from, &host);
@@ -1854,21 +1879,19 @@ fn in_park_corner(f: &Rect, g: &Geometry) -> bool {
     if near(f.x, g.park_host.x - f.w + SLIVER) {
         return true;
     }
-    // The retired corners, all bottom-flush: the rightmost display's bottom
-    // right (through 2026-09-02), the main display's right edge, and — briefly,
-    // on 2026-09-01 — right-aligned inside the main display. y confines the
-    // window's TOP edge to the bottom CLAMP_SLACK points of the display, where
-    // it shows less than a title bar's worth of itself.
+    // The retired corners, both bottom-flush: the rightmost display's bottom
+    // right (through 2026-09-02), and the main display's right edge. y confines
+    // the window's TOP edge to the bottom CLAMP_SLACK points of the display,
+    // where it shows less than a title bar's worth of itself. (The one used
+    // briefly on 2026-09-01, right-aligned INSIDE the main display, is no
+    // longer recognized: a wide window dragged flush right and low lands
+    // exactly there, and was taken for parked, run 58.)
     let retired = [
         (
             g.legacy_host.x + g.legacy_host.w - SLIVER,
             g.legacy_host.y + g.legacy_host.h - SLIVER,
         ),
         (g.main.x + g.main.w - SLIVER, g.main.y + g.main.h - SLIVER),
-        (
-            (g.main.x + g.main.w - f.w).max(g.main.x),
-            g.main.y + g.main.h - SLIVER,
-        ),
     ];
     retired
         .iter()
@@ -2633,14 +2656,6 @@ mod tests {
     fn park_never_captures_a_sliver_as_the_saved_frame() {
         let mut b = EmulatedWorkspaces::new(3);
         let sliver = park_frame(rect(100.0, 100.0), &geo());
-        // The deepest clamp measured in production (124pt): still an artifact,
-        // and beyond any title-bar-sized guess.
-        let deep = Rect {
-            x: MAIN.w - 800.0,
-            y: MAIN.h - 124.0,
-            w: 800.0,
-            h: 600.0,
-        };
         // The pre-right-aligned corner, as restarts still find on disk-era
         // windows: x at the display edge, the body hanging past it.
         let legacy = Rect {
@@ -2661,16 +2676,15 @@ mod tests {
         let frames: HashMap<WindowId, (Pid, Rect)> = [
             (w(1), (Pid(42), sliver)),
             (w(2), (Pid(42), rect(50.0, 60.0))),
-            (w(3), (Pid(42), deep)),
             (w(4), (Pid(42), legacy)),
             (w(5), (Pid(42), retired_right)),
         ]
         .into();
 
-        // A window already at a park artifact — the current corner, a deep
-        // clamp, or either retired corner: bookkept as parked, but its
-        // (unknown) real frame is never fabricated from the artifact.
-        for id in [w(1), w(3), w(4), w(5)] {
+        // A window already at a park artifact — the current corner or either
+        // retired corner: bookkept as parked, but its (unknown) real frame is
+        // never fabricated from the artifact.
+        for id in [w(1), w(4), w(5)] {
             assert_eq!(b.park(id, None, &frames, &geo(), false), None, "{id:?}");
             assert!(b.parked.contains(&id));
             assert!(!b.saved.contains_key(&id), "{id:?} captured an artifact");
@@ -2680,6 +2694,35 @@ mod tests {
         let write = b.park(w(2), None, &frames, &geo(), false).unwrap();
         assert_eq!(b.saved[&w(2)], rect(50.0, 60.0));
         assert_eq!(write.2, park_frame(rect(50.0, 60.0), &geo()));
+    }
+
+    /// A window the user drags low, hanging off its display's bottom edge, is
+    /// put back exactly there after a round trip (run 58: the screenshot
+    /// window, 486 tall, was clamped back up, and dragged flush right as well
+    /// it was taken for parked and put back where it had been before).
+    #[test]
+    fn a_window_hung_off_the_bottom_edge_comes_back_where_the_user_left_it() {
+        let low_right = Rect {
+            x: MAIN.w - 1560.0,
+            y: MAIN.h - 86.0,
+            w: 1560.0,
+            h: 486.0,
+        };
+        let low_left = Rect {
+            x: 316.0,
+            y: 941.0,
+            w: 1560.0,
+            h: 486.0,
+        };
+        for spot in [low_right, low_left] {
+            let d = FakeDesktop::new(&[(w(1), Pid(10), rect(100.0, 100.0)), (w(4), Pid(40), spot)]);
+            let mut b = EmulatedWorkspaces::new(3);
+            rescan(&d, &mut b);
+            b.switch_workspace(&d, ws(2));
+            assert!(in_park_corner(&d.frame(w(4)), &geo()));
+            b.switch_workspace(&d, ws(1));
+            assert_eq!(d.frame(w(4)), spot);
+        }
     }
 
     /// The park request must clear every display: an earlier corner

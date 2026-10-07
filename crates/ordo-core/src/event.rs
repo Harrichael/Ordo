@@ -268,6 +268,12 @@ pub struct WorldSnapshot {
     /// not listed here is one the window server agrees is gone.
     #[serde(default)]
     pub unread: Vec<WindowId>,
+    /// The key window is one Ordo does not manage (the screenshot tool's
+    /// capture bar, mid-capture), so `focused` is `None` though focus is not
+    /// in a vacuum: someone holds it, and nothing is to be taken back from
+    /// them.
+    #[serde(default)]
+    pub key_unmanaged: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

@@ -73,8 +73,9 @@ pub enum ParkTraceKind {
     /// leave behind for the stacking worker to repair.
     Stack,
     /// A window its app's scan missed, kept because the window server still
-    /// lists it: when that began, whether it turned ghost (kept while its
-    /// app answers for longer than a dropped read lasts), and when it ended.
+    /// shows it on screen (or its app is hidden or didn't answer): when that
+    /// began, whether it turned ghost (on screen, unlisted by an app that
+    /// answers, for longer than a dropped read lasts), and when it ended.
     Unread,
 }
 

@@ -48,6 +48,15 @@ pub unsafe fn dict_get(d: sys::CFDictionaryRef, key: &str) -> *const c_void {
     value
 }
 
+/// Read a CFBoolean. Returns None if the pointer isn't a CFBoolean.
+pub unsafe fn boolean(b: *const c_void) -> Option<bool> {
+    use objc2_core_foundation::{CFBoolean, ConcreteType};
+    if b.is_null() || sys::CFGetTypeID(b) != CFBoolean::type_id() {
+        return None;
+    }
+    Some((*(b as *const CFBoolean)).value())
+}
+
 /// Read a CFNumber as i64. Returns None if the pointer isn't a CFNumber.
 pub unsafe fn number_i64(n: *const c_void) -> Option<i64> {
     if n.is_null() || sys::CFGetTypeID(n) != sys::CFNumberGetTypeID() {

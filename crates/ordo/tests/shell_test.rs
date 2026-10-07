@@ -124,6 +124,7 @@ impl FakeOs {
             windows: self.windows.clone(),
             focused: self.focused,
             unread: Vec::new(),
+            key_unmanaged: false,
         }
     }
 }
@@ -335,6 +336,7 @@ fn snap(focused: Option<u32>, a_ws: u8, b_ws: u8) -> WorldSnapshot {
         windows: vec![win(1, 100, 100.0), win(2, 200, 2000.0), win(3, 100, 600.0)],
         focused: focused.map(WindowId),
         unread: Vec::new(),
+        key_unmanaged: false,
         workspaces: WorkspaceSnap {
             monitors: [
                 (

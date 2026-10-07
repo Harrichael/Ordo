@@ -44,6 +44,9 @@ pub struct AxWindow {
     /// Logged first so the classifier is chosen against what apps actually
     /// report rather than what the conventions say they should.
     pub subrole: Option<String>,
+    /// Its app has a Dock icon; otherwise it is one of the named background
+    /// apps (see [`manages`]).
+    pub regular: bool,
 }
 
 pub struct AxScan {
@@ -104,17 +107,20 @@ pub fn windows() -> Vec<AxWindow> {
 fn walk() -> (Vec<AxWindow>, Walk) {
     let started = Instant::now();
     // AppKit objects stay on this thread; only plain data crosses.
-    let apps: Vec<(i32, Option<String>)> = NSWorkspace::sharedWorkspace()
+    let apps: Vec<(i32, Option<String>, bool)> = NSWorkspace::sharedWorkspace()
         .runningApplications()
         .iter()
         .filter(|a| managed(a))
-        .map(|a| (a.processIdentifier(), a.bundleIdentifier().map(|b| b.to_string())))
-        .filter(|(pid, _)| *pid > 0)
+        .map(|a| {
+            let regular = a.activationPolicy() == NSApplicationActivationPolicy::Regular;
+            (a.processIdentifier(), a.bundleIdentifier().map(|b| b.to_string()), regular)
+        })
+        .filter(|(pid, _, _)| *pid > 0)
         .collect();
     let per_app: Vec<(Vec<AxWindow>, Duration, Listing)> = std::thread::scope(|scope| {
         let handles: Vec<_> = apps
             .iter()
-            .map(|(pid, bundle_id)| scope.spawn(move || app_windows(*pid, bundle_id)))
+            .map(|(pid, bundle_id, regular)| scope.spawn(move || app_windows(*pid, bundle_id, *regular)))
             .collect();
         handles
             .into_iter()
@@ -128,12 +134,12 @@ fn walk() -> (Vec<AxWindow>, Walk) {
         .iter()
         .zip(&per_app)
         .max_by_key(|(_, (_, took, _))| *took)
-        .map(|((pid, _), (_, took, _))| (Pid(*pid), *took));
+        .map(|((pid, _, _), (_, took, _))| (Pid(*pid), *took));
     let listed = |how: Listing| -> Vec<Pid> {
         apps.iter()
             .zip(&per_app)
             .filter(|(_, (_, _, listing))| *listing == how)
-            .map(|((pid, _), _)| Pid(*pid))
+            .map(|((pid, _, _), _)| Pid(*pid))
             .collect()
     };
     let refused = listed(Listing::Refused);
@@ -150,7 +156,7 @@ fn walk() -> (Vec<AxWindow>, Walk) {
 }
 
 /// The app's windows, how long asking took, and how it answered.
-fn app_windows(pid: i32, bundle_id: &Option<String>) -> (Vec<AxWindow>, Duration, Listing) {
+fn app_windows(pid: i32, bundle_id: &Option<String>, regular: bool) -> (Vec<AxWindow>, Duration, Listing) {
     let started = Instant::now();
     let mut windows = Vec::new();
     let el = unsafe { AXUIElement::new_application(pid) };
@@ -173,7 +179,7 @@ fn app_windows(pid: i32, bundle_id: &Option<String>) -> (Vec<AxWindow>, Duration
                 if win.is_null() {
                     continue;
                 }
-                if let Some(w) = read_window(win, Pid(pid), bundle_id.clone()) {
+                if let Some(w) = read_window(win, Pid(pid), bundle_id.clone(), regular) {
                     windows.push(w);
                 }
             }
@@ -183,7 +189,12 @@ fn app_windows(pid: i32, bundle_id: &Option<String>) -> (Vec<AxWindow>, Duration
     (windows, started.elapsed(), listing)
 }
 
-fn read_window(win: *const AXUIElement, app: Pid, bundle_id: Option<String>) -> Option<AxWindow> {
+fn read_window(
+    win: *const AXUIElement,
+    app: Pid,
+    bundle_id: Option<String>,
+    regular: bool,
+) -> Option<AxWindow> {
     let id = window_id(win)?;
     let win_ref = unsafe { &*win };
     let pos = unsafe { copy_point(win_ref, "AXPosition", AXValueType::CGPoint) }?;
@@ -216,6 +227,7 @@ fn read_window(win: *const AXUIElement, app: Pid, bundle_id: Option<String>) -> 
             h: size.height,
         },
         subrole,
+        regular,
     })
 }
 
@@ -290,6 +302,19 @@ pub(crate) fn managed(app: &NSRunningApplication) -> bool {
         app.activationPolicy() == NSApplicationActivationPolicy::Regular,
         bundle.as_deref(),
     )
+}
+
+/// NSFloatingWindowLevel: the screenshot window, utility panels. Capture UI
+/// and overlays sit higher.
+const FLOATING_LAYER: i32 = 3;
+
+/// Whether Ordo manages a window it has been told about: a regular app's at
+/// any layer, a background app's only at an ordinary one. The screenshot
+/// tool's own window floats at layer 3 and is worked in like an app window;
+/// its capture bar (layer 1499) and crop overlay (layer 24) are the capture
+/// in progress, and move with the user as one thing (run 56).
+pub fn admits(regular: bool, layer: Option<i32>) -> bool {
+    regular || layer.is_some_and(|l| l <= FLOATING_LAYER)
 }
 
 /// Whether the app has a Dock icon, so a hide can be undone from there.
@@ -1231,5 +1256,14 @@ mod tests {
         assert!(manages(false, Some("com.apple.screencaptureui")));
         assert!(!manages(false, Some("com.raycast.macos")));
         assert!(!manages(false, None));
+    }
+
+    #[test]
+    fn a_background_apps_window_is_managed_only_at_an_ordinary_layer() {
+        use super::admits;
+        assert!(admits(false, Some(3)), "the screenshot window");
+        assert!(!admits(false, Some(1499)), "its capture bar");
+        assert!(!admits(false, None), "a layer never learned");
+        assert!(admits(true, Some(1499)), "a regular app's panel, as before");
     }
 }

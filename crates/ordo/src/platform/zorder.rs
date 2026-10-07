@@ -147,7 +147,15 @@ pub fn stack_with_pids() -> Vec<(u32, i32)> {
 /// an existence question a filter can only manufacture false deaths, never
 /// remove a false alive. `None` when the read fails or comes back empty: an
 /// empty full list is a failed read, not a desktop with no windows.
-pub fn all_windows() -> Option<Vec<WindowId>> {
+/// A window in the window server's full list. `on_screen` is false for a
+/// window ordered out but still allocated (a closed Chrome window, the
+/// screenshot tool's spent capture bar) as for a hidden app's.
+pub struct Listed {
+    pub id: WindowId,
+    pub on_screen: bool,
+}
+
+pub fn all_windows() -> Option<Vec<Listed>> {
     let mut out = Vec::new();
     unsafe {
         let arr = CGWindowListCopyWindowInfo(EXCLUDE_DESKTOP, 0);
@@ -157,7 +165,10 @@ pub fn all_windows() -> Option<Vec<WindowId>> {
         for i in 0..cf::array_len(arr) {
             let d = cf::array_get(arr, i) as sys::CFDictionaryRef;
             if let Some(wid) = cf::number_i64(cf::dict_get(d, "kCGWindowNumber")) {
-                out.push(WindowId(wid as u32));
+                out.push(Listed {
+                    id: WindowId(wid as u32),
+                    on_screen: cf::boolean(cf::dict_get(d, "kCGWindowIsOnscreen")) == Some(true),
+                });
             }
         }
         sys::CFRelease(arr);

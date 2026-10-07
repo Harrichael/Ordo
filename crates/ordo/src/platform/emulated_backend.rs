@@ -105,7 +105,7 @@ impl Desktop for AxDesktop {
 
     fn existing_windows(&self, ids: &[WindowId]) -> Option<std::collections::HashSet<WindowId>> {
         let all = super::zorder::all_windows()?;
-        let all: std::collections::HashSet<WindowId> = all.into_iter().collect();
+        let all: std::collections::HashSet<WindowId> = all.into_iter().map(|l| l.id).collect();
         Some(ids.iter().filter(|w| all.contains(w)).copied().collect())
     }
 }

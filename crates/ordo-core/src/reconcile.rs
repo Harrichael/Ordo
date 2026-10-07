@@ -320,6 +320,7 @@ pub(crate) fn apply_snapshot(s: &mut State, snap: &WorldSnapshot) {
     // update decides when it is really gone (`keep_vanished_places`).
 
     s.focused = snap.focused.filter(|w| s.windows.contains_key(w));
+    s.key_unmanaged = snap.key_unmanaged;
 }
 
 /// The monitor whose frame contains the window's center; a window straddling

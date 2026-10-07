@@ -131,10 +131,10 @@ struct Unread {
     ghost: bool,
 }
 
-/// A window its app stops listing while the window server still has it, and
-/// while the app answers, may never come back: an app that orders a window
-/// out instead of closing it leaves it in the window server's list for good,
-/// and the core keeps it in the MRU order and on its workspace.
+/// A window its app stops listing, though it answers, while the window server
+/// still shows the window on screen, for longer than a dropped read lasts: an
+/// anomaly worth a line (see `still_there`, which no longer keeps a window
+/// that is merely still allocated).
 const GHOST_AFTER: Duration = Duration::from_secs(10);
 
 impl MacWorldSource {
@@ -253,6 +253,7 @@ impl WorldSource for MacWorldSource {
                 focused: None,
                 workspaces: WorkspaceSnap::default(),
                 unread: Vec::new(),
+                key_unmanaged: false,
             };
         }
         let started = Instant::now();
@@ -262,16 +263,40 @@ impl WorldSource for MacWorldSource {
             .map(|d| (d.id, d.frame, d.is_main))
             .collect();
 
-        let scan = ax::scan();
+        let mut scan = ax::scan();
+        // Facts first: a window's layer decides whether Ordo manages it.
+        let unseen: Vec<WindowId> = scan
+            .windows
+            .iter()
+            .map(|w| w.id)
+            .filter(|w| !self.facts.contains_key(w))
+            .collect();
+        if !unseen.is_empty() {
+            self.facts.extend(zorder::server_facts(&unseen));
+        }
+        self.facts.retain(|w, _| scan.windows.iter().any(|s| s.id == *w));
+        // Missed against everything the apps listed, so a window Ordo stops
+        // managing is not taken for one a read dropped.
         let missed: Vec<WindowId> = self
             .last_windows
             .keys()
             .filter(|w| !scan.windows.iter().any(|s| s.id == **w))
             .copied()
             .collect();
+        let facts = &self.facts;
+        let (admitted, refused): (Vec<_>, Vec<_>) = std::mem::take(&mut scan.windows)
+            .into_iter()
+            .partition(|w| ax::admits(w.regular, facts.get(&w.id).and_then(|f| f.layer)));
+        scan.windows = admitted;
+        let key_unmanaged = scan.focused.is_some_and(|f| refused.iter().any(|w| w.id == f));
+        if key_unmanaged {
+            scan.focused = None;
+        }
         let listed = (!missed.is_empty()).then(zorder::all_windows);
         let unlisted = matches!(listed, Some(None));
-        let alive = still_listed(&missed, listed.flatten());
+        let listed = listed.flatten();
+        let ids = listed.as_ref().map(|l| l.iter().map(|x| x.id).collect());
+        let alive = still_listed(&missed, ids);
         if is_blind(scan.windows.len(), &alive) {
             if !std::mem::replace(&mut self.blind, true) {
                 eprintln!(
@@ -289,14 +314,27 @@ impl WorldSource for MacWorldSource {
                 focused: None,
                 workspaces: WorkspaceSnap::default(),
                 unread: Vec::new(),
+                key_unmanaged: false,
             };
         }
         self.blind = false;
-        let unread = still_there(alive, unlisted, |w| {
-            self.last_windows
-                .get(w)
-                .is_some_and(|pid| scan.walk.unanswered.contains(pid))
-        });
+        let on_screen: Option<Vec<WindowId>> =
+            listed.map(|l| l.into_iter().filter(|x| x.on_screen).map(|x| x.id).collect());
+        let hidden = std::cell::RefCell::new(HashMap::<Pid, bool>::new());
+        let app_of = |w: &WindowId| self.last_windows.get(w).copied();
+        let unread = still_there(
+            alive,
+            on_screen.as_deref(),
+            |w| app_of(w).is_some_and(|pid| scan.walk.unanswered.contains(&pid)),
+            |w| {
+                app_of(w).is_some_and(|pid| {
+                    *hidden
+                        .borrow_mut()
+                        .entry(pid)
+                        .or_insert_with(|| ax::app_hidden(pid) == Some(true))
+                })
+            },
+        );
         let last_windows: HashMap<WindowId, Pid> = scan
             .windows
             .iter()
@@ -365,16 +403,6 @@ impl WorldSource for MacWorldSource {
             })
             .collect();
 
-        let unseen: Vec<WindowId> = scan
-            .windows
-            .iter()
-            .map(|w| w.id)
-            .filter(|w| !self.facts.contains_key(w))
-            .collect();
-        if !unseen.is_empty() {
-            self.facts.extend(zorder::server_facts(&unseen));
-        }
-        self.facts.retain(|w, _| frames.contains_key(w));
         let facts = &self.facts;
         let windows = scan
             .windows
@@ -438,6 +466,7 @@ impl WorldSource for MacWorldSource {
             focused: scan.focused,
             workspaces,
             unread,
+            key_unmanaged,
         }
     }
 
@@ -461,18 +490,29 @@ fn still_listed(windows: &[WindowId], listed: Option<Vec<WindowId>>) -> Vec<Wind
 
 /// Of the windows a scan missed that `still_listed` kept, those the core is
 /// told are still there (`WorldSnapshot::unread`), so that a window it is
-/// told closed is one the window server agrees is gone. An app's AX read
-/// drops a window now and then even when the app answers (run 45 seq 1969: a
-/// focused Slack window gone for one scan), and the core hands focus on when
-/// the focused window closes. Without the list there is no evidence either
-/// way, and only an app that didn't answer keeps its windows: one that keeps
-/// timing out must not keep its closed windows alive.
+/// told closed has really gone. An app's AX read drops a window now and then
+/// even when the app answers (run 45 seq 1969: a focused Slack window gone
+/// for one scan), and the core hands focus on when the focused window closes.
+/// Being listed is not enough: an app may order a window out and keep it
+/// (Chrome's closed windows, for seconds or for good; the screenshot tool's
+/// spent capture bar), and kept, a closed window was never handed on from.
+/// So a missed window stays only while it is on screen (a parked one is, at
+/// its corner), its app didn't answer, or its app is hidden, which takes its
+/// windows off screen too. Without the list only an unanswered app keeps its
+/// windows: one that keeps timing out must not keep its closed windows alive.
 fn still_there(
     alive: Vec<WindowId>,
-    unlisted: bool,
+    on_screen: Option<&[WindowId]>,
     unanswered: impl Fn(&WindowId) -> bool,
+    hidden: impl Fn(&WindowId) -> bool,
 ) -> Vec<WindowId> {
-    alive.into_iter().filter(|w| !unlisted || unanswered(w)).collect()
+    alive
+        .into_iter()
+        .filter(|w| match on_screen {
+            None => unanswered(w),
+            Some(on) => on.contains(w) || unanswered(w) || hidden(w),
+        })
+        .collect()
 }
 
 /// A scan in which no app listed a window, while windows the model holds are
@@ -501,14 +541,23 @@ mod tests {
     }
 
     #[test]
-    fn a_missed_window_is_still_there_while_the_window_server_lists_it() {
-        // a's app answered without it, b's app timed out, c is gone from the
-        // window server's list too.
-        let (a, b, c) = (WindowId(1), WindowId(2), WindowId(3));
-        let unanswered = |w: &WindowId| *w == b;
-        let alive = still_listed(&[a, b, c], Some(vec![a, b, WindowId(9)]));
-        assert_eq!(still_there(alive, false, unanswered), vec![a, b]);
+    fn a_missed_window_is_still_there_only_while_on_screen_or_its_app_cannot_say() {
+        // Every app answered without its window. a is on screen (a dropped
+        // read, or a parked window at its corner); b is ordered out but still
+        // allocated, as a closed Chrome window is; c's app is hidden; d's app
+        // timed out; e is gone from the list altogether.
+        let (a, b, c, d, e) = (WindowId(1), WindowId(2), WindowId(3), WindowId(4), WindowId(5));
+        let unanswered = |w: &WindowId| *w == d;
+        let hidden = |w: &WindowId| *w == c;
+        let alive = still_listed(&[a, b, c, d, e], Some(vec![a, b, c, d, WindowId(9)]));
+        assert_eq!(alive, vec![a, b, c, d]);
+        let on_screen = [a, WindowId(9)];
+        assert_eq!(still_there(alive, Some(&on_screen), unanswered, hidden), vec![a, c, d]);
         let alive = still_listed(&[a, b, c], None);
-        assert_eq!(still_there(alive, true, unanswered), vec![b], "no list, no evidence");
+        assert_eq!(
+            still_there(alive, None, unanswered, hidden),
+            Vec::<WindowId>::new(),
+            "no list, no evidence: only an unanswered app keeps its windows"
+        );
     }
 }

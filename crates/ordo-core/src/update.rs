@@ -1152,7 +1152,7 @@ fn handle_snapshot(
     // the close's fallout, even inside the second after the click that
     // closed it: where focus goes next is Ordo's to say.
     let hand_on = hand_on_from_close(pre, s, &deltas);
-    if hand_on.is_none() && !s.own_menu {
+    if hand_on.is_none() && !s.own_menu && !s.key_unmanaged {
         record_landing(s, trigger, now_ns, notes);
     }
     // A display came or went. Every window on the vanished display was just
@@ -1943,8 +1943,8 @@ fn enforce_focus(
     let Some(here) = s.current_workspace() else {
         return false;
     };
-    // See `State::own_menu`.
-    if s.own_menu {
+    // See `State::own_menu` and `State::key_unmanaged`.
+    if s.own_menu || s.key_unmanaged {
         return false;
     }
     // A window born without focus is awaited (see `Landing::awaited`), and
