@@ -2022,6 +2022,12 @@ fn enforce_focus(
     let Some(w) = s.focus_target() else {
         return false;
     };
+    // As vacuous as a declaration about a window absent from the model: the
+    // look didn't read it, and a grant to an app that isn't answering only
+    // queues behind it.
+    if s.windows[&w].unread {
+        return false;
+    }
     if s.focused == Some(w) {
         s.focus_corrections = 0;
         return false;

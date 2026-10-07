@@ -4904,6 +4904,100 @@ fn the_monitor_the_user_is_at_is_declared_not_read() {
     assert_eq!(away.declared_vmonitor(), Some(vm(1)));
 }
 
+/// At an unplug apps stop answering for seconds (run 59: about 20). A window
+/// whose app is silent, on the display that went away, is still in the
+/// window server's list: it stays in the model on its workspace and monitor,
+/// on the display that monitor is now shown on, with nothing written to it
+/// or re-declared off its stale frame. Focus declared on it is neither
+/// fought for nor given up while its app can't answer. It keeps its MRU
+/// place however long the silence lasts, and when its app answers it is no
+/// newborn.
+#[test]
+fn a_window_whose_app_is_silent_through_an_unplug_stays_in_the_model() {
+    // The user Ctrl+Alt+Tabbed to w2 (Slack, monitor 2), on the second display.
+    let jumped = update(&booted(&[3, 2, 1]), &hotkey(HotkeyAction::MruOtherMonitor)).state;
+    let s = update(
+        &jumped,
+        &observed(vec![mon_a(1), mon_b(1)], std_windows(), Some(2), RescanTrigger::Periodic),
+    )
+    .state;
+    assert_eq!(s.focus_intent(), FocusIntent::Window(wid(2)));
+    let wins = vec![
+        win(1, 100, 1, rect(100.0, 100.0)),
+        on_monitor(win(2, 200, 1, rect(2000.0, 100.0)), 2),
+        win(3, 100, 1, rect(600.0, 500.0)),
+    ];
+    // Unplugged: the laptop shows monitor 2, where the user is, and w2's
+    // app does not answer.
+    let silent = |at: Ts| {
+        let mut snap = world_view(laptop(2, true), &[mon_a(1)], &wins, None);
+        snap.windows.retain(|w| w.id != wid(2));
+        snap.unread = vec![wid(2)];
+        Event::WorldObserved {
+            at,
+            trigger: RescanTrigger::Periodic,
+            snap,
+        }
+    };
+    let start = ts();
+    let unplug = update(&s, &silent(start));
+    let kept = &unplug.state.windows[&wid(2)];
+    assert_eq!((kept.workspace, kept.vmonitor, kept.monitor), (ws(1), vm(2), mid(1)));
+    assert!(unplug.state.is_visible(kept));
+    let touches_w2 = |e: &Effect| match e {
+        Effect::SetWindowFrame { window, .. }
+        | Effect::AssignWindowToMonitor { window, .. }
+        | Effect::FocusWindow { window, .. } => *window == wid(2),
+        _ => false,
+    };
+    assert!(!unplug.effects.iter().any(touches_w2), "{:?}", unplug.effects);
+
+    // Had the laptop kept monitor 1, w2 would be hidden: kept all the same,
+    // on the display nearest where it was last seen.
+    let mut snap = world_view(laptop(1, true), &[mon_a(1)], &wins, None);
+    snap.windows.retain(|w| w.id != wid(2));
+    snap.unread = vec![wid(2)];
+    let elsewhere = update(&s, &Event::WorldObserved { at: start, trigger: RescanTrigger::Periodic, snap });
+    let hidden = &elsewhere.state.windows[&wid(2)];
+    assert_eq!(hidden.monitor, mid(1));
+    assert!(!elsewhere.state.is_visible(hidden));
+
+    let mut st = unplug.state;
+    for second in 1..=12 {
+        let step = update(&st, &silent(plus_ms(start, second * 1000)));
+        assert!(!step.effects.iter().any(touches_w2), "{:?}", step.effects);
+        assert!(!step
+            .notes
+            .iter()
+            .any(|n| matches!(n, Note::MonitorAdopted { .. } | Note::FocusDiverged { .. })));
+        st = step.state;
+    }
+    assert_eq!(st.focus_history.iter().collect::<Vec<_>>(), [wid(2), wid(1), wid(3)]);
+    assert_eq!(st.focus_intent(), FocusIntent::Window(wid(2)));
+
+    // The app answers; macOS had moved w2 onto the laptop.
+    let mut back = wins.clone();
+    back[1].snap.frame = rect(600.0, 100.0);
+    let answered = update(
+        &st,
+        &Event::WorldObserved {
+            at: plus_ms(start, 13_000),
+            trigger: RescanTrigger::Periodic,
+            snap: world_view(laptop(2, true), &[mon_a(1)], &back, None),
+        },
+    );
+    assert!(!answered
+        .notes
+        .iter()
+        .any(|n| matches!(n, Note::External { delta: Delta::WindowCreated(_) })));
+    assert_eq!(answered.state.windows[&wid(2)].frame, rect(600.0, 100.0));
+    assert_eq!(
+        answered.state.focus_history.iter().collect::<Vec<_>>(),
+        [wid(2), wid(1), wid(3)]
+    );
+    assert_eq!(answered.state.focus_intent(), FocusIntent::Window(wid(2)));
+}
+
 #[test]
 fn a_drag_across_live_displays_adopts_the_new_monitor_once() {
     let s = booted(&[1]);

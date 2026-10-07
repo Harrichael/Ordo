@@ -269,6 +269,7 @@ pub(crate) fn apply_snapshot(s: &mut State, snap: &WorldSnapshot) {
                 frame: w.frame,
                 parent: w.parent,
                 layer: w.layer.unwrap_or(0),
+                unread: false,
                 ws_corrections,
                 frame_corrections,
             },
@@ -292,28 +293,41 @@ pub(crate) fn apply_snapshot(s: &mut State, snap: &WorldSnapshot) {
         s.focus_history.remove(w);
     }
 
-    // A window the scan missed but the window server has is still there, on
-    // the displays still there. Where it belongs is the backend's word, which a scan that
+    // A window the scan missed but the window server has is still there,
+    // even off a display that is gone (an unplug is when apps stop
+    // answering). Where it belongs is the backend's word, which a scan that
     // missed it still carries: a carry must confirm on it, or the carry's
-    // retry would fight a window already where it was sent.
+    // retry would fight a window already where it was sent. Its display is
+    // the one it is believed on: the last seen while that exists, else where
+    // its declaration shows it, else nearest to where it was last seen;
+    // nothing may be corrected or adopted off this guess.
+    let proj = s.projection();
     for (id, mut r) in old_windows {
-        if snap.unread.contains(&id)
-            && !s.windows.contains_key(&id)
-            && s.monitors.contains_key(&r.monitor)
-        {
-            if let Some(ws) = snap.workspaces.assignments.get(&id) {
-                r.workspace = *ws;
-            }
-            if let Some(vm) = snap
-                .workspaces
-                .virtual_monitors
-                .as_ref()
-                .and_then(|word| word.assignments.get(&id))
-            {
-                r.vmonitor = *vm;
-            }
-            s.windows.insert(id, r);
+        if !snap.unread.contains(&id) || s.windows.contains_key(&id) {
+            continue;
         }
+        if let Some(ws) = snap.workspaces.assignments.get(&id) {
+            r.workspace = *ws;
+        }
+        if let Some(vm) = snap
+            .workspaces
+            .virtual_monitors
+            .as_ref()
+            .and_then(|word| word.assignments.get(&id))
+        {
+            r.vmonitor = *vm;
+        }
+        if !s.monitors.contains_key(&r.monitor) {
+            let Some(monitor) = s
+                .host_in(r.vmonitor, &proj)
+                .or_else(|| derive_monitor(&r.frame, &snap.monitors))
+            else {
+                continue;
+            };
+            r.monitor = monitor;
+        }
+        r.unread = true;
+        s.windows.insert(id, r);
     }
 
     // A window gone from this scan keeps its history entry for now; the

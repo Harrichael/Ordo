@@ -67,6 +67,11 @@ pub struct WindowRecord {
     /// windows on one layer overlap each other in the stack.
     #[serde(default)]
     pub layer: i32,
+    /// The last look didn't read this window (its app didn't answer, or
+    /// dropped it from its list) while the window server still has it: the
+    /// record is as last seen.
+    #[serde(default)]
+    pub unread: bool,
     /// Placement correctives issued without the world staying put, damped per
     /// axis: workspace assignment and on-screen frame are independent fights
     /// (a new window can be wrong on both at once), so a single counter would
