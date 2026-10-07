@@ -8,7 +8,9 @@
 
 use std::time::Duration;
 
-use ordo_core::{Effect, OpOutcome, Pid, Rect, RescanTrigger, WindowId, WorldSnapshot};
+use ordo_core::{
+    Effect, OpOutcome, Pid, Rect, RescanTrigger, VirtualMonitorId, WindowId, WorldSnapshot,
+};
 use ordo_emulated::{Hiding, ParkTrace};
 
 /// Where the engine sends a look at the screen it shouldn't take yet. An
@@ -31,8 +33,10 @@ pub trait LookGate {
 /// thread. External producers reach the engine through a channel instead.
 pub trait WorldSource {
     /// `Err` when the world can't be observed right now, which is not the
-    /// same as observing it empty.
-    fn snapshot(&mut self) -> Result<WorldSnapshot, Blind>;
+    /// same as observing it empty. `user_monitor` is the core's word on which
+    /// virtual monitor the user is at, for the backend (see
+    /// [`crate::backend::WorkspaceBackend::topology`]).
+    fn snapshot(&mut self, user_monitor: Option<VirtualMonitorId>) -> Result<WorldSnapshot, Blind>;
 
     /// Drain diagnostic records of the workspace mechanism from the snapshot
     /// just built. Telemetry, not record: the core never sees these and the

@@ -318,7 +318,7 @@ impl Engine {
     /// whatever actually changed.
     fn take_look(&mut self, trigger: &RescanTrigger) -> Option<WorldSnapshot> {
         let held = self.looked();
-        let snap = self.world.snapshot();
+        let snap = self.world.snapshot(self.state.declared_vmonitor());
         self.drain_park_trace();
         let cost = self.world.take_snapshot_stats().map(|c| SnapshotStats { held, ..c });
         match snap {

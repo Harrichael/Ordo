@@ -126,6 +126,7 @@ impl WorkspaceBackend for NativeBackend {
         &mut self,
         windows: &HashMap<WindowId, (Pid, Rect)>,
         monitors: &[(MonitorId, Rect, bool)],
+        _user_monitor: Option<ordo_core::VirtualMonitorId>,
     ) -> Result<BackendTopology> {
         let displays = skylight::managed_display_spaces(self.cid);
         let known: Vec<(MonitorId, bool)> = monitors.iter().map(|(id, _, m)| (*id, *m)).collect();

@@ -78,10 +78,15 @@ pub trait WorkspaceBackend {
     /// monitors onto the displays by position) and neither backend should
     /// re-enumerate them independently: a second walk of every app is a
     /// second wait on every app.
+    ///
+    /// `user_monitor` is the virtual monitor the core's declarations put the
+    /// user at (`ordo_core::State::declared_vmonitor`): a backend with a
+    /// virtual layer keeps it on screen when the display set changes.
     fn topology(
         &mut self,
         windows: &HashMap<WindowId, (Pid, Rect)>,
         monitors: &[(MonitorId, Rect, bool)],
+        user_monitor: Option<VirtualMonitorId>,
     ) -> Result<BackendTopology>;
 
     /// Bring every display to its `target`-th workspace. Blocking and

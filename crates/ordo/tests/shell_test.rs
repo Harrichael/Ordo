@@ -33,7 +33,7 @@ struct ScriptedWorld {
 }
 
 impl WorldSource for ScriptedWorld {
-    fn snapshot(&mut self) -> Result<WorldSnapshot, Blind> {
+    fn snapshot(&mut self, _: Option<VirtualMonitorId>) -> Result<WorldSnapshot, Blind> {
         let i = self.at.get().min(self.snaps.len() - 1);
         self.at.set(i + 1);
         Ok(self.snaps[i].clone())
@@ -132,7 +132,7 @@ impl FakeOs {
 struct FakeWorld(Rc<RefCell<FakeOs>>);
 
 impl WorldSource for FakeWorld {
-    fn snapshot(&mut self) -> Result<WorldSnapshot, Blind> {
+    fn snapshot(&mut self, _: Option<VirtualMonitorId>) -> Result<WorldSnapshot, Blind> {
         Ok(self.0.borrow().snapshot())
     }
 
@@ -1305,7 +1305,7 @@ struct LockingWorld {
 }
 
 impl WorldSource for LockingWorld {
-    fn snapshot(&mut self) -> Result<WorldSnapshot, Blind> {
+    fn snapshot(&mut self, _: Option<VirtualMonitorId>) -> Result<WorldSnapshot, Blind> {
         self.looks += 1;
         if self.looks > 1 {
             return Err(Blind::NoWindows);
@@ -1390,4 +1390,50 @@ fn a_look_that_leaves_no_event_is_still_on_record() {
     let report = replay(&conn, run_id, None).unwrap();
     assert!(report.is_clean(), "{:?}", report.mismatches);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A world that remembers which monitor each look was told the user is at.
+struct ListeningWorld {
+    os: Rc<RefCell<FakeOs>>,
+    told: Rc<RefCell<Vec<Option<VirtualMonitorId>>>>,
+}
+
+impl WorldSource for ListeningWorld {
+    fn snapshot(&mut self, user: Option<VirtualMonitorId>) -> Result<WorldSnapshot, Blind> {
+        self.told.borrow_mut().push(user);
+        Ok(self.os.borrow().snapshot())
+    }
+
+    fn take_park_trace(&mut self) -> Vec<ordo_emulated::ParkTrace> {
+        Vec::new()
+    }
+
+    fn take_snapshot_stats(&mut self) -> Option<SnapshotStats> {
+        None
+    }
+}
+
+/// Each look carries the core's word on which monitor the user is at, for
+/// the backend to keep on screen if the displays change under it. The user
+/// was last in w2, on monitor 2; when its app stops answering and the OS
+/// reports no focus, the look is still told monitor 2.
+#[test]
+fn each_look_is_told_where_ordo_declared_the_user_is() {
+    let os = fake_os(FocusPolicy::Lands);
+    os.borrow_mut().assignments.insert(WindowId(2), WorkspaceId(1));
+    os.borrow_mut().focused = Some(WindowId(2));
+    let told = Rc::new(RefCell::new(Vec::new()));
+    let mut engine = Engine::new(
+        in_memory_logger("emulated"),
+        Box::new(ListeningWorld {
+            os: os.clone(),
+            told: told.clone(),
+        }),
+        Box::new(FakeEffector(os.clone())),
+        Box::new(StepClock { n: Cell::new(0) }),
+    );
+    engine.observe(RescanTrigger::Startup);
+    os.borrow_mut().focused = None;
+    engine.observe(RescanTrigger::Periodic);
+    assert_eq!(*told.borrow(), [None, Some(VirtualMonitorId(2))]);
 }

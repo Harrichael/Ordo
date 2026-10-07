@@ -49,8 +49,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ordo_core::{
-    MonitorId, MonitorSnap, MonitorWs, Pid, Rect, WindowId, WindowSnap, WorkspaceSnap,
-    WorldSnapshot,
+    MonitorId, MonitorSnap, MonitorWs, Pid, Rect, VirtualMonitorId, WindowId, WindowSnap,
+    WorkspaceSnap, WorldSnapshot,
 };
 
 use ordo_emulated::{ParkTrace, ParkTraceKind};
@@ -257,7 +257,7 @@ fn timed<T>(f: impl FnOnce() -> T) -> (T, Duration) {
 }
 
 impl WorldSource for MacWorldSource {
-    fn snapshot(&mut self) -> Result<WorldSnapshot, Blind> {
+    fn snapshot(&mut self, user_monitor: Option<VirtualMonitorId>) -> Result<WorldSnapshot, Blind> {
         let started = Instant::now();
         // Reads the effector made since the last snapshot are not this one's.
         meter::take();
@@ -380,7 +380,7 @@ impl WorldSource for MacWorldSource {
         let (topo, topology_took) = timed(|| {
             self.backend
                 .borrow_mut()
-                .topology(&frames, &known)
+                .topology(&frames, &known, user_monitor)
                 .unwrap_or_default()
         });
         stats.topology = topology_took;

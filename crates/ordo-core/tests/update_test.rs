@@ -4873,6 +4873,37 @@ fn unplugging_never_adopts_the_windows_macos_rehomed() {
     assert!(later.effects.is_empty(), "{:?}", later.effects);
 }
 
+/// Where the user is, which the view keeps through an unplug, is what Ordo
+/// declared, never what a focus read answers: apps stop answering at an
+/// unplug, and in run 59 the read came back empty at 5 of 8 of them.
+#[test]
+fn the_monitor_the_user_is_at_is_declared_not_read() {
+    let quiet = |s: &State, focused| {
+        update(
+            s,
+            &observed(vec![mon_a(1), mon_b(1)], std_windows(), focused, RescanTrigger::Periodic),
+        )
+        .state
+    };
+
+    // A command declares w2, on monitor 2, and its app goes silent.
+    let s = booted(&[3, 2, 1]);
+    let jumped = update(&s, &hotkey(HotkeyAction::MruOtherMonitor)).state;
+    assert_eq!(quiet(&jumped, None).declared_vmonitor(), Some(vm(2)));
+
+    // With the slot the OS's, the click on w2 is where the user went; an app
+    // keying w1 with no input behind it is not.
+    let clicked = used(&booted(&[1]), 2, vec![mon_a(1), mon_b(1)], std_windows());
+    assert_eq!(clicked.focus_intent(), FocusIntent::Deferred);
+    assert_eq!(quiet(&clicked, None).declared_vmonitor(), Some(vm(2)));
+    assert_eq!(quiet(&clicked, Some(1)).declared_vmonitor(), Some(vm(2)));
+
+    // On an empty workspace the user is at the desktop the anchor shows.
+    let away = update(&booted(&[2]), &hotkey(HotkeyAction::WorkspaceNext)).state;
+    assert_eq!(away.focus_intent(), FocusIntent::Desktop);
+    assert_eq!(away.declared_vmonitor(), Some(vm(1)));
+}
+
 #[test]
 fn a_drag_across_live_displays_adopts_the_new_monitor_once() {
     let s = booted(&[1]);

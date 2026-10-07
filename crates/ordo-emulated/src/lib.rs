@@ -156,7 +156,6 @@ pub trait Desktop {
     /// this call's back — focusing a window of a hidden app un-hides it.
     fn show_apps(&self, apps: &[Unhide]);
 
-    fn focused_window(&self) -> Option<WindowId>;
     /// The active app, whether or not a window of it is key — Finder holding
     /// the desktop has none.
     fn frontmost_app(&self) -> Option<Pid>;

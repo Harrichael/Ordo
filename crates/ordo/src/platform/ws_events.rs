@@ -277,8 +277,11 @@ impl<W: WorldSource> SubscribingWorld<W> {
 }
 
 impl<W: WorldSource> WorldSource for SubscribingWorld<W> {
-    fn snapshot(&mut self) -> Result<ordo_core::WorldSnapshot, crate::ports::Blind> {
-        let snap = self.inner.snapshot()?;
+    fn snapshot(
+        &mut self,
+        user_monitor: Option<ordo_core::VirtualMonitorId>,
+    ) -> Result<ordo_core::WorldSnapshot, crate::ports::Blind> {
+        let snap = self.inner.snapshot(user_monitor)?;
         self.ws
             .subscribe(snap.windows.iter().map(|w| w.id.0).collect());
         Ok(snap)

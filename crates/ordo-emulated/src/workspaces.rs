@@ -336,12 +336,19 @@ impl EmulatedWorkspaces {
     /// it no longer exists; a failed CG read is not evidence either, and
     /// everything is kept.
     /// `windows` is the scan's own read — every window with its app and frame
-    /// — so nothing here walks the apps again.
-    pub fn note_scan(&mut self, d: &dyn Desktop, windows: &HashMap<WindowId, (Pid, Rect)>) {
+    /// — so nothing here walks the apps again. `user_monitor` is the virtual
+    /// monitor the core's declarations put the user at, which a change of
+    /// display set keeps on screen.
+    pub fn note_scan(
+        &mut self,
+        d: &dyn Desktop,
+        windows: &HashMap<WindowId, (Pid, Rect)>,
+        user_monitor: Option<VirtualMonitorId>,
+    ) {
         let g = Geometry::read(d);
         self.homecoming.clear();
         let known = self.ledger.physical() > 0;
-        let mut dirty = self.note_displays(d, &g);
+        let mut dirty = self.note_displays(&g, user_monitor);
         let replugged = dirty && known;
         if windows.is_empty() {
             self.replug_unseen |= replugged;
@@ -408,14 +415,18 @@ impl EmulatedWorkspaces {
 
     /// Learn the display set. A change is a change to the projection, so the
     /// view is decided here — BEFORE enforcement projects anything — by one
-    /// named policy: the view follows the focused window. A topology change is
-    /// systemic; without this the anchor stays where it was, the window the
-    /// user is typing into is parked, and the core's focus invariant then
-    /// yanks focus to whatever is left. Deciding it here also spares the
-    /// screen a park of the wrong set followed by its unpark a snapshot later.
-    /// The park/restore writes themselves belong to `enforce_placement`, which
-    /// runs only while Ordo is driving.
-    fn note_displays(&mut self, d: &dyn Desktop, g: &Geometry) -> bool {
+    /// named policy: the view keeps the monitor the user is at. A topology
+    /// change is systemic; without this the anchor stays where it was, the
+    /// window the user is typing into is parked, and the core's focus
+    /// invariant then yanks focus to whatever is left. Deciding it here also
+    /// spares the screen a park of the wrong set followed by its unpark a
+    /// snapshot later. The park/restore writes themselves belong to
+    /// `enforce_placement`, which runs only while Ordo is driving.
+    ///
+    /// Where the user is comes from the core's declarations, not a focus
+    /// read: apps stop answering for seconds at an unplug, so a read then is
+    /// as often empty as not.
+    fn note_displays(&mut self, g: &Geometry, user_monitor: Option<VirtualMonitorId>) -> bool {
         let physical = g.physical();
         // Displays asleep are not a rig with no monitors; nothing is learned.
         if physical == 0 || physical == self.ledger.physical() {
@@ -423,10 +434,8 @@ impl EmulatedWorkspaces {
         }
         let m = self.ledger.monitors();
         let after = project(m.count.max(physical as u8), m.viewed, m.enabled, physical);
-        if let Some(c) = d.focused_window().and_then(|w| self.ledger.claim(w)) {
-            if c.ws == self.ledger.current() && !after.is_hosted(c.monitor) {
-                self.ledger.set_viewed(c.monitor);
-            }
+        if let Some(vm) = user_monitor.filter(|vm| !after.is_hosted(*vm)) {
+            self.ledger.set_viewed(vm);
         }
         let plan = self.ledger.note_displays(physical);
         let current = self.ledger.current();
@@ -2443,10 +2452,6 @@ mod tests {
             }
         }
 
-        fn focused_window(&self) -> Option<WindowId> {
-            self.focused.get()
-        }
-
         fn frontmost_app(&self) -> Option<Pid> {
             self.front.get().or_else(|| {
                 let w = self.focused.get()?;
@@ -2483,7 +2488,7 @@ mod tests {
             (w(2), Pid(20), rect(300.0, 200.0)),
         ]);
         let mut b = EmulatedWorkspaces::new(3);
-        b.note_scan(&d, &d.scan());
+        b.note_scan(&d, &d.scan(), None);
 
         // Moving w2 to a hidden workspace parks it at the corner…
         b.move_window_to_workspace(&d, w(2), ws(2)).unwrap();
@@ -2516,7 +2521,7 @@ mod tests {
             (w(2), Pid(20), rect(300.0, 200.0)),
         ]);
         let mut b = EmulatedWorkspaces::new(3);
-        b.note_scan(&d, &d.scan());
+        b.note_scan(&d, &d.scan(), None);
         b.assign_window_to_workspace(w(2), ws(2)).unwrap();
         b.switch_workspace(&d, ws(2));
         d.yank_on_hide.set(true);
@@ -2542,7 +2547,7 @@ mod tests {
             (w(2), Pid(10), rect(300.0, 200.0)),
         ]);
         let mut b = EmulatedWorkspaces::new(3);
-        b.note_scan(&d, &d.scan());
+        b.note_scan(&d, &d.scan(), None);
         b.assign_window_to_workspace(w(2), ws(2)).unwrap();
         b.take_trace();
 
@@ -2602,7 +2607,7 @@ mod tests {
             (w(3), Pid(20), rect(500.0, 300.0)),
         ]);
         let mut b = EmulatedWorkspaces::new(3);
-        b.note_scan(&d, &d.scan());
+        b.note_scan(&d, &d.scan(), None);
         b.move_window_to_workspace(&d, w(1), ws(2)).unwrap();
         b.move_window_to_workspace(&d, w(2), ws(3)).unwrap();
         d.settle(&mut b);
@@ -2635,7 +2640,7 @@ mod tests {
     fn the_trace_records_the_park_the_snapshot_hides() {
         let d = FakeDesktop::new(&[(w(1), Pid(10), rect(100.0, 100.0))]);
         let mut b = EmulatedWorkspaces::new(3);
-        b.note_scan(&d, &d.scan());
+        b.note_scan(&d, &d.scan(), None);
         b.take_trace(); // discard adoption noise from the scan
 
         b.move_window_to_workspace(&d, w(1), ws(2)).unwrap();
@@ -2674,7 +2679,7 @@ mod tests {
             (w(2), Pid(20), rect(300.0, 200.0)),
         ]);
         let mut b = EmulatedWorkspaces::new(3);
-        b.note_scan(&d, &d.scan());
+        b.note_scan(&d, &d.scan(), None);
         b.move_window_to_workspace(&d, w(1), ws(2)).unwrap(); // parks w1
 
         let frames = d.scan();
@@ -2826,7 +2831,7 @@ mod tests {
         };
         let d = FakeDesktop::new(&[(w(1), Pid(10), tall), (w(2), Pid(20), rect(300.0, 200.0))]);
         let mut b = EmulatedWorkspaces::new(3);
-        b.note_scan(&d, &d.scan());
+        b.note_scan(&d, &d.scan(), None);
 
         b.move_window_to_workspace(&d, w(1), ws(2)).unwrap();
         for round in 1..=2 {
@@ -2865,7 +2870,7 @@ mod tests {
 
         let d = FakeDesktop::new(&[(w(1), Pid(10), over_tall)]);
         let mut b = EmulatedWorkspaces::new(3);
-        b.note_scan(&d, &d.scan());
+        b.note_scan(&d, &d.scan(), None);
         b.move_window_to_workspace(&d, w(1), ws(2)).unwrap();
         assert_eq!(d.frame(w(1)), want, "parked exactly, height and all");
         assert_eq!(
@@ -2902,7 +2907,7 @@ mod tests {
         };
         let d = FakeDesktop::new(&[(w(1), Pid(10), tall)]);
         let mut b = EmulatedWorkspaces::new(3);
-        b.note_scan(&d, &d.scan());
+        b.note_scan(&d, &d.scan(), None);
         b.move_window_to_workspace(&d, w(1), ws(2)).unwrap();
         let parked_at = d.frame(w(1));
 
@@ -2937,26 +2942,26 @@ mod tests {
             (w(2), Pid(20), rect(300.0, 200.0)),
         ]);
         let mut b = EmulatedWorkspaces::new(3);
-        b.note_scan(&d, &d.scan());
+        b.note_scan(&d, &d.scan(), None);
         b.move_window_to_workspace(&d, w(1), ws(3)).unwrap(); // parked
 
-        b.note_scan(&d, &d.scan_only(&[(w(2), Pid(20))])); // partial: w1 missing, alive
+        b.note_scan(&d, &d.scan_only(&[(w(2), Pid(20))]), None); // partial: w1 missing, alive
         assert_eq!(b.window_ws()[&w(1)], ws(3), "declaration kept");
         assert_eq!(b.saved[&w(1)], rect(100.0, 100.0), "promise kept");
 
         // Re-sighted next scan: same identity, nothing to adopt.
-        b.note_scan(&d, &d.scan());
+        b.note_scan(&d, &d.scan(), None);
         assert_eq!(b.window_ws()[&w(1)], ws(3));
 
         // A failed CG read is not evidence either.
         d.cg_down.set(true);
         d.close(w(1));
-        b.note_scan(&d, &d.scan_only(&[(w(2), Pid(20))]));
+        b.note_scan(&d, &d.scan_only(&[(w(2), Pid(20))]), None);
         assert_eq!(b.window_ws()[&w(1)], ws(3), "no evidence, no forgetting");
 
         // CG back up and the window really is gone: forgotten everywhere.
         d.cg_down.set(false);
-        b.note_scan(&d, &d.scan_only(&[(w(2), Pid(20))]));
+        b.note_scan(&d, &d.scan_only(&[(w(2), Pid(20))]), None);
         assert!(!b.window_ws().contains_key(&w(1)));
         assert!(!b.saved.contains_key(&w(1)));
         assert!(!b.parked.contains(&w(1)));
@@ -2969,12 +2974,12 @@ mod tests {
             (w(2), Pid(20), rect(300.0, 200.0)),
         ]);
         let mut b = EmulatedWorkspaces::new(3);
-        b.note_scan(&d, &d.scan());
+        b.note_scan(&d, &d.scan(), None);
         b.move_window_to_workspace(&d, w(1), ws(3)).unwrap(); // parked, saved
 
         // The id comes back in the same scan under a different app: it is a
         // NEW window on the current workspace, with no inherited teleport.
-        b.note_scan(&d, &d.scan_only(&[(w(1), Pid(99)), (w(2), Pid(20))]));
+        b.note_scan(&d, &d.scan_only(&[(w(1), Pid(99)), (w(2), Pid(20))]), None);
         assert_eq!(b.window_ws()[&w(1)], ws(1));
         assert!(!b.saved.contains_key(&w(1)));
         assert!(!b.parked.contains(&w(1)));
@@ -2991,7 +2996,7 @@ mod tests {
             (w(2), Pid(20), rect(300.0, 200.0)),
         ]);
         let mut b = EmulatedWorkspaces::new(3);
-        b.note_scan(&d, &d.scan());
+        b.note_scan(&d, &d.scan(), None);
 
         // Prologue: a workspace round trip leaves w1 with a lingering saved
         // promise (saved outlives parked), and the user then moves it. The
@@ -3026,7 +3031,7 @@ mod tests {
         // and the old parked-set walk could never see it.
         let d = FakeDesktop::new(&[(w(2), Pid(20), rect(300.0, 200.0))]);
         let mut b = EmulatedWorkspaces::new(3);
-        b.note_scan(&d, &d.scan());
+        b.note_scan(&d, &d.scan(), None);
         b.move_window_to_workspace(&d, w(1), ws(2)).unwrap(); // no frame yet
 
         // The window appears, visible on the wrong workspace.
@@ -3045,7 +3050,7 @@ mod tests {
             (w(2), Pid(20), rect(300.0, 200.0)),
         ]);
         let mut b = EmulatedWorkspaces::new(3);
-        b.note_scan(&d, &d.scan());
+        b.note_scan(&d, &d.scan(), None);
         b.move_window_to_workspace(&d, w(1), ws(2)).unwrap(); // parked
         let corner = d.frame(w(1)); // where the park write lands
 
@@ -3093,7 +3098,7 @@ mod tests {
             (w(2), Pid(20), rect(300.0, 200.0)),
         ]);
         let mut b = EmulatedWorkspaces::new(3);
-        b.note_scan(&d, &d.scan());
+        b.note_scan(&d, &d.scan(), None);
         b.move_window_to_workspace(&d, w(1), ws(2)).unwrap();
         b.take_trace();
 
@@ -3149,7 +3154,7 @@ mod tests {
             ]);
             d.pull.set(pull);
             let mut b = EmulatedWorkspaces::new(3);
-            b.note_scan(&d, &d.scan());
+            b.note_scan(&d, &d.scan(), None);
             b.move_window_to_workspace(&d, w(1), ws(2)).unwrap();
 
             let landed = d.frame(w(1));
@@ -3200,7 +3205,7 @@ mod tests {
             (w(2), Pid(20), rect(300.0, 200.0)),
         ]);
         let mut b = EmulatedWorkspaces::new(3);
-        b.note_scan(&d, &d.scan());
+        b.note_scan(&d, &d.scan(), None);
         b.move_window_to_workspace(&d, w(1), ws(2)).unwrap(); // sliver guard: no promise
         assert!(!b.saved.contains_key(&w(1)));
 
@@ -3260,7 +3265,7 @@ mod tests {
             (w(2), Pid(20), rect(300.0, 200.0)),
         ]);
         let mut b = EmulatedWorkspaces::new(3);
-        b.note_scan(&d, &d.scan());
+        b.note_scan(&d, &d.scan(), None);
         b.ledger.assign_window(w(1), ws(2));
         b.parked.insert(w(1));
         b.saved.insert(w(1), rect(100.0, 100.0));
@@ -3291,7 +3296,7 @@ mod tests {
     fn a_promise_that_is_itself_a_park_position_re_homes_instead_of_re_parking() {
         let d = FakeDesktop::new(&[(w(1), Pid(10), rect(100.0, 100.0))]);
         let mut b = EmulatedWorkspaces::new(3);
-        b.note_scan(&d, &d.scan());
+        b.note_scan(&d, &d.scan(), None);
         b.move_window_to_workspace(&d, w(1), ws(2)).unwrap();
 
         // Exactly the residue found in a live state.json: origin at the park
@@ -3391,7 +3396,7 @@ mod tests {
             (w(2), Pid(20), rect(2000.0, 100.0)),
         ]);
         let mut b = EmulatedWorkspaces::new(3);
-        b.note_scan(&d, &d.scan());
+        b.note_scan(&d, &d.scan(), None);
         assert_eq!(b.monitors().count, 2, "two displays, two monitors");
         assert_eq!(b.window_monitors()[&w(2)], vm(2), "adopted where it stands");
         (d, b)
@@ -3400,7 +3405,12 @@ mod tests {
     /// One rescan's worth of the shell: learn the displays, then assert the
     /// projection — what a plug event turns into once the world settles.
     fn rescan(d: &FakeDesktop, b: &mut EmulatedWorkspaces) {
-        b.note_scan(d, &d.scan());
+        rescan_at(d, b, None);
+    }
+
+    /// A rescan with the core's word on which monitor the user is at.
+    fn rescan_at(d: &FakeDesktop, b: &mut EmulatedWorkspaces, user: Option<VirtualMonitorId>) {
+        b.note_scan(d, &d.scan(), user);
         b.enforce_placement(d, &frames_of(d));
     }
 
@@ -3917,7 +3927,7 @@ mod tests {
 
         d.set_displays(&[MAIN, SECOND]);
         let stale = frames_of(&d);
-        b.note_scan(&d, &d.scan());
+        b.note_scan(&d, &d.scan(), None);
         b.enforce_placement(&d, &stale);
         assert_eq!(d.frame(w(1)), rect(100.0, 100.0), "left on screen, back home");
         assert_eq!(b.believed_frames(&d, &stale)[&w(1)], rect(100.0, 100.0));
@@ -3944,15 +3954,14 @@ mod tests {
         ]);
         let mut b = EmulatedWorkspaces::new(3);
         rescan(&d, &mut b);
-        d.focused.set(Some(w(2)));
         d.set_displays(&[MAIN]);
-        rescan(&d, &mut b);
+        rescan_at(&d, &mut b, Some(vm(2)));
         assert_eq!(b.monitors().viewed, vm(2));
         assert!(in_park_corner(&d.frame(w(1)), &geo()), "monitor 1 waits parked");
 
         d.set_displays(&[MAIN, SECOND]);
         let blind = HashMap::new();
-        b.note_scan(&d, &blind);
+        b.note_scan(&d, &blind, None);
         b.enforce_placement(&d, &blind);
         rescan(&d, &mut b);
 
@@ -3983,18 +3992,38 @@ mod tests {
         assert_eq!((f.w, f.h), (800.0, 600.0), "size is the window's own");
     }
 
-    /// A display change is systemic: the view follows the window the user is
-    /// in, rather than that window being parked because the anchor pointed
-    /// elsewhere.
+    /// A display change is systemic: the view keeps the monitor the core
+    /// says the user is at, rather than that monitor's windows being parked
+    /// because the anchor pointed elsewhere. Nothing here reads focus: at an
+    /// unplug the apps stop answering, and this desktop reports none.
     #[test]
-    fn the_view_follows_the_focused_window_through_an_unplug() {
+    fn the_view_follows_the_declared_monitor_through_an_unplug() {
         let (d, mut b) = rig();
-        d.focused.set(Some(w(2)));
         d.set_displays(&[MAIN]);
-        rescan(&d, &mut b);
+        rescan_at(&d, &mut b, Some(vm(2)));
         assert_eq!(b.monitors().viewed, vm(2));
         assert!(in_park_corner(&d.frame(w(1)), &geo()), "monitor 1 hidden instead");
         assert!(MAIN.contains(d.frame(w(2)).center()));
+    }
+
+    /// Run 59, 10-05: an undock left the anchor on monitor 2; docked again,
+    /// both monitors show whatever the anchor, and the user went back to
+    /// monitor 1. The next undock must show monitor 1, not the anchor an
+    /// earlier one left behind.
+    #[test]
+    fn an_anchor_left_by_an_earlier_undock_does_not_hide_the_user() {
+        let (d, mut b) = rig();
+        d.set_displays(&[MAIN]);
+        rescan_at(&d, &mut b, Some(vm(2)));
+        d.set_displays(&[MAIN, SECOND]);
+        rescan_at(&d, &mut b, Some(vm(1)));
+        assert_eq!(b.monitors().viewed, vm(2), "docked, the anchor changes nothing");
+
+        d.set_displays(&[MAIN]);
+        rescan_at(&d, &mut b, Some(vm(1)));
+        assert_eq!(b.monitors().viewed, vm(1));
+        assert_eq!(d.frame(w(1)), rect(100.0, 100.0), "the user's window stays put");
+        assert!(in_park_corner(&d.frame(w(2)), &geo()));
     }
 
     #[test]
@@ -4027,7 +4056,7 @@ mod tests {
             (w(2), Pid(20), rect(2000.0, 100.0)),
         ]);
         let mut b = EmulatedWorkspaces::with_persistence(3, path.clone());
-        b.note_scan(&d, &d.scan());
+        b.note_scan(&d, &d.scan(), None);
         d.set_displays(&[MAIN]);
         rescan(&d, &mut b);
         b.view_monitor(&d, vm(2)).unwrap();
@@ -4157,7 +4186,7 @@ mod tests {
         ]);
         d.set_displays(&[MAIN, SECOND, THIRD]);
         let mut b = EmulatedWorkspaces::new(3);
-        b.note_scan(&d, &d.scan());
+        b.note_scan(&d, &d.scan(), None);
         d.set_displays(&[MAIN, SECOND]);
         rescan(&d, &mut b);
         assert_eq!(b.monitors().count, 3);

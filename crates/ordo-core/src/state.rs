@@ -586,6 +586,26 @@ impl State {
             .or_else(|| self.virtual_monitors.map(|v| v.viewed))
     }
 
+    /// The virtual monitor Ordo's declarations put the user at, read from
+    /// intent alone: the declared window's monitor, else, while the OS owns
+    /// the slot, that of the most recent window in the MRU order on the
+    /// declared workspace; the anchor under a desktop declaration. Unlike
+    /// `focused_vmonitor`, never the observed focus, which an app that has
+    /// stopped answering reports as nothing. `None` when nothing declared
+    /// says, or there is no virtual layer.
+    pub fn declared_vmonitor(&self) -> Option<VirtualMonitorId> {
+        let v = self.virtual_monitors?;
+        if self.focus_intent == FocusIntent::Desktop {
+            return Some(v.viewed);
+        }
+        let here = self.declared_workspace()?;
+        let on_here = |w: &WindowId| self.declared_workspace_of(*w) == Some(here);
+        self.focus_target()
+            .filter(on_here)
+            .or_else(|| self.focus_history.iter().find(on_here))
+            .and_then(|w| self.declared_vmonitor_of(w))
+    }
+
     /// The display holding a point, else the nearest by center — the same
     /// rule reconcile uses to attribute a window to a display.
     pub fn display_holding(&self, p: Point) -> Option<&MonitorRecord> {

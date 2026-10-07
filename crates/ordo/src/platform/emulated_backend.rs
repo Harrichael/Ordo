@@ -76,10 +76,6 @@ impl Desktop for AxDesktop {
         }
     }
 
-    fn focused_window(&self) -> Option<WindowId> {
-        ax::focused_window()
-    }
-
     fn frontmost_app(&self) -> Option<Pid> {
         ax::frontmost_app()
     }
@@ -136,8 +132,9 @@ impl WorkspaceBackend for EmulatedBackend {
         &mut self,
         windows: &HashMap<WindowId, (Pid, Rect)>,
         monitors: &[(MonitorId, Rect, bool)],
+        user_monitor: Option<VirtualMonitorId>,
     ) -> Result<BackendTopology> {
-        self.model.note_scan(&self.desktop, windows);
+        self.model.note_scan(&self.desktop, windows, user_monitor);
         let mons = monitors
             .iter()
             .map(|(id, _, _)| MonitorWorkspace {
