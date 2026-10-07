@@ -27,7 +27,7 @@ use objc2::runtime::{Bool, ProtocolObject};
 use objc2::{define_class, msg_send, sel, AnyThread, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{
     NSAccessibility, NSAttributedStringNSStringDrawing, NSBezierPath, NSColor,
-    NSCompositingOperation, NSControlStateValueOff, NSControlStateValueOn, NSEventModifierFlags,
+    NSCompositingOperation, NSEventModifierFlags,
     NSFont, NSFontAttributeName, NSFontWeightBold, NSForegroundColorAttributeName,
     NSGraphicsContext, NSImage, NSMenu, NSMenuDelegate, NSMenuItem, NSRunningApplication,
     NSStatusBar, NSStatusItem, NSVariableStatusItemLength,
@@ -37,11 +37,12 @@ use objc2_foundation::{
     NSPoint, NSRect, NSSize, NSString,
 };
 
-use ordo_core::{Gesture, HotkeyAction};
+use ordo_core::{Gesture, HotkeyAction, Point, Rect};
 
 use crate::engine::Msg;
 use crate::menubar::{MenuBarView, MonitorsView};
 use crate::platform::monitor_map::MonitorMap;
+use crate::platform::settings::{saved_hiding, SettingsPanel};
 use crate::platform::workspace_list::{Row, WorkspaceList};
 
 /// Image height; the status bar centers it vertically.
@@ -77,26 +78,61 @@ struct Mailbox {
     own_menu: OwnMenu,
 }
 
-/// Whether Ordo's own menu is open, for the threads that must not read what
-/// happens in it as the user acting on the world: a click in it is a pick
-/// of Ordo's, which reaches the engine as a command if it asks for one.
+/// Whether Ordo's own menu or settings panel is open, for the threads that
+/// must not read what happens in them as the user acting on the world: a
+/// click in one is a pick of Ordo's, which reaches the engine as a command if
+/// it asks for one.
 #[derive(Clone, Default)]
-pub struct OwnMenu(Arc<AtomicBool>);
+pub struct OwnMenu(Arc<Surfaces>);
+
+#[derive(Default)]
+struct Surfaces {
+    menu: AtomicBool,
+    /// The panel's frame in CG coordinates, while it is shown.
+    panel: Mutex<Option<Rect>>,
+}
 
 impl OwnMenu {
     pub fn is_open(&self) -> bool {
-        self.0.load(Ordering::Relaxed)
+        self.0.menu.load(Ordering::Relaxed) || self.0.panel.lock().unwrap().is_some()
     }
 
-    fn set(&self, open: bool) {
-        self.0.store(open, Ordering::Relaxed);
+    /// Whether a click at `at` is one of Ordo's own. The open menu takes
+    /// every click, since macOS spends one outside it on closing it. The panel
+    /// takes only its own: a click outside closes it and also lands on
+    /// whatever is there, which is the user acting on the world.
+    pub fn takes(&self, at: Point) -> bool {
+        self.0.menu.load(Ordering::Relaxed)
+            || self.0.panel.lock().unwrap().is_some_and(|f| f.contains(at))
+    }
+
+    fn set_menu(&self, tx: &Sender<Msg>, open: bool) {
+        let before = self.is_open();
+        self.0.menu.store(open, Ordering::Relaxed);
+        self.changed(tx, before, "menu", open);
+    }
+
+    pub(crate) fn set_panel(&self, tx: &Sender<Msg>, frame: Option<Rect>) {
+        let before = self.is_open();
+        let open = frame.is_some();
+        *self.0.panel.lock().unwrap() = frame;
+        self.changed(tx, before, "settings", open);
+    }
+
+    /// The core hears only when Ordo's surfaces as a whole open or close: the
+    /// panel opens from the menu, and the two may overlap.
+    fn changed(&self, tx: &Sender<Msg>, before: bool, what: &str, open: bool) {
         let wall_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_millis());
         eprintln!(
-            "ordo: own menu {} at wall {wall_ms}",
+            "ordo: own {what} {} at wall {wall_ms}",
             if open { "opened" } else { "closed" }
         );
+        let after = self.is_open();
+        if after != before {
+            let _ = tx.send(Msg::Gesture(Gesture::OwnMenu { open: after }));
+        }
     }
 }
 
@@ -126,6 +162,7 @@ impl MenuBar {
 /// Nothing appears until the first view arrives: an item that showed a
 /// guess before the first snapshot would be the menu bar lying.
 pub fn install(tx: Sender<Msg>, own_menu: OwnMenu) -> MenuBar {
+    let _ = tx.send(Msg::Hiding(saved_hiding()));
     MenuBar {
         mailbox: Arc::new(Mailbox {
             latest: Mutex::new(None),
@@ -512,6 +549,7 @@ struct Ivars {
     /// Kept across rebuilds so a view change can slide the frame it drew.
     map: OnceCell<Retained<MonitorMap>>,
     list: OnceCell<Retained<WorkspaceList>>,
+    settings: OnceCell<Retained<SettingsPanel>>,
     open: Cell<bool>,
 }
 
@@ -526,9 +564,18 @@ define_class!(
 
     impl Controller {
         // SAFETY: the signature matches the action selector's.
-        #[unsafe(method(toggleDebug:))]
-        fn toggle_debug(&self, _sender: &NSMenuItem) {
-            crate::debug::set(!crate::debug::enabled());
+        #[unsafe(method(openSettings:))]
+        fn open_settings(&self, _sender: &NSMenuItem) {
+            // After the menu has finished closing: a popover shown while the
+            // menu still tracks is closed along with it.
+            DispatchQueue::main().exec_async(|| {
+                let mtm = MainThreadMarker::new().expect("runs on the main queue");
+                UI.with(|ui| {
+                    let Some(ui) = ui.get() else { return };
+                    let Some(button) = ui.item.button(mtm) else { return };
+                    ui.controller.settings_panel().show(&button);
+                });
+            });
         }
     }
 
@@ -538,15 +585,15 @@ define_class!(
         #[unsafe(method(menuWillOpen:))]
         fn menu_will_open(&self, _menu: &NSMenu) {
             self.ivars().open.set(true);
-            self.ivars().mailbox.own_menu.set(true);
-            let _ = self.ivars().mailbox.tx.send(Msg::Gesture(Gesture::OwnMenu { open: true }));
+            let mailbox = &self.ivars().mailbox;
+            mailbox.own_menu.set_menu(&mailbox.tx, true);
         }
 
         #[unsafe(method(menuDidClose:))]
         fn menu_did_close(&self, _menu: &NSMenu) {
             self.ivars().open.set(false);
-            self.ivars().mailbox.own_menu.set(false);
-            let _ = self.ivars().mailbox.tx.send(Msg::Gesture(Gesture::OwnMenu { open: false }));
+            let mailbox = &self.ivars().mailbox;
+            mailbox.own_menu.set_menu(&mailbox.tx, false);
         }
 
         #[unsafe(method(menuNeedsUpdate:))]
@@ -565,6 +612,7 @@ impl Controller {
             mailbox,
             map: OnceCell::new(),
             list: OnceCell::new(),
+            settings: OnceCell::new(),
             open: Cell::new(false),
         });
         unsafe { msg_send![super(this), init] }
@@ -574,6 +622,13 @@ impl Controller {
         self.ivars()
             .map
             .get_or_init(|| MonitorMap::new(self.mtm(), commands(&self.ivars().mailbox)))
+    }
+
+    fn settings_panel(&self) -> &SettingsPanel {
+        self.ivars().settings.get_or_init(|| {
+            let mailbox = &self.ivars().mailbox;
+            SettingsPanel::new(mailbox.tx.clone(), mailbox.own_menu.clone(), self.mtm())
+        })
     }
 
     fn list(&self) -> &WorkspaceList {
@@ -632,28 +687,15 @@ impl Controller {
     }
 
     fn settings(&self, mtm: MainThreadMarker) -> Retained<NSMenuItem> {
-        let debug = unsafe {
+        let item = unsafe {
             NSMenuItem::initWithTitle_action_keyEquivalent(
                 NSMenuItem::alloc(mtm),
-                ns_string!("Debug mode"),
-                Some(sel!(toggleDebug:)),
+                ns_string!("Settings…"),
+                Some(sel!(openSettings:)),
                 ns_string!(""),
             )
         };
-        unsafe { debug.setTarget(Some(self)) };
-        debug.setState(if crate::debug::enabled() {
-            NSControlStateValueOn
-        } else {
-            NSControlStateValueOff
-        });
-        debug.setToolTip(Some(ns_string!(
-            "Logs the stacking order at each step of a switch. Costs a few ms per switch; off at every launch."
-        )));
-        let submenu = NSMenu::new(mtm);
-        submenu.addItem(&debug);
-
-        let item = NSMenuItem::new(mtm);
-        item.setTitle(ns_string!("Settings"));
+        unsafe { item.setTarget(Some(self)) };
         item.setImage(
             NSImage::imageWithSystemSymbolName_accessibilityDescription(
                 ns_string!("gearshape"),
@@ -661,7 +703,6 @@ impl Controller {
             )
             .as_deref(),
         );
-        item.setSubmenu(Some(&submenu));
         item
     }
 }

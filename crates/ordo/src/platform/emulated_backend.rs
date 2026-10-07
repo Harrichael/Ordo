@@ -231,6 +231,10 @@ impl WorkspaceBackend for EmulatedBackend {
         self.model.note_app_visibility(pid, hidden);
     }
 
+    fn set_hiding(&mut self, hiding: ordo_emulated::Hiding) {
+        self.model.set_hiding(hiding);
+    }
+
     fn reveal_for_focus(&mut self, pid: Pid) -> Option<Vec<(WindowId, ordo_core::Point)>> {
         self.model.reveal_for_focus(&self.desktop, pid)
     }

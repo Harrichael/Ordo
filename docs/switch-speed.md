@@ -21,7 +21,7 @@ On the engine thread, in order (see also the page at https://claude.ai/artifact/
 3. **Read every window's frame** (`current_frames`, an AX walk of every app) and the display geometry. The outgoing windows' frames become their saved positions.
 4. **Save `state.json`**, before any window moves: a crash mid-switch never loses where a window belongs.
 5. **Move windows**, one thread per app (`ax::move_windows`). The batch takes as long as the slowest app.
-6. **Show the destination's apps**, one thread per app (`ax::show_apps`). Only apps Ordo hid are asked and un-hidden. The un-hide carries the park positions of that app's other windows, and holds them (an un-hide re-homes every window the app owns). Hides of apps left with nothing on screen run 500 ms later (`HIDE_SETTLE`).
+6. **Show the destination's apps**, one thread per app (`ax::show_apps`). Only apps Ordo hid are asked and un-hidden. The un-hide carries the park positions of that app's other windows, and holds them (an un-hide re-homes every window the app owns). Hides of apps left with nothing to show run later, as the user's hiding setting says (`ordo_emulated::Hiding`: 500 ms by default, 5 s, or never).
 7. **Hand the MRU order to the restack worker.** It takes microseconds, and the restack runs on its own thread (`restack.rs`: overlap-only plan, lanes per overlap group).
 8. **Rescan** (a full AX walk) so the core can confirm the switch. The next hotkey waits for it.
 

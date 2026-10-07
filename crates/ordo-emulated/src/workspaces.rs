@@ -21,7 +21,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use ordo_core::{
     project, Pid, Point, Rect, VirtualMonitorId, VirtualMonitors, WindowId,
@@ -31,7 +31,7 @@ use ordo_core::{
 use crate::ledger::{Claim, Ledger, SwitchPlan};
 use crate::statefile::{self, PersistedState, PersistedWindow};
 use crate::trace::{ParkTrace, ParkTraceKind, SwitchCost};
-use crate::{Desktop, Move, Unhide};
+use crate::{Desktop, HideWhen, Hiding, Idle, Move, Unhide};
 
 /// How much of a parked window stays on-screen. macOS refuses to keep a fully
 /// off-screen window where you put it, so we leave a 1px handle — also the
@@ -59,13 +59,6 @@ const CLAMP_SLACK: f64 = 160.0;
 /// permanent, while a visibly misplaced window is obvious and self-heals on
 /// the next switch or command.
 const ENFORCE_LIMIT: u8 = 3;
-
-/// How long after the last switch the apps left with nothing on screen are
-/// hidden. A quick round trip then never hides and un-hides an app. Around
-/// one, a window was measured coming back under one that stayed shown (9 of
-/// 11 real hides), for the stacking worker to repair at the app's own pace;
-/// the cause is not yet understood (no isolated hide reproduced it).
-const HIDE_SETTLE: Duration = Duration::from_millis(500);
 
 /// Each app's windows that are off screen, with where each is parked.
 type ParkedByApp = HashMap<Pid, Vec<(WindowId, Point)>>;
@@ -212,6 +205,10 @@ pub struct EmulatedWorkspaces {
     /// asks for its un-hides straight away but hides only once the user
     /// settles, and the apps are done with the switches' writes.
     hides_due: Option<Instant>,
+    /// When, and for lack of what, an app is hidden: the user's setting.
+    hiding: Hiding,
+    /// The setting changed since the last pass judged which apps to hide.
+    hiding_changed: bool,
     /// The apps hidden right now, as far as this model knows: the ones it
     /// hid, and ones found hidden with nothing on screen. Hiding is Ordo's
     /// alone. An app hidden any other way while it has a window on screen is
@@ -248,6 +245,8 @@ impl EmulatedWorkspaces {
             homecoming: HashMap::new(),
             replug_unseen: false,
             hides_due: None,
+            hiding: Hiding::default(),
+            hiding_changed: false,
             hidden_apps: None,
             visibility_news: Vec::new(),
             trace: Vec::new(),
@@ -965,6 +964,9 @@ impl EmulatedWorkspaces {
             }
         }
         self.reconcile_visibility(d, frames, &g);
+        if std::mem::take(&mut self.hiding_changed) {
+            self.apply_app_visibility(d, frames, &g);
+        }
         if self.hides_due.is_some_and(|due| d.now() >= due) && !d.busy() {
             self.hides_due = None;
             self.hide_idle_apps(d, frames, &g);
@@ -1511,9 +1513,9 @@ impl EmulatedWorkspaces {
         (ParkTraceKind::Rehost, want)
     }
 
-    /// Dock dimming: unhide every app with a window here now, and hide
-    /// (Cmd+H-style) every app whose known windows are all off screen once
-    /// the user has settled — see [`HIDE_SETTLE`]. With the Dock's
+    /// Dock dimming: unhide every app with something to show now, and hide
+    /// (Cmd+H-style) every app with nothing to show once the user has
+    /// settled — both as [`Hiding`] says. With the Dock's
     /// `showhidden` pref, "hidden" renders as a translucent icon — the
     /// closest macOS gets to a per-workspace Dock.
     ///
@@ -1529,6 +1531,7 @@ impl EmulatedWorkspaces {
     ) {
         let current = self.ledger.current();
         let (here_by_app, elsewhere) = self.apps_on_screen(frames, g);
+        let wanted = self.wanted_apps(frames, &here_by_app);
         let hidden = self.hidden_apps(d, frames).clone();
         // A hide Ordo wasn't told of (an app its observer never attached to)
         // shows here as an app none of whose windows on screen are in the
@@ -1544,11 +1547,15 @@ impl EmulatedWorkspaces {
         // An app Ordo never hides needs no showing; its windows may float
         // above the layer the window server's list is read at, which would
         // read as a hide nobody announced.
-        let (shows, showing): (Vec<Pid>, Vec<Pid>) = here_by_app
+        // An app with nothing on screen is out of that list hidden or not,
+        // so for it only this model's own record counts.
+        let (shows, showing): (Vec<Pid>, Vec<Pid>) = wanted
             .into_iter()
-            .filter(|(_, here)| *here)
+            .filter(|(pid, wanted)| *wanted && (here_by_app[pid] || hidden.contains(pid)))
             .map(|(pid, _)| pid)
-            .partition(|pid| d.can_hide(*pid) && (hidden.contains(pid) || unlisted(pid)));
+            .partition(|pid| {
+                d.can_hide(*pid) && (hidden.contains(pid) || (here_by_app[pid] && unlisted(pid)))
+            });
         // Any other app is showing, and nothing un-hidden needs holding.
         for pid in showing {
             self.note(
@@ -1580,7 +1587,7 @@ impl EmulatedWorkspaces {
         if !shows.is_empty() {
             d.show_apps(&shows);
         }
-        self.hides_due = Some(d.now() + HIDE_SETTLE);
+        self.hides_due = self.hiding.when.delay().map(|delay| d.now() + delay);
     }
 
     /// The deferred half of [`Self::apply_app_visibility`], judged against
@@ -1599,10 +1606,11 @@ impl EmulatedWorkspaces {
     ) {
         let current = self.ledger.current();
         let (here_by_app, elsewhere) = self.apps_on_screen(frames, g);
+        let wanted = self.wanted_apps(frames, &here_by_app);
         let focused_app = d.frontmost_app();
         let hidden = self.hidden_apps(d, frames).clone();
-        for (pid, has_window_here) in here_by_app {
-            if has_window_here
+        for (pid, wanted) in wanted {
+            if wanted
                 || Some(pid) == focused_app
                 || hidden.contains(&pid)
                 || !d.can_hide(pid)
@@ -1640,6 +1648,16 @@ impl EmulatedWorkspaces {
             self.hidden_apps = Some(hidden);
         }
         self.hidden_apps.as_mut().unwrap()
+    }
+
+    /// The user changed when apps are hidden. Judged at the next pass, which
+    /// has the frames and runs only while Ordo is engaged: an app the new
+    /// setting wants shown is un-hidden then, and hides wait the new delay.
+    pub fn set_hiding(&mut self, hiding: Hiding) {
+        if hiding != self.hiding {
+            self.hiding = hiding;
+            self.hiding_changed = true;
+        }
     }
 
     /// The shell is about to bring this app to the front, which un-hides it.
@@ -1770,6 +1788,30 @@ impl EmulatedWorkspaces {
             hold.sort_by_key(|(w, _)| w.0);
         }
         (here_by_app, elsewhere)
+    }
+
+    /// Per app with a declared window, whether [`Hiding`] wants it shown,
+    /// given whether it has a window on screen.
+    fn wanted_apps(
+        &self,
+        frames: &HashMap<WindowId, (Pid, Rect)>,
+        here_by_app: &HashMap<Pid, bool>,
+    ) -> HashMap<Pid, bool> {
+        match (self.hiding.when, self.hiding.idle) {
+            (HideWhen::Never, _) => here_by_app.keys().map(|pid| (*pid, true)).collect(),
+            (_, Idle::OffScreen) => here_by_app.clone(),
+            (_, Idle::OffWorkspace) => {
+                let current = self.ledger.current();
+                let mut wanted: HashMap<Pid, bool> =
+                    here_by_app.keys().map(|pid| (*pid, false)).collect();
+                for (window, (pid, _)) in frames {
+                    if self.ledger.claim(*window).is_some_and(|c| c.ws == current) {
+                        wanted.insert(*pid, true);
+                    }
+                }
+                wanted
+            }
+        }
     }
 }
 
@@ -2190,7 +2232,8 @@ mod tests {
         /// The user stays put long enough for the deferred hides, and the
         /// next snapshot carries them out.
         fn settle(&self, b: &mut EmulatedWorkspaces) {
-            self.now.set(self.now.get() + HIDE_SETTLE);
+            let delay = HideWhen::Settled.delay().expect("Settled hides");
+            self.now.set(self.now.get() + delay);
             b.enforce_placement(self, &self.scan());
         }
 
@@ -3539,6 +3582,73 @@ mod tests {
             .any(|t| t.kind == ParkTraceKind::Rehost && t.window == w(2)));
         // Belief and screen agree, so the core sees no promise to re-host.
         assert!(b.believed_frames(&d, &frames_of(&d)).is_empty());
+    }
+
+    /// On one display, the monitor not being viewed is parked, and by default
+    /// its apps are dimmed like any with nothing on screen. Counting the
+    /// workspace instead, they stay shown until the user leaves it.
+    #[test]
+    fn hiding_by_workspace_spares_apps_on_the_monitor_not_viewed() {
+        let (d, mut b) = rig();
+        d.set_displays(&[MAIN]);
+        rescan(&d, &mut b);
+        b.set_hiding(Hiding { when: HideWhen::Settled, idle: Idle::OffWorkspace });
+        rescan(&d, &mut b);
+        d.settle(&mut b);
+        assert!(in_park_corner(&d.frame(w(2)), &geo()));
+        assert!(!d.is_hidden(Pid(20)));
+
+        b.switch_workspace(&d, ws(2));
+        d.settle(&mut b);
+        assert!(d.is_hidden(Pid(10)));
+        assert!(d.is_hidden(Pid(20)));
+    }
+
+    /// Turned off, hiding un-hides what Ordo hid, still holding the windows
+    /// parked for other workspaces, and hides nothing after that.
+    #[test]
+    fn hiding_off_shows_what_was_hidden_and_hides_nothing_more() {
+        let d = FakeDesktop::new(&[
+            (w(1), Pid(10), rect(100.0, 100.0)),
+            (w(2), Pid(20), rect(300.0, 200.0)),
+        ]);
+        let mut b = EmulatedWorkspaces::new(3);
+        rescan(&d, &mut b);
+        b.assign_window_to_workspace(w(2), ws(2)).unwrap();
+        b.switch_workspace(&d, ws(2));
+        d.settle(&mut b);
+        assert!(d.is_hidden(Pid(10)));
+
+        b.set_hiding(Hiding { when: HideWhen::Never, ..Hiding::default() });
+        rescan(&d, &mut b);
+        assert!(!d.is_hidden(Pid(10)));
+        assert!(in_park_corner(&d.frame(w(1)), &geo()), "held where it was parked");
+
+        b.switch_workspace(&d, ws(1));
+        d.settle(&mut b);
+        assert!(!d.is_hidden(Pid(20)));
+        assert!(in_park_corner(&d.frame(w(2)), &geo()));
+    }
+
+    /// Delayed, a pause that would have hidden an app doesn't: only a longer
+    /// stay does.
+    #[test]
+    fn delayed_hiding_waits_out_a_short_pause() {
+        let d = FakeDesktop::new(&[
+            (w(1), Pid(10), rect(100.0, 100.0)),
+            (w(2), Pid(20), rect(300.0, 200.0)),
+        ]);
+        let mut b = EmulatedWorkspaces::new(3);
+        rescan(&d, &mut b);
+        b.set_hiding(Hiding { when: HideWhen::Delayed, ..Hiding::default() });
+        b.assign_window_to_workspace(w(2), ws(2)).unwrap();
+        b.switch_workspace(&d, ws(2));
+        d.settle(&mut b);
+        assert!(!d.is_hidden(Pid(10)));
+
+        d.now.set(d.now.get() + HideWhen::Delayed.delay().unwrap());
+        b.enforce_placement(&d, &d.scan());
+        assert!(d.is_hidden(Pid(10)));
     }
 
     /// A switch to an empty workspace hands focus to the desktop: Finder is

@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use ordo_core::{
     MonitorId, Pid, Point, Rect, VirtualMonitorId, VirtualMonitorsWord, WindowId, WorkspaceId,
 };
-use ordo_emulated::ParkTrace;
+use ordo_emulated::{Hiding, ParkTrace};
 
 pub type Result<T> = std::result::Result<T, BackendError>;
 
@@ -167,6 +167,10 @@ pub trait WorkspaceBackend {
     /// An app was hidden or shown, by anyone. Native leaves hiding to the
     /// user; default no-op.
     fn note_app_visibility(&mut self, _pid: Pid, _hidden: bool) {}
+
+    /// The user's setting for when apps are hidden. Native hides nothing;
+    /// default no-op.
+    fn set_hiding(&mut self, _hiding: Hiding) {}
 
     /// About to bring this app to the front, which un-hides it: if this
     /// backend hid it, the windows it has parked and where, to hold through

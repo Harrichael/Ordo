@@ -29,11 +29,13 @@
 //! unlimited instant workspaces with no private Space APIs — see the research.
 //! Best paired with "Displays have separate Spaces" off.
 
+pub mod hiding;
 pub mod ledger;
 pub mod statefile;
 pub mod trace;
 pub mod workspaces;
 
+pub use hiding::{HideWhen, Hiding, Idle};
 pub use trace::{ChainStat, FocusStat, HoldStat, ParkTrace, ParkTraceKind, WriteStat};
 pub use workspaces::{EmulatedWorkspaces, MonitorOutOfRange, WorkspaceOutOfRange};
 

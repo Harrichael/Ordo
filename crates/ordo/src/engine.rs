@@ -23,6 +23,7 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::Receiver;
+use ordo_emulated::Hiding;
 use ordo_core::{
     coalesce_hotkeys, update, AxHintKind, Effect, Event, Gesture, HotkeyAction, OpId, Pid,
     RescanTrigger, State,
@@ -70,6 +71,9 @@ pub enum Msg {
     /// backend. Never becomes a core event; the observer follows it with a
     /// rescan hint, which is what gets it acted on.
     AppVisibility(Pid, bool),
+    /// The user's setting for when apps are hidden, from the menu's settings
+    /// (and once at launch, as saved). Never becomes a core event.
+    Hiding(Hiding),
     /// Stop the loop and close the run. Needed because producer threads (the
     /// event tap) hold sender clones that outlive shutdown, so channel-close
     /// alone can't end the loop.
@@ -107,7 +111,7 @@ fn collapse_rescans(batch: Vec<Msg>) -> Vec<Msg> {
             Msg::Hotkey(..) | Msg::RestackStats(_) => after.push(m),
             // Ahead of the look the batch's rescans become, so that look acts
             // on it.
-            Msg::AppVisibility(..) | Msg::Gesture(Gesture::Key) => out.push(m),
+            Msg::AppVisibility(..) | Msg::Hiding(_) | Msg::Gesture(Gesture::Key) => out.push(m),
             fence => {
                 flush_rescans(&mut rescans, &mut out);
                 out.append(&mut after);
@@ -332,6 +336,7 @@ impl Engine {
                     Msg::AppVisibility(pid, hidden) => {
                         self.effector.note_app_visibility(pid, hidden);
                     }
+                    Msg::Hiding(hiding) => self.effector.set_hiding(hiding),
                     // Nor a key press, which may overtake presses queued in
                     // the same batch: a command after it only clears what it
                     // would have explained. Its look is held like any other,
@@ -379,7 +384,10 @@ impl Engine {
                             }
                             Msg::SaveState => self.effector.persist_workspaces(),
                             Msg::Shutdown => break 'recv,
-                            Msg::Hotkey(..) | Msg::RestackStats(_) | Msg::AppVisibility(..) => {
+                            Msg::Hotkey(..)
+                            | Msg::RestackStats(_)
+                            | Msg::AppVisibility(..)
+                            | Msg::Hiding(_) => {
                                 unreachable!("handled above")
                             }
                         }

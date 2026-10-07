@@ -31,6 +31,7 @@ pub mod native_backend;
 pub mod observer;
 pub mod rescue_gather;
 pub mod restack_worker;
+pub mod settings;
 pub mod skylight;
 pub mod status_item;
 pub mod tap;
