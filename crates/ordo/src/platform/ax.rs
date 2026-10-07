@@ -52,6 +52,7 @@ pub struct AxWindow {
 pub struct AxScan {
     pub windows: Vec<AxWindow>,
     pub focused: Option<WindowId>,
+    pub focus: Duration,
     pub walk: Walk,
 }
 
@@ -84,10 +85,13 @@ enum Listing {
 /// Enumerate every standard window of every regular (Dock-visible) app, plus
 /// which window currently has focus.
 pub fn scan() -> AxScan {
+    let started = Instant::now();
     let focused = focused_window();
+    let focus = started.elapsed();
     let (windows, walk) = walk();
     AxScan {
         focused,
+        focus,
         windows,
         walk,
     }
@@ -324,6 +328,10 @@ pub fn has_dock_icon(pid: Pid) -> bool {
 }
 
 pub fn frontmost_app() -> Option<Pid> {
+    super::meter::metered(|r| &mut r.front_sweeps, sweep_frontmost)
+}
+
+fn sweep_frontmost() -> Option<Pid> {
     // Ask each app's live `AXFrontmost` attribute — NOT
     // NSWorkspace.frontmostApplication, which is a cache that refreshes only
     // when a run loop pumps (the engine thread never pumps one, so it would

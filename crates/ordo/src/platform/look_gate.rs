@@ -6,10 +6,10 @@
 use std::time::Instant;
 
 use crossbeam_channel::{Receiver, Sender};
-use ordo_core::{AxHintKind, RescanTrigger};
+use ordo_core::RescanTrigger;
 
 use crate::app_queue::AppQueues;
-use crate::engine::{Msg, LOOK_BOUND};
+use crate::engine::{fold_triggers, Msg, LOOK_BOUND};
 use crate::ports::LookGate;
 
 pub struct QueueGate {
@@ -41,36 +41,14 @@ fn hold(queues: AppQueues, rx: Receiver<(RescanTrigger, Instant)>, engine: Sende
         queues.wait_idle(until.min(Instant::now() + LOOK_BOUND));
         let mut held = vec![first];
         held.extend(rx.try_iter().map(|(t, _)| t));
-        for trigger in fold(held) {
+        let (kept, folded) = fold_triggers(held);
+        if !folded.is_empty() && engine.send(Msg::Folded(folded)).is_err() {
+            return;
+        }
+        for trigger in kept {
             if engine.send(Msg::Rescan(trigger)).is_err() {
                 return;
             }
         }
-    }
-}
-
-/// Everything held becomes one look, except that each app's creation hint
-/// survives on its own: only those authorize corralling a new window, and
-/// the engine folds the rest the same way (`collapse_rescans`).
-fn fold(held: Vec<RescanTrigger>) -> Vec<RescanTrigger> {
-    let mut births: Vec<RescanTrigger> = Vec::new();
-    let mut last = None;
-    for t in held {
-        match t {
-            RescanTrigger::AxHint {
-                kind: AxHintKind::WindowCreated,
-                ..
-            } => {
-                if !births.contains(&t) {
-                    births.push(t);
-                }
-            }
-            other => last = Some(other),
-        }
-    }
-    if births.is_empty() {
-        last.into_iter().collect()
-    } else {
-        births
     }
 }

@@ -13,7 +13,7 @@ use ordo::clock::Clock;
 use ordo::engine::{Engine, Msg};
 use ordo::logger::Logger;
 use ordo::menubar::{MenuBarView, MonitorEntry, MonitorsView, WorkspaceEntry};
-use ordo::ports::{Effector, LookGate, NullEffector, SnapshotStats, WorldSource};
+use ordo::ports::{Blind, Effector, LookGate, NullEffector, SnapshotStats, WorldSource};
 use ordo::replay::replay;
 use ordo_core::{
     after_merge, after_move, anchor_after_add, AxHintKind, Effect, Event, FocusIntent, Gesture, HotkeyAction, MonitorId, MonitorSnap, MonitorWs, OpOutcome, Pid,
@@ -33,10 +33,10 @@ struct ScriptedWorld {
 }
 
 impl WorldSource for ScriptedWorld {
-    fn snapshot(&mut self) -> WorldSnapshot {
+    fn snapshot(&mut self) -> Result<WorldSnapshot, Blind> {
         let i = self.at.get().min(self.snaps.len() - 1);
         self.at.set(i + 1);
-        self.snaps[i].clone()
+        Ok(self.snaps[i].clone())
     }
 
     /// Scripted snapshots come from fixtures, not a parking mechanism.
@@ -132,8 +132,8 @@ impl FakeOs {
 struct FakeWorld(Rc<RefCell<FakeOs>>);
 
 impl WorldSource for FakeWorld {
-    fn snapshot(&mut self) -> WorldSnapshot {
-        self.0.borrow().snapshot()
+    fn snapshot(&mut self) -> Result<WorldSnapshot, Blind> {
+        Ok(self.0.borrow().snapshot())
     }
 
     fn take_park_trace(&mut self) -> Vec<ordo_emulated::ParkTrace> {
@@ -150,7 +150,7 @@ impl WorldSource for FakeWorld {
             apps: 2,
             windows: self.0.borrow().windows.len(),
             slowest: Some((Pid(200), Duration::from_millis(6))),
-            held: Duration::ZERO,
+            ..SnapshotStats::default()
         })
     }
 }
@@ -1296,5 +1296,98 @@ fn a_key_press_does_not_split_a_queued_burst() {
         count(&conn, "SELECT COUNT(*) FROM effects WHERE kind = 'switch_workspace'"),
         1
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A world that sees the desktop once, then nothing: the screen locked.
+struct LockingWorld {
+    looks: usize,
+}
+
+impl WorldSource for LockingWorld {
+    fn snapshot(&mut self) -> Result<WorldSnapshot, Blind> {
+        self.looks += 1;
+        if self.looks > 1 {
+            return Err(Blind::NoWindows);
+        }
+        Ok(snap(Some(1), 1, 1))
+    }
+
+    fn take_park_trace(&mut self) -> Vec<ordo_emulated::ParkTrace> {
+        Vec::new()
+    }
+
+    fn take_snapshot_stats(&mut self) -> Option<SnapshotStats> {
+        Some(SnapshotStats {
+            total: Duration::from_millis(20),
+            walk: Duration::from_millis(15),
+            ..SnapshotStats::default()
+        })
+    }
+}
+
+/// Every look asked for is on record, even one that leaves no event behind.
+/// A display hint followed by a periodic tick is one look, so the hint is
+/// logged as folded into it; that look then finds the screen locked and is
+/// discarded, logged with why, its cost logged like any snapshot's. Neither
+/// is in the event stream, and the run still replays clean.
+#[test]
+fn a_look_that_leaves_no_event_is_still_on_record() {
+    let dir = std::env::temp_dir().join(format!("ordo-dropped-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = dir.join("dropped.db");
+    let _ = std::fs::remove_file(&db);
+    let display_hint = RescanTrigger::BackendHint {
+        kind: "display_reconfigured".into(),
+    };
+    let run_id = {
+        let logger = Logger::open(&db, "test", "emulated", 1_000).unwrap();
+        let run_id = logger.run_id();
+        let engine = Engine::new(
+            logger,
+            Box::new(LockingWorld { looks: 0 }),
+            Box::new(OkEffector),
+            Box::new(StepClock { n: Cell::new(0) }),
+        );
+        let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
+        tx.send(Msg::Rescan(display_hint.clone())).unwrap();
+        tx.send(Msg::Rescan(RescanTrigger::Periodic)).unwrap();
+        tx.send(Msg::Shutdown).unwrap();
+        engine.run(rx);
+        run_id
+    };
+    let conn = Connection::open(&db).unwrap();
+    let dropped: Vec<(String, String)> = conn
+        .prepare("SELECT why, asked_by FROM dropped_looks ORDER BY rowid")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    let trigger = |json: &str| serde_json::from_str::<RescanTrigger>(json).unwrap();
+    assert_eq!(dropped.len(), 2, "{dropped:?}");
+    assert_eq!(
+        (dropped[0].0.as_str(), trigger(&dropped[0].1)),
+        ("folded", display_hint)
+    );
+    assert_eq!(
+        (dropped[1].0.as_str(), trigger(&dropped[1].1)),
+        ("no_windows", RescanTrigger::Periodic)
+    );
+    let costs: Vec<(Option<String>, f64)> = conn
+        .prepare("SELECT blind, total_ms FROM snapshots ORDER BY rowid")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(costs, [(None, 20.0), (Some("no_windows".into()), 20.0)]);
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM events WHERE kind = 'world_observed'"),
+        1,
+        "the startup look only"
+    );
+    let report = replay(&conn, run_id, None).unwrap();
+    assert!(report.is_clean(), "{:?}", report.mismatches);
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -11,7 +11,7 @@
 //!
 //! So the callback records nothing but the time. While fewer than `SETTLE`
 //! have passed since the last one, the world source reports the world as
-//! unobservable (no displays — the same path that guards display sleep), and
+//! unobservable (as it does while the displays sleep), and
 //! once it has, one rescan is posted and everything re-projects at once onto
 //! the rig as it actually is. One second is the judgment call: long enough
 //! for the re-homing and Dock dance measured on plug events, short enough

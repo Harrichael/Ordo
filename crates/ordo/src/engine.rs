@@ -26,7 +26,7 @@ use crossbeam_channel::Receiver;
 use ordo_emulated::Hiding;
 use ordo_core::{
     coalesce_hotkeys, update, AxHintKind, Effect, Event, Gesture, HotkeyAction, OpId, Pid,
-    RescanTrigger, State,
+    RescanTrigger, State, WorldSnapshot,
 };
 
 use crate::clock::Clock;
@@ -67,6 +67,9 @@ pub enum Msg {
     /// Telemetry from the restack worker, delivered as a message because the
     /// SQLite logger is engine-thread-only. Never becomes a core event.
     RestackStats(RestackStats),
+    /// Rescan triggers folded into another look (see [`fold_triggers`]), for
+    /// the log alone: the look they were folded into carries one trigger.
+    Folded(Vec<RescanTrigger>),
     /// An app was hidden (true) or shown, by anyone, for the workspace
     /// backend. Never becomes a core event; the observer follows it with a
     /// rescan hint, which is what gets it acted on.
@@ -111,7 +114,10 @@ fn collapse_rescans(batch: Vec<Msg>) -> Vec<Msg> {
             Msg::Hotkey(..) | Msg::RestackStats(_) => after.push(m),
             // Ahead of the look the batch's rescans become, so that look acts
             // on it.
-            Msg::AppVisibility(..) | Msg::Hiding(_) | Msg::Gesture(Gesture::Key) => out.push(m),
+            Msg::AppVisibility(..)
+            | Msg::Hiding(_)
+            | Msg::Gesture(Gesture::Key)
+            | Msg::Folded(_) => out.push(m),
             fence => {
                 flush_rescans(&mut rescans, &mut out);
                 out.append(&mut after);
@@ -125,26 +131,46 @@ fn collapse_rescans(batch: Vec<Msg>) -> Vec<Msg> {
 }
 
 fn flush_rescans(run: &mut Vec<RescanTrigger>, out: &mut Vec<Msg>) {
+    let (kept, folded) = fold_triggers(run.drain(..));
+    if !folded.is_empty() {
+        out.push(Msg::Folded(folded));
+    }
+    out.extend(kept.into_iter().map(Msg::Rescan));
+}
+
+/// Several asks for a look are one look: the last trigger stands for it,
+/// except that each app's creation hint survives on its own, since only
+/// those authorize corralling a new window.
+pub fn fold_triggers(
+    triggers: impl IntoIterator<Item = RescanTrigger>,
+) -> (Vec<RescanTrigger>, Vec<RescanTrigger>) {
     let mut births: Vec<RescanTrigger> = Vec::new();
-    let mut last = None;
-    for trigger in run.drain(..) {
+    let mut others: Vec<RescanTrigger> = Vec::new();
+    let mut folded: Vec<RescanTrigger> = Vec::new();
+    for trigger in triggers {
         match trigger {
             RescanTrigger::AxHint {
                 kind: AxHintKind::WindowCreated,
                 ..
             } => {
-                if !births.contains(&trigger) {
+                if births.contains(&trigger) {
+                    folded.push(trigger);
+                } else {
                     births.push(trigger);
                 }
             }
-            _ => last = Some(trigger),
+            _ => others.push(trigger),
         }
     }
-    if births.is_empty() {
-        out.extend(last.map(Msg::Rescan));
+    let kept = if births.is_empty() {
+        let last = others.pop();
+        folded.extend(others);
+        last.into_iter().collect()
     } else {
-        out.extend(births.into_iter().map(Msg::Rescan));
-    }
+        folded.extend(others);
+        births
+    };
+    (kept, folded)
 }
 
 /// A single external event can only spawn so many internal follow-ups before
@@ -276,23 +302,40 @@ impl Engine {
     /// originate here (or from a `RequestRescan` cascade) — never from an
     /// external producer, which cannot touch the thread-affine world source.
     pub fn observe(&mut self, trigger: RescanTrigger) {
+        if let Some(snap) = self.take_look(&trigger) {
+            self.pump(Event::WorldObserved {
+                at: self.clock.now(),
+                trigger,
+                snap,
+            });
+        }
+    }
+
+    /// A snapshot for the core, or None when the world couldn't be seen.
+    /// Unobservable is not empty: displays asleep make every window
+    /// "missing", and believing that once erased the whole model over a
+    /// weekend. A blind look is only logged; the next sighted one self-heals
+    /// whatever actually changed.
+    fn take_look(&mut self, trigger: &RescanTrigger) -> Option<WorldSnapshot> {
         let held = self.looked();
         let snap = self.world.snapshot();
         self.drain_park_trace();
         let cost = self.world.take_snapshot_stats().map(|c| SnapshotStats { held, ..c });
-        // No displays means the world is unobservable, not empty — displays
-        // asleep make every window "missing", and believing that once erased
-        // the whole model over a weekend. Discard the blind scan; the next
-        // sighted one self-heals whatever actually changed.
-        if snap.monitors.is_empty() {
-            return;
+        match snap {
+            Ok(snap) => {
+                self.snapshot_costs.push_back(cost);
+                Some(snap)
+            }
+            Err(why) => {
+                let wall_ms = self.clock.now().wall_ms;
+                if let Some(cost) = &cost {
+                    let seq = self.logger.next_seq();
+                    let _ = self.logger.log_snapshot_stats(seq, cost, Some(why), wall_ms);
+                }
+                let _ = self.logger.log_dropped_look(why.as_str(), trigger, wall_ms);
+                None
+            }
         }
-        self.snapshot_costs.push_back(cost);
-        self.pump(Event::WorldObserved {
-            at: self.clock.now(),
-            trigger,
-            snap,
-        });
     }
 
     /// Process messages until the channel closes (all senders dropped), then
@@ -330,6 +373,12 @@ impl Engine {
                         let _ = self
                             .logger
                             .log_restack_stats(&stats, self.clock.now().wall_ms);
+                    }
+                    Msg::Folded(triggers) => {
+                        let wall_ms = self.clock.now().wall_ms;
+                        for t in &triggers {
+                            let _ = self.logger.log_dropped_look("folded", t, wall_ms);
+                        }
                     }
                     // Not a fence either: a switch's own un-hides report
                     // mid-burst. Recording it is instant.
@@ -386,6 +435,7 @@ impl Engine {
                             Msg::Shutdown => break 'recv,
                             Msg::Hotkey(..)
                             | Msg::RestackStats(_)
+                            | Msg::Folded(_)
                             | Msg::AppVisibility(..)
                             | Msg::Hiding(_) => {
                                 unreachable!("handled above")
@@ -456,7 +506,7 @@ impl Engine {
                 if let (Ok(seq), Some(Some(cost))) = (seq, self.snapshot_costs.pop_front()) {
                     let _ = self
                         .logger
-                        .log_snapshot_stats(seq, &cost, self.clock.now().wall_ms);
+                        .log_snapshot_stats(seq, &cost, None, self.clock.now().wall_ms);
                 }
             }
             if let Event::EffectResult { op, outcome, at } = &ev {
@@ -481,17 +531,9 @@ impl Engine {
                 if self.hold_look(reason.clone()) {
                     return;
                 }
-                let held = self.looked();
-                let snap = self.world.snapshot();
-                self.drain_park_trace();
-                let cost = self.world.take_snapshot_stats().map(|c| SnapshotStats { held, ..c });
-                // The same blind-scan discard as `observe`: a post-effect
-                // rescan during display sleep or a display reconfiguration
-                // must not feed the core an empty world.
-                if snap.monitors.is_empty() {
+                let Some(snap) = self.take_look(reason) else {
                     return;
-                }
-                self.snapshot_costs.push_back(cost);
+                };
                 queue.push_back(Event::WorldObserved {
                     at: self.clock.now(),
                     trigger: reason.clone(),

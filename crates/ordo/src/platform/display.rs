@@ -27,6 +27,10 @@ pub struct DisplayInfo {
 }
 
 pub fn active_displays() -> Vec<DisplayInfo> {
+    super::meter::metered(|r| &mut r.display_reads, read_displays)
+}
+
+fn read_displays() -> Vec<DisplayInfo> {
     let ids = active_display_ids();
     let main = CGMainDisplayID();
     let mut out: Vec<DisplayInfo> = Vec::new();

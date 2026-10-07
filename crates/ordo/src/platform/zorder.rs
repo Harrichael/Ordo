@@ -156,6 +156,10 @@ pub struct Listed {
 }
 
 pub fn all_windows() -> Option<Vec<Listed>> {
+    super::meter::metered(|r| &mut r.list_reads, list_windows)
+}
+
+fn list_windows() -> Option<Vec<Listed>> {
     let mut out = Vec::new();
     unsafe {
         let arr = CGWindowListCopyWindowInfo(EXCLUDE_DESKTOP, 0);

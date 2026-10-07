@@ -20,16 +20,18 @@
 //! statistics question rather than to replay: `restacks`/`raises` hold the
 //! z-order reassert's timing breakdown (see [`crate::ports::RestackStats`]),
 //! `hotkey_batches` holds how long presses queued behind the engine and how
-//! many a burst folded away (see [`HotkeyBatch`]), and `snapshots` holds where
-//! each world snapshot's time went (see [`crate::ports::SnapshotStats`]).
+//! many a burst folded away (see [`HotkeyBatch`]), `snapshots` holds where
+//! each world snapshot's time went (see [`crate::ports::SnapshotStats`]), and
+//! `dropped_looks` holds every look that left no event of its own (see
+//! [`Logger::log_dropped_look`]).
 
 use std::path::{Path, PathBuf};
 
 use ordo_emulated::ParkTrace;
 
-use crate::ports::{RestackStats, SnapshotStats};
+use crate::ports::{Blind, RestackStats, SnapshotStats};
 use crate::schema;
-use ordo_core::{Effect, Event, Note, OpId, OpOutcome, State};
+use ordo_core::{Effect, Event, Note, OpId, OpOutcome, RescanTrigger, State};
 use rusqlite::{params, Connection};
 
 /// A `State` checkpoint every this many events. Small enough that replay never
@@ -348,18 +350,23 @@ impl Logger {
         Ok(())
     }
 
-    /// `seq` is the snapshot's own `world_observed` event.
+    /// `seq` is the snapshot's own `world_observed` event; for a blind one,
+    /// which has none, the next event's.
     pub fn log_snapshot_stats(
         &mut self,
         seq: u64,
         s: &SnapshotStats,
+        blind: Option<Blind>,
         now_wall_ms: i64,
     ) -> rusqlite::Result<()> {
-        let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+        let r = &s.reads;
         self.conn.execute(
             "INSERT INTO snapshots (run_id, wall_ms, seq, total_ms, walk_ms, enforce_ms,
-                 apps, windows, slowest_pid, slowest_ms, held_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                 apps, windows, slowest_pid, slowest_ms, held_ms, displays_ms, focus_ms,
+                 list_ms, topology_ms, believed_ms, facts_ms, front_sweeps, front_sweeps_ms,
+                 display_reads, display_reads_ms, list_reads, list_reads_ms, blind)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+                 ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
             params![
                 self.run_id,
                 now_wall_ms,
@@ -372,7 +379,38 @@ impl Logger {
                 s.slowest.map(|(p, _)| p.0),
                 s.slowest.map(|(_, d)| ms(d)),
                 ms(s.held),
+                ms(s.displays),
+                ms(s.focus),
+                ms(s.list),
+                ms(s.topology),
+                ms(s.believed),
+                ms(s.facts),
+                r.front_sweeps.calls,
+                ms(r.front_sweeps.time),
+                r.display_reads.calls,
+                ms(r.display_reads.time),
+                r.list_reads.calls,
+                ms(r.list_reads.time),
+                blind.map(Blind::as_str),
             ],
+        )?;
+        Ok(())
+    }
+
+    /// A look that left no `world_observed` event of its own: `why` is
+    /// "folded" for a trigger folded into another look, or the blindness its
+    /// snapshot was discarded for (whose cost is in `snapshots`). `seq` is
+    /// the next event's. Telemetry: replay never reads it.
+    pub fn log_dropped_look(
+        &mut self,
+        why: &str,
+        asked_by: &RescanTrigger,
+        now_wall_ms: i64,
+    ) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO dropped_looks (run_id, wall_ms, seq, why, asked_by)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![self.run_id, now_wall_ms, self.seq as i64, why, json(asked_by)],
         )?;
         Ok(())
     }
@@ -384,6 +422,10 @@ impl Logger {
         )?;
         Ok(())
     }
+}
+
+fn ms(d: std::time::Duration) -> f64 {
+    d.as_secs_f64() * 1000.0
 }
 
 fn json<T: serde::Serialize>(v: &T) -> String {

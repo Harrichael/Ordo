@@ -33,7 +33,7 @@
 use rusqlite::{Connection, Transaction};
 
 /// The schema version this build writes and understands.
-pub const CURRENT_VERSION: i32 = 9;
+pub const CURRENT_VERSION: i32 = 11;
 
 type Migration = fn(&Transaction) -> rusqlite::Result<()>;
 
@@ -47,6 +47,8 @@ const MIGRATIONS: &[Migration] = &[
     m7_overlap_restacks,
     m8_restack_landing_wait,
     m9_snapshot_held,
+    m10_snapshot_phases,
+    m11_dropped_looks,
 ];
 
 /// Read the version of an existing log, refusing one written by a newer Ordo.
@@ -208,6 +210,43 @@ fn m8_restack_landing_wait(tx: &Transaction) -> rusqlite::Result<()> {
 /// How long each look was held back while the apps were busy.
 fn m9_snapshot_held(tx: &Transaction) -> rusqlite::Result<()> {
     tx.execute_batch("ALTER TABLE snapshots ADD COLUMN held_ms REAL NOT NULL DEFAULT 0;")
+}
+
+/// Each snapshot phase's time, the slow OS reads counted across them, and
+/// why a blind snapshot was discarded (null for one the core saw).
+fn m10_snapshot_phases(tx: &Transaction) -> rusqlite::Result<()> {
+    tx.execute_batch(
+        "ALTER TABLE snapshots ADD COLUMN displays_ms REAL NOT NULL DEFAULT 0;
+         ALTER TABLE snapshots ADD COLUMN focus_ms REAL NOT NULL DEFAULT 0;
+         ALTER TABLE snapshots ADD COLUMN list_ms REAL NOT NULL DEFAULT 0;
+         ALTER TABLE snapshots ADD COLUMN topology_ms REAL NOT NULL DEFAULT 0;
+         ALTER TABLE snapshots ADD COLUMN believed_ms REAL NOT NULL DEFAULT 0;
+         ALTER TABLE snapshots ADD COLUMN facts_ms REAL NOT NULL DEFAULT 0;
+         ALTER TABLE snapshots ADD COLUMN front_sweeps INTEGER NOT NULL DEFAULT 0;
+         ALTER TABLE snapshots ADD COLUMN front_sweeps_ms REAL NOT NULL DEFAULT 0;
+         ALTER TABLE snapshots ADD COLUMN display_reads INTEGER NOT NULL DEFAULT 0;
+         ALTER TABLE snapshots ADD COLUMN display_reads_ms REAL NOT NULL DEFAULT 0;
+         ALTER TABLE snapshots ADD COLUMN list_reads INTEGER NOT NULL DEFAULT 0;
+         ALTER TABLE snapshots ADD COLUMN list_reads_ms REAL NOT NULL DEFAULT 0;
+         ALTER TABLE snapshots ADD COLUMN blind TEXT;",
+    )
+}
+
+/// Every look asked for that never became a `world_observed` event of its
+/// own: discarded as blind, or folded into another look. `seq` is the next
+/// event's, which places it in the stream.
+fn m11_dropped_looks(tx: &Transaction) -> rusqlite::Result<()> {
+    tx.execute_batch(
+        r#"
+CREATE TABLE dropped_looks (
+    run_id   INTEGER NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+    wall_ms  INTEGER NOT NULL,
+    seq      INTEGER NOT NULL,
+    why      TEXT NOT NULL,
+    asked_by TEXT NOT NULL
+);
+"#,
+    )
 }
 
 /// Version 1: the schema as it first shipped. Frozen — see the module rules.
@@ -500,6 +539,7 @@ CREATE INDEX events_by_kind ON events(run_id, kind);
             "raises",
             "hotkey_batches",
             "snapshots",
+            "dropped_looks",
         ] {
             assert!(!columns(&conn, table).is_empty(), "{table} missing");
         }
@@ -511,6 +551,7 @@ CREATE INDEX events_by_kind ON events(run_id, kind);
         assert!(columns(&conn, "restacks").contains(&"frames".to_string()));
         assert!(columns(&conn, "raises").contains(&"ax_ms".to_string()));
         assert!(columns(&conn, "snapshots").contains(&"held_ms".to_string()));
+        assert!(columns(&conn, "snapshots").contains(&"front_sweeps_ms".to_string()));
     }
 
     #[test]

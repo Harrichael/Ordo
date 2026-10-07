@@ -30,7 +30,9 @@ pub trait LookGate {
 /// thread-affine, so the engine constructs and uses it entirely on its own
 /// thread. External producers reach the engine through a channel instead.
 pub trait WorldSource {
-    fn snapshot(&mut self) -> WorldSnapshot;
+    /// `Err` when the world can't be observed right now, which is not the
+    /// same as observing it empty.
+    fn snapshot(&mut self) -> Result<WorldSnapshot, Blind>;
 
     /// Drain diagnostic records of the workspace mechanism from the snapshot
     /// just built. Telemetry, not record: the core never sees these and the
@@ -52,15 +54,32 @@ pub trait WorldSource {
 }
 
 /// Where a snapshot's time went. A hotkey that arrives mid-snapshot waits for
-/// all of it, so this is what says whether reading the apps, or the placement
-/// check that rides along, is what a burst press is waiting on — and which
-/// app, when one app is most of it.
+/// all of it, so this is what says which phase a press is waiting on, which
+/// kind of OS read inside it, and which app, when one app is most of it.
+#[derive(Clone, Debug, Default)]
 pub struct SnapshotStats {
     pub total: Duration,
+    /// Each phase in the order the snapshot runs them. What none of them
+    /// covers is `total` less their sum.
+    pub displays: Duration,
+    /// The focus read: a sweep asking each app in turn whether it is
+    /// frontmost, so a hung app costs it a messaging timeout.
+    pub focus: Duration,
     /// Reading every app's windows (apps in parallel).
     pub walk: Duration,
+    /// Layers and parents of windows seen for the first time.
+    pub facts: Duration,
+    /// The window server's list, read when the scan missed a window.
+    pub list: Duration,
+    /// The backend's fold of the scan (emulated: the display set, deaths,
+    /// adoptions).
+    pub topology: Duration,
     /// The placement check, which can write.
     pub enforce: Duration,
+    pub believed: Duration,
+    /// The slow kinds of read, counted wherever in the snapshot they ran:
+    /// the backend makes its own, inside `topology` and `enforce`.
+    pub reads: OsReads,
     pub apps: usize,
     pub windows: usize,
     pub slowest: Option<(Pid, Duration)>,
@@ -68,6 +87,41 @@ pub struct SnapshotStats {
     /// writes (see [`LookGate`]); zero when it was taken at once. The engine
     /// fills it in, since it owns the hold.
     pub held: Duration,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct OsReads {
+    pub front_sweeps: Tally,
+    pub display_reads: Tally,
+    /// The window server's full window list.
+    pub list_reads: Tally,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Tally {
+    pub calls: u32,
+    pub time: Duration,
+}
+
+/// Why a snapshot saw nothing to believe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Blind {
+    /// The display set is still changing.
+    Settling,
+    NoDisplays,
+    /// No app listed a window while the window server still has them: the
+    /// screen locked or the session asleep.
+    NoWindows,
+}
+
+impl Blind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Blind::Settling => "settling",
+            Blind::NoDisplays => "no_displays",
+            Blind::NoWindows => "no_windows",
+        }
+    }
 }
 
 /// Carries out a core [`Effect`] against the OS.

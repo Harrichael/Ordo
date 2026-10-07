@@ -277,11 +277,11 @@ impl<W: WorldSource> SubscribingWorld<W> {
 }
 
 impl<W: WorldSource> WorldSource for SubscribingWorld<W> {
-    fn snapshot(&mut self) -> ordo_core::WorldSnapshot {
-        let snap = self.inner.snapshot();
+    fn snapshot(&mut self) -> Result<ordo_core::WorldSnapshot, crate::ports::Blind> {
+        let snap = self.inner.snapshot()?;
         self.ws
             .subscribe(snap.windows.iter().map(|w| w.id.0).collect());
-        snap
+        Ok(snap)
     }
 
     /// Forwarded, not defaulted. This decorator sits between the engine and the

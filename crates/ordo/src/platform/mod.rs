@@ -23,6 +23,7 @@ pub mod display_watch;
 pub mod effector;
 pub mod emulated_backend;
 pub mod look_gate;
+pub mod meter;
 pub mod mission_control;
 pub mod monitor_map;
 pub mod workspace_list;
@@ -56,7 +57,7 @@ use ordo_emulated::{ParkTrace, ParkTraceKind};
 
 use crate::app_queue::AppQueues;
 use crate::backend::WorkspaceBackend;
-use crate::ports::{SnapshotStats, WorldSource};
+use crate::ports::{Blind, SnapshotStats, WorldSource};
 
 pub type SharedBackend = Rc<RefCell<dyn WorkspaceBackend>>;
 
@@ -186,6 +187,14 @@ impl MacWorldSource {
 }
 
 impl MacWorldSource {
+    fn record_stats(&mut self, started: Instant, stats: SnapshotStats) {
+        self.stats = Some(SnapshotStats {
+            total: started.elapsed(),
+            reads: meter::take(),
+            ..stats
+        });
+    }
+
     /// One `Unread` row when a window starts being kept unread, one if it
     /// turns ghost, and one when it is seen again or gone.
     fn note_unread(&mut self, unread: &[WindowId], scan: &ax::AxScan) {
@@ -241,24 +250,33 @@ impl MacWorldSource {
     }
 }
 
+fn timed<T>(f: impl FnOnce() -> T) -> (T, Duration) {
+    let started = Instant::now();
+    let out = f();
+    (out, started.elapsed())
+}
+
 impl WorldSource for MacWorldSource {
-    fn snapshot(&mut self) -> WorldSnapshot {
-        // Mid-reconfiguration, frames are wherever macOS has got to with
-        // re-homing them and the display list may be half-updated. Reported
-        // as no displays at all — the existing "unobservable, not empty" path
-        // — so nothing is believed, corrected, or parked off a transient.
-        if self.settle.settling() {
-            return WorldSnapshot {
-                monitors: Vec::new(),
-                windows: Vec::new(),
-                focused: None,
-                workspaces: WorkspaceSnap::default(),
-                unread: Vec::new(),
-                key_unmanaged: false,
-            };
-        }
+    fn snapshot(&mut self) -> Result<WorldSnapshot, Blind> {
         let started = Instant::now();
-        let displays = display::active_displays();
+        // Reads the effector made since the last snapshot are not this one's.
+        meter::take();
+        // Mid-reconfiguration, frames are wherever macOS has got to with
+        // re-homing them and the display list may be half-updated: nothing
+        // is believed, corrected, or parked off a transient.
+        if self.settle.settling() {
+            self.record_stats(started, SnapshotStats::default());
+            return Err(Blind::Settling);
+        }
+        let (displays, displays_took) = timed(display::active_displays);
+        if displays.is_empty() {
+            let stats = SnapshotStats {
+                displays: displays_took,
+                ..SnapshotStats::default()
+            };
+            self.record_stats(started, stats);
+            return Err(Blind::NoDisplays);
+        }
         let known: Vec<(MonitorId, Rect, bool)> = displays
             .iter()
             .map(|d| (d.id, d.frame, d.is_main))
@@ -272,8 +290,11 @@ impl WorldSource for MacWorldSource {
             .map(|w| w.id)
             .filter(|w| !self.facts.contains_key(w))
             .collect();
+        let mut facts_took = Duration::ZERO;
         if !unseen.is_empty() {
-            self.facts.extend(zorder::server_facts(&unseen));
+            let (facts, took) = timed(|| zorder::server_facts(&unseen));
+            facts_took = took;
+            self.facts.extend(facts);
         }
         self.facts.retain(|w, _| scan.windows.iter().any(|s| s.id == *w));
         // Missed against everything the apps listed, so a window Ordo stops
@@ -293,7 +314,18 @@ impl WorldSource for MacWorldSource {
         if key_unmanaged {
             scan.focused = None;
         }
-        let listed = (!missed.is_empty()).then(zorder::all_windows);
+        let (listed, list_took) = timed(|| (!missed.is_empty()).then(zorder::all_windows));
+        let mut stats = SnapshotStats {
+            displays: displays_took,
+            focus: scan.focus,
+            walk: scan.walk.elapsed,
+            facts: facts_took,
+            list: list_took,
+            apps: scan.walk.apps,
+            windows: scan.windows.len(),
+            slowest: scan.walk.slowest,
+            ..SnapshotStats::default()
+        };
         let unlisted = matches!(listed, Some(None));
         let listed = listed.flatten();
         let ids = listed.as_ref().map(|l| l.iter().map(|x| x.id).collect());
@@ -309,14 +341,8 @@ impl WorldSource for MacWorldSource {
                     }
                 );
             }
-            return WorldSnapshot {
-                monitors: Vec::new(),
-                windows: Vec::new(),
-                focused: None,
-                workspaces: WorkspaceSnap::default(),
-                unread: Vec::new(),
-                key_unmanaged: false,
-            };
+            self.record_stats(started, stats);
+            return Err(Blind::NoWindows);
         }
         self.blind = false;
         let on_screen: Option<Vec<WindowId>> =
@@ -351,25 +377,29 @@ impl WorldSource for MacWorldSource {
             .map(|w| (w.id, (w.app, w.frame)))
             .collect();
 
-        let topo = self
-            .backend
-            .borrow_mut()
-            .topology(&frames, &known)
-            .unwrap_or_default();
+        let (topo, topology_took) = timed(|| {
+            self.backend
+                .borrow_mut()
+                .topology(&frames, &known)
+                .unwrap_or_default()
+        });
+        stats.topology = topology_took;
 
-        let enforce_started = Instant::now();
-        if self.intercepting.load(Ordering::Relaxed) {
-            // The corrective write lands after this snapshot was read, so the
-            // snapshot still shows the phantom; the next rescan absorbs the
-            // fix as an (unattributed) external delta. Acceptable for a
-            // standing-invariant check.
-            self.backend.borrow_mut().enforce_placement(&frames);
-        }
-        let enforce = enforce_started.elapsed();
+        stats.enforce = timed(|| {
+            if self.intercepting.load(Ordering::Relaxed) {
+                // The corrective write lands after this snapshot was read, so
+                // the snapshot still shows the phantom; the next rescan
+                // absorbs the fix as an (unattributed) external delta.
+                // Acceptable for a standing-invariant check.
+                self.backend.borrow_mut().enforce_placement(&frames);
+            }
+        })
+        .1;
 
         // Mechanism artifacts (park slivers) never reach the core: the
         // backend substitutes the promise each one encodes.
-        let believed = self.backend.borrow().believed_frames(&frames);
+        let (believed, believed_took) = timed(|| self.backend.borrow().believed_frames(&frames));
+        stats.believed = believed_took;
 
         // The substitution above is why no other channel can see parking, so
         // capture the raw truth here, before it is laundered — on movement
@@ -452,23 +482,15 @@ impl WorldSource for MacWorldSource {
         *unreachable = scan.walk.refused.clone();
         drop(unreachable);
 
-        self.stats = Some(SnapshotStats {
-            total: started.elapsed(),
-            walk: scan.walk.elapsed,
-            enforce,
-            apps: scan.walk.apps,
-            windows: scan.windows.len(),
-            slowest: scan.walk.slowest,
-            held: Duration::ZERO,
-        });
-        WorldSnapshot {
+        self.record_stats(started, stats);
+        Ok(WorldSnapshot {
             monitors,
             windows,
             focused: scan.focused,
             workspaces,
             unread,
             key_unmanaged,
-        }
+        })
     }
 
     fn take_park_trace(&mut self) -> Vec<ParkTrace> {
