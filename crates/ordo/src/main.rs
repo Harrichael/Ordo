@@ -177,11 +177,23 @@ fn run(
 
     let menu_bars = ordo::platform::display::MenuBars::default();
     let own_menu = ordo::platform::status_item::OwnMenu::default();
-    if !observe {
-        // The tap runs even when paused — it's what hears the engage chord.
-        tap::spawn(tx.clone(), intercepting.clone(), menu_bars.clone(), own_menu.clone());
-        // New-window corralling depends on the WindowCreated hint this emits.
-        observer::spawn(tx.clone());
+    let needs_access = Arc::new(AtomicBool::new(false));
+    if observe {
+        // Observe mode raises nothing, but is as blind without the grant.
+        ordo::platform::trust::when_trusted(needs_access.clone(), tx.clone(), || true);
+    } else {
+        let (tx, intercepting, menu_bars, own_menu) =
+            (tx.clone(), intercepting.clone(), menu_bars.clone(), own_menu.clone());
+        let observer_tx = tx.clone();
+        ordo::platform::trust::when_trusted(needs_access.clone(), tx.clone(), move || {
+            // The tap runs even when paused — it's what hears the engage chord.
+            if !tap::spawn(tx.clone(), intercepting.clone(), menu_bars.clone(), own_menu.clone()) {
+                return false;
+            }
+            // New-window corralling depends on the WindowCreated hint this emits.
+            observer::spawn(observer_tx.clone());
+            true
+        });
     }
     if paused {
         // A paused start is a run born rescued: same inert mode, entered via a
@@ -264,7 +276,12 @@ fn run(
         if let Some(menubar) = menubar {
             engine = engine.on_state(move |s| {
                 let mut view = MenuBarView::of(s);
-                view.unreachable = unreachable.lock().unwrap().clone();
+                // Untrusted, every app refuses Ordo; the grant is the remedy,
+                // not reopening each one.
+                view.needs_accessibility = needs_access.load(Ordering::Relaxed);
+                if !view.needs_accessibility {
+                    view.unreachable = unreachable.lock().unwrap().clone();
+                }
                 menubar.show(view);
             });
         }

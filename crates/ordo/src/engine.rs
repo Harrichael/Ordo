@@ -64,6 +64,11 @@ pub enum Msg {
     /// The save-state chord: resume persistence and write the current model
     /// as the new durable state.
     SaveState,
+    /// Accessibility was granted after launch: every look so far saw no
+    /// windows, so the next is the startup look. Nothing was born while Ordo
+    /// was blind, and the OS owned focus throughout. A fence, so no later
+    /// trigger in its batch stands in for it.
+    Sighted,
     /// Telemetry from the restack worker, delivered as a message because the
     /// SQLite logger is engine-thread-only. Never becomes a core event.
     RestackStats(RestackStats),
@@ -432,6 +437,7 @@ impl Engine {
                                 });
                             }
                             Msg::SaveState => self.effector.persist_workspaces(),
+                            Msg::Sighted => self.observe(RescanTrigger::Startup),
                             Msg::Shutdown => break 'recv,
                             Msg::Hotkey(..)
                             | Msg::RestackStats(_)

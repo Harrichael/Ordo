@@ -65,6 +65,7 @@ const SCREEN_GAP: f64 = 4.0;
 const FRAME_PAD: f64 = 1.5;
 const FRAME_LINE: f64 = 1.0;
 const FRAME_R: f64 = 3.0;
+const BADGE: f64 = 12.0;
 const SLIDE_SECS: f64 = 0.12;
 const SLIDE_FRAMES: u32 = 8;
 /// Long enough for the engine's view of a move that landed to arrive first.
@@ -209,7 +210,7 @@ fn redraw(mailbox: &Arc<Mailbox>) {
             }
         }
         // Dimmed, the way macOS marks an item that is present but inert.
-        button.setAppearsDisabled(!view.engaged);
+        button.setAppearsDisabled(!view.engaged || view.needs_accessibility);
         let summary = NSString::from_str(&summary(&view));
         button.setToolTip(Some(&summary));
         button.setAccessibilityLabel(Some(&summary));
@@ -297,6 +298,9 @@ fn commands(mailbox: &Arc<Mailbox>) -> Box<dyn Fn(HotkeyAction)> {
 }
 
 fn summary(view: &MenuBarView) -> String {
+    if view.needs_accessibility {
+        return "Ordo needs Accessibility".into();
+    }
     let count = view.workspaces.len();
     let mut s = match view.current {
         Some(ws) => format!("Ordo — workspace {} of {count}", ws.0),
@@ -467,6 +471,27 @@ impl Strip {
     }
 }
 
+/// A disc with "!" punched out of it, as the pill's digit is: something is
+/// missing before Ordo can work.
+fn draw_badge(x: f64) {
+    NSColor::labelColor().setFill();
+    let disc = NSRect::new(NSPoint::new(x, (HEIGHT - BADGE) / 2.0), NSSize::new(BADGE, BADGE));
+    NSBezierPath::bezierPathWithOvalInRect(disc).fill();
+    let Some(ctx) = NSGraphicsContext::currentContext() else {
+        return;
+    };
+    ctx.setCompositingOperation(NSCompositingOperation::DestinationOut);
+    let font = label_font();
+    let mark = attributed("!", &font, &NSColor::blackColor());
+    let size = mark.size();
+    let baseline = HEIGHT / 2.0 - font.capHeight() / 2.0;
+    mark.drawAtPoint(NSPoint::new(
+        x + (BADGE - size.width) / 2.0,
+        baseline + font.descender(),
+    ));
+    ctx.setCompositingOperation(NSCompositingOperation::SourceOver);
+}
+
 fn screen_x(i: usize) -> f64 {
     FRAME_LINE + FRAME_PAD + i as f64 * (SCREEN_W + SCREEN_GAP)
 }
@@ -516,7 +541,9 @@ fn icon(view: &MenuBarView, strip: Option<Strip>) -> Retained<NSImage> {
         .collect();
     let marks_w =
         marks.iter().map(Mark::width).sum::<f64>() + GAP * marks.len().saturating_sub(1) as f64;
-    let width = marks_w + strip.map_or(0.0, |s| GROUP_GAP + s.width());
+    let strip_w = strip.map_or(0.0, |s| GROUP_GAP + s.width());
+    let badge = view.needs_accessibility;
+    let width = marks_w + strip_w + if badge { GROUP_GAP + BADGE } else { 0.0 };
     let draw = RcBlock::new(move |_: NSRect| -> Bool {
         let mut x = 0.0;
         for m in &marks {
@@ -525,6 +552,9 @@ fn icon(view: &MenuBarView, strip: Option<Strip>) -> Retained<NSImage> {
         }
         if let Some(s) = strip {
             s.draw(marks_w + GROUP_GAP);
+        }
+        if badge {
+            draw_badge(marks_w + strip_w + GROUP_GAP);
         }
         Bool::YES
     });
@@ -563,6 +593,12 @@ define_class!(
     struct Controller;
 
     impl Controller {
+        // SAFETY: the signature matches the action selector's.
+        #[unsafe(method(grantAccessibility:))]
+        fn grant_accessibility(&self, _sender: &NSMenuItem) {
+            crate::platform::trust::ask();
+        }
+
         // SAFETY: the signature matches the action selector's.
         #[unsafe(method(openSettings:))]
         fn open_settings(&self, _sender: &NSMenuItem) {
@@ -655,6 +691,20 @@ impl Controller {
     fn fill(&self, menu: &NSMenu, view: &MenuBarView) {
         let mtm = self.mtm();
         menu.removeAllItems();
+        if view.needs_accessibility {
+            let grant = unsafe {
+                NSMenuItem::initWithTitle_action_keyEquivalent(
+                    NSMenuItem::alloc(mtm),
+                    ns_string!("Grant Accessibility…"),
+                    Some(sel!(grantAccessibility:)),
+                    ns_string!(""),
+                )
+            };
+            unsafe { grant.setTarget(Some(self)) };
+            menu.addItem(&grant);
+            menu.addItem(&info_item("Ordo can't see windows or hear hotkeys until then", mtm));
+            menu.addItem(&NSMenuItem::separatorItem(mtm));
+        }
         menu.addItem(&NSMenuItem::sectionHeaderWithTitle(
             ns_string!("Workspaces"),
             mtm,

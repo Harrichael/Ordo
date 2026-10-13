@@ -66,10 +66,15 @@ struct TapContext {
 }
 
 /// Spawn the tap on its own thread with its own run loop. The thread runs until
-/// the process exits. Returns immediately; if the tap can't be created (no
-/// Accessibility permission), logs and the thread ends — Ordo still observes,
-/// just without hotkeys.
-pub fn spawn(tx: Sender<Msg>, intercepting: Arc<AtomicBool>, menu_bars: MenuBars, own_menu: OwnMenu) {
+/// the process exits. Returns once the tap is up (true) or refused (false,
+/// and the thread has ended): macOS refuses it without Accessibility.
+pub fn spawn(
+    tx: Sender<Msg>,
+    intercepting: Arc<AtomicBool>,
+    menu_bars: MenuBars,
+    own_menu: OwnMenu,
+) -> bool {
+    let (up_tx, up) = crossbeam_channel::bounded(1);
     std::thread::spawn(move || {
         let ctx = Box::into_raw(Box::new(TapContext {
             tx,
@@ -102,12 +107,15 @@ pub fn spawn(tx: Sender<Msg>, intercepting: Arc<AtomicBool>, menu_bars: MenuBars
             )
         };
         let Some(tap) = tap else {
-            eprintln!("ordo: could not create event tap (grant Accessibility permission).");
+            drop(unsafe { Box::from_raw(ctx) });
+            let _ = up_tx.send(false);
             return;
         };
 
         let Some(source) = CFMachPort::new_run_loop_source(None, Some(&tap), 0) else {
             eprintln!("ordo: could not create run loop source for tap.");
+            drop(unsafe { Box::from_raw(ctx) });
+            let _ = up_tx.send(false);
             return;
         };
         if let Some(rl) = CFRunLoop::current() {
@@ -116,9 +124,11 @@ pub fn spawn(tx: Sender<Msg>, intercepting: Arc<AtomicBool>, menu_bars: MenuBars
         CGEvent::tap_enable(&tap, true);
         // Hand the tap to the callback for self re-enable, then keep it alive.
         unsafe { (*ctx).tap.replace(Some(tap)) };
+        let _ = up_tx.send(true);
 
         CFRunLoop::run();
     });
+    up.recv().unwrap_or(false)
 }
 
 unsafe extern "C-unwind" fn callback(

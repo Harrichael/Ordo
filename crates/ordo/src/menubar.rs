@@ -24,6 +24,9 @@ pub struct MenuBarView {
     /// be neither seen nor parked. Not the core's belief: the scan's, which
     /// the core never hears of.
     pub unreachable: Vec<Pid>,
+    /// macOS hasn't granted Ordo Accessibility, so it sees no windows and
+    /// hears no hotkeys. The shell's, like `unreachable`.
+    pub needs_accessibility: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -91,6 +94,7 @@ impl MenuBarView {
             engaged: s.mode == Mode::Active,
             monitors: MonitorsView::of(s),
             unreachable: Vec::new(),
+            needs_accessibility: false,
         }
     }
 }

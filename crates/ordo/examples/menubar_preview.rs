@@ -5,6 +5,7 @@
 //!   cargo run --example menubar_preview            # 9 workspaces, on 3
 //!   cargo run --example menubar_preview -- paused  # the rescued look
 //!   cargo run --example menubar_preview -- off     # virtualization off
+//!   cargo run --example menubar_preview -- needs-access  # no Accessibility yet
 //!
 //! Apps named in the menu are whatever is running now (pids from this
 //! machine), and the monitors section projects three virtual monitors, the
@@ -19,6 +20,7 @@ use ordo_core::{project, HotkeyAction, Pid, VirtualMonitorId, WorkspaceId};
 fn main() {
     let paused = std::env::args().any(|a| a == "paused");
     let enabled = !std::env::args().any(|a| a == "off");
+    let needs_accessibility = std::env::args().any(|a| a == "needs-access");
     let mtm = objc2::MainThreadMarker::new().unwrap();
 
     let running: Vec<Pid> = NSWorkspace::sharedWorkspace()
@@ -53,6 +55,7 @@ fn main() {
         engaged: !paused,
         monitors: Some(monitors(enabled)),
         unreachable: Vec::new(),
+        needs_accessibility,
     };
 
     let (tx, rx) = crossbeam_channel::unbounded::<Msg>();

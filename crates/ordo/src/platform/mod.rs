@@ -36,6 +36,7 @@ pub mod settings;
 pub mod skylight;
 pub mod status_item;
 pub mod tap;
+pub mod trust;
 pub mod ws_events;
 pub mod zorder;
 
