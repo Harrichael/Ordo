@@ -120,6 +120,11 @@ cargo build --release
 ./target/release/ordo replay              # verify the last run replays clean
 ```
 
+**Install**: `./get-ordo.sh` builds a checkout (or clones `main`) into a
+signed `~/Applications/Ordo.app` and links `~/.local/bin/ordo`. It signs every
+build with one local certificate, so an Accessibility grant made once survives
+updates. Run it again to update. It does not start Ordo or add a login item.
+
 **Permission**: Ordo needs Accessibility (System Settings → Privacy & Security →
 Accessibility). Without it, it degrades to observe-without-hotkeys rather than
 crashing. It must be non-sandboxed and is best code-signed with a stable
