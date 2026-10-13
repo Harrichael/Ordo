@@ -152,6 +152,10 @@ pub enum HotkeyAction {
     /// Ctrl+Alt+Tab: MRU in the current workspace on any monitor EXCEPT the
     /// focused one — "jump to what I was last doing over there".
     MruOtherMonitor,
+    /// Alt+Shift+Backtick: `MruMonitor`, within the focused app.
+    MruMonitorApp,
+    /// Ctrl+Alt+Backtick: `MruOtherMonitor`, within the focused app.
+    MruOtherMonitorApp,
     /// Alt+End: banish the focused window to the back of the MRU history and
     /// the back of the visual stack, and focus the next MRU window — "done
     /// with this one, stop offering it (or showing it)".

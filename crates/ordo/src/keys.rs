@@ -18,8 +18,9 @@
 //!     workspace and switch there with it
 //!   - Alt+Tab                   → MRU window in the workspace
 //!   - Alt+Shift+Tab             → MRU window in the workspace + monitor
-//!   - Alt+Backtick              → MRU window in the workspace + app
 //!   - Ctrl+Alt+Tab              → MRU window on the OTHER monitor
+//!   - Alt+Backtick, Alt+Shift+Backtick, Ctrl+Alt+Backtick → the three Tab
+//!     chords above, within the focused app
 //!   - Alt+End                   → demote the focused window to the back of
 //!     the MRU history and focus the next one
 //!   - Ctrl+Alt+Cmd+Escape       → rescue candidate (engages on a double-press;
@@ -210,7 +211,11 @@ pub fn match_chord(keycode: u16, m: Mods) -> Option<Chord> {
         code::TAB if m.ctrl && m.alt && !m.cmd && !m.shift => Some(Chord::Hotkey(MruOtherMonitor)),
         code::TAB if m.alt && m.shift && !m.cmd && !m.ctrl => Some(Chord::Hotkey(MruMonitor)),
         code::TAB if m.alt && !m.shift && !m.cmd && !m.ctrl => Some(Chord::Hotkey(MruWorkspace)),
-        code::GRAVE if m.alt && !m.cmd && !m.ctrl => Some(Chord::Hotkey(MruApp)),
+        code::GRAVE if m.ctrl && m.alt && !m.cmd && !m.shift => {
+            Some(Chord::Hotkey(MruOtherMonitorApp))
+        }
+        code::GRAVE if m.alt && m.shift && !m.cmd && !m.ctrl => Some(Chord::Hotkey(MruMonitorApp)),
+        code::GRAVE if m.alt && !m.shift && !m.cmd && !m.ctrl => Some(Chord::Hotkey(MruApp)),
         code::END if m.alt && !m.shift && !m.cmd && !m.ctrl => Some(Chord::Hotkey(MruDemote)),
         _ => None,
     }
@@ -281,6 +286,8 @@ pub fn key_for(action: &HotkeyAction) -> Option<Key> {
         MruMonitor => key(code::TAB, false, true, true, false),
         MruApp => key(code::GRAVE, false, true, false, false),
         MruOtherMonitor => key(code::TAB, false, true, false, true),
+        MruMonitorApp => key(code::GRAVE, false, true, true, false),
+        MruOtherMonitorApp => key(code::GRAVE, false, true, false, true),
         MruDemote => key(code::END, false, true, false, false),
         MoveFocusedToMonitorPrev => key(code::LEFT, true, false, true, false),
         MoveFocusedToMonitorNext => key(code::RIGHT, true, false, true, false),
@@ -409,6 +416,15 @@ mod tests {
             match_chord(code::TAB, mods(false, true, false, true)),
             Some(Chord::Hotkey(MruOtherMonitor))
         );
+        assert_eq!(
+            match_chord(code::GRAVE, mods(false, true, true, false)),
+            Some(Chord::Hotkey(MruMonitorApp))
+        );
+        assert_eq!(
+            match_chord(code::GRAVE, mods(false, true, false, true)),
+            Some(Chord::Hotkey(MruOtherMonitorApp))
+        );
+        assert_eq!(match_chord(code::GRAVE, mods(false, true, true, true)), None);
         // Ctrl+Alt+Cmd+Tab is nobody's chord — the full-triple family is
         // reserved for rescue/engage keys only.
         assert_eq!(match_chord(code::TAB, mods(true, true, false, true)), None);
@@ -572,6 +588,8 @@ mod tests {
             MruMonitor,
             MruApp,
             MruOtherMonitor,
+            MruMonitorApp,
+            MruOtherMonitorApp,
             MruDemote,
             MoveFocusedToMonitorPrev,
             MoveFocusedToMonitorNext,

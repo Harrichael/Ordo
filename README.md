@@ -64,8 +64,8 @@ The two rules that make it work:
   `--observe`. Preview the design without the daemon:
   `cargo run --example menubar_preview`.
 - **MRU window focus**: `Alt+Tab` (in workspace), `Alt+Shift+Tab` (+ monitor),
-  `Alt+Backtick` (+ app), `Ctrl+Alt+Tab` (the *other* monitor). The mouse warps
-  to the focused window's center.
+  `Ctrl+Alt+Tab` (the *other* monitor); the same three with Backtick for Tab
+  stay within the focused app. The mouse warps to the focused window's center.
 - **New-window placement**: a newly created window is corralled onto the focused
   workspace and monitor.
 - **Move window to the adjacent monitor**: `Cmd+Shift+Left/Right` — focus and

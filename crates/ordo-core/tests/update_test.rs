@@ -561,6 +561,29 @@ fn alt_backtick_stays_in_the_focused_app() {
     assert_eq!(focus_targets(&step.effects), vec![wid(3)]);
 }
 
+/// The backtick chords are the Tab chords within the focused app. From w1
+/// (app 100, monitor 1), w2 of another app is the most recent window on the
+/// other monitor, and app 100 has a window on each.
+#[test]
+fn shifted_and_ctrl_backtick_mirror_their_tab_chords_within_the_focused_app() {
+    let wins = vec![
+        win(1, 100, 1, rect(100.0, 100.0)),
+        win(2, 200, 1, rect(2000.0, 100.0)),
+        win(3, 100, 1, rect(600.0, 500.0)),
+        win(4, 100, 1, rect(2400.0, 500.0)),
+    ];
+    let s = booted_with(&wins, &[3, 4, 2, 1]);
+    let pick = |s: &State, action| focus_targets(&update(s, &hotkey(action)).effects);
+    assert_eq!(pick(&s, HotkeyAction::MruOtherMonitor), vec![wid(2)]);
+    assert_eq!(pick(&s, HotkeyAction::MruOtherMonitorApp), vec![wid(4)]);
+    assert_eq!(pick(&s, HotkeyAction::MruMonitorApp), vec![wid(3)]);
+
+    // As with Ctrl+Alt+Tab, nowhere to go is no move: app 100 has no window
+    // on the other monitor here.
+    let s = booted(&[3, 2, 1]);
+    assert!(pick(&s, HotkeyAction::MruOtherMonitorApp).is_empty());
+}
+
 #[test]
 fn alt_tab_toggles_between_top_two() {
     let s = booted(&[3, 2, 1]);

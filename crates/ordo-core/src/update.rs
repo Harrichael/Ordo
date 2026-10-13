@@ -683,13 +683,24 @@ fn resolve(s: &State, action: HotkeyAction) -> Option<Command> {
         HotkeyAction::MruWorkspace
         | HotkeyAction::MruMonitor
         | HotkeyAction::MruApp
-        | HotkeyAction::MruOtherMonitor => {
+        | HotkeyAction::MruOtherMonitor
+        | HotkeyAction::MruMonitorApp
+        | HotkeyAction::MruOtherMonitorApp => {
+            let (monitors, same_app) = match action {
+                HotkeyAction::MruWorkspace => (Monitors::Any, false),
+                HotkeyAction::MruMonitor => (Monitors::Focused, false),
+                HotkeyAction::MruOtherMonitor => (Monitors::Other, false),
+                HotkeyAction::MruApp => (Monitors::Any, true),
+                HotkeyAction::MruMonitorApp => (Monitors::Focused, true),
+                HotkeyAction::MruOtherMonitorApp => (Monitors::Other, true),
+                _ => unreachable!(),
+            };
             let cur_ws = s.current_workspace()?;
             let focused = s.declared_focus();
             let focused_rec = focused.and_then(|w| s.windows.get(&w));
             // The scoped variants are relative to the focused window; with
             // nothing focused there is no "same monitor/app" to speak of.
-            if focused_rec.is_none() && action != HotkeyAction::MruWorkspace {
+            if focused_rec.is_none() && (monitors != Monitors::Any || same_app) {
                 return None;
             }
             let target = s.focus_history.most_recent(focused, |w| {
@@ -702,17 +713,12 @@ fn resolve(s: &State, action: HotkeyAction) -> Option<Command> {
                 // Monitor scoping reads the DECLARED virtual monitor, never
                 // the display: two virtual monitors collapsed onto one
                 // display are still two monitors to Alt+Shift+Tab.
-                match action {
-                    HotkeyAction::MruWorkspace => true,
-                    HotkeyAction::MruMonitor => {
-                        focused_rec.is_some_and(|f| r.vmonitor == f.vmonitor)
-                    }
-                    HotkeyAction::MruOtherMonitor => {
-                        focused_rec.is_some_and(|f| r.vmonitor != f.vmonitor)
-                    }
-                    HotkeyAction::MruApp => focused_rec.is_some_and(|f| r.app == f.app),
-                    _ => unreachable!(),
-                }
+                let on_monitor = match monitors {
+                    Monitors::Any => true,
+                    Monitors::Focused => focused_rec.is_some_and(|f| r.vmonitor == f.vmonitor),
+                    Monitors::Other => focused_rec.is_some_and(|f| r.vmonitor != f.vmonitor),
+                };
+                on_monitor && (!same_app || focused_rec.is_some_and(|f| r.app == f.app))
             })?;
             Some(Command::Focus { target })
         }
@@ -1077,6 +1083,14 @@ fn execute(
             (s.focus_intent(), op)
         }
     }
+}
+
+/// Which monitors an MRU chord ranges over, relative to the focused window.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Monitors {
+    Any,
+    Focused,
+    Other,
 }
 
 /// Collapse a burst of queued hotkeys into what the user meant by the LAST of

@@ -8,8 +8,10 @@
 | Cmd + Right | Switch to next workspace |
 | Alt + Tab | Focus most-recently-used window in the current workspace |
 | Alt + Shift + Tab | Focus MRU window in the current workspace and monitor |
-| Alt + Backtick (`) | Focus MRU window in the current workspace and app |
 | Ctrl + Alt + Tab | Focus MRU window on the other monitor |
+| Alt + Backtick (`) | Focus MRU window in the current workspace and app |
+| Alt + Shift + Backtick | Focus MRU window in the current workspace, monitor and app |
+| Ctrl + Alt + Backtick | Focus MRU window of the focused app on the other monitor |
 | Cmd + Shift + Left / Right | Move the focused window to the previous / next virtual monitor (focus and mouse go with it; a hidden monitor is viewed) |
 | Cmd + Alt + J / K | View the previous / next virtual monitor: focus its MRU window and, where displays are short, show its windows in place of the current monitor's (no wrap) |
 | Ctrl + Alt + Cmd + V | Virtualization on / off: off collapses every virtual monitor onto the displays present |
