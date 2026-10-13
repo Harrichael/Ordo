@@ -16,6 +16,8 @@ use objc2_application_services::{
 };
 use objc2_core_foundation::{CFBoolean, CFDictionary, CFString};
 
+use ordo_core::RescanTrigger;
+
 use crate::engine::Msg;
 
 /// A local check, cheap enough to poll.
@@ -38,7 +40,7 @@ pub fn ask() {
 /// Run `bring_up` (true once what it raised is up) now if Ordo is trusted,
 /// else as soon as it is. `needs` holds while it waits: untrusted, or trusted
 /// with the tap refused, the other sign of a missing grant. A late bring-up
-/// is followed by the first look that can see anything (`Msg::Sighted`).
+/// asks for a look at once, rather than at the next periodic one.
 pub fn when_trusted(
     needs: Arc<AtomicBool>,
     tx: Sender<Msg>,
@@ -56,7 +58,9 @@ pub fn when_trusted(
         }
         needs.store(false, Ordering::Relaxed);
         eprintln!("ordo: Accessibility granted; hotkeys and window tracking are up.");
-        let _ = tx.send(Msg::Sighted);
+        let _ = tx.send(Msg::Rescan(RescanTrigger::BackendHint {
+            kind: "accessibility_granted".into(),
+        }));
         return;
     });
 }

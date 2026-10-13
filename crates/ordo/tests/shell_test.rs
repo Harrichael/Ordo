@@ -1440,3 +1440,84 @@ fn each_look_is_told_where_ordo_declared_the_user_is() {
     engine.observe(RescanTrigger::Periodic);
     assert_eq!(*told.borrow(), [None, Some(VirtualMonitorId(2))]);
 }
+
+/// A world Ordo can't see until Accessibility is granted, after its first
+/// look.
+struct GrantedLater {
+    looks: usize,
+}
+
+impl WorldSource for GrantedLater {
+    fn snapshot(&mut self, _: Option<VirtualMonitorId>) -> Result<WorldSnapshot, Blind> {
+        self.looks += 1;
+        if self.looks == 1 {
+            return Err(Blind::Untrusted);
+        }
+        Ok(snap(Some(1), 1, 1))
+    }
+
+    fn take_park_trace(&mut self) -> Vec<ordo_emulated::ParkTrace> {
+        Vec::new()
+    }
+
+    fn take_snapshot_stats(&mut self) -> Option<SnapshotStats> {
+        None
+    }
+}
+
+/// Started before Accessibility was granted, Ordo's startup look sees
+/// nothing. Once granted, whatever look comes first (here a periodic one)
+/// is the startup look: nothing was born while Ordo was blind, and every
+/// window it now sees is one that was already there.
+#[test]
+fn the_first_look_that_sees_is_the_startup_look() {
+    let dir = std::env::temp_dir().join(format!("ordo-sighted-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = dir.join("sighted.db");
+    let _ = std::fs::remove_file(&db);
+    let run_id = {
+        let logger = Logger::open(&db, "test", "emulated", 1_000).unwrap();
+        let run_id = logger.run_id();
+        let engine = Engine::new(
+            logger,
+            Box::new(GrantedLater { looks: 0 }),
+            Box::new(OkEffector),
+            Box::new(StepClock { n: Cell::new(0) }),
+        );
+        let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
+        tx.send(Msg::Rescan(RescanTrigger::Periodic)).unwrap();
+        tx.send(Msg::Rescan(RescanTrigger::Periodic)).unwrap();
+        tx.send(Msg::Shutdown).unwrap();
+        engine.run(rx);
+        run_id
+    };
+    let conn = Connection::open(&db).unwrap();
+    let triggers: Vec<RescanTrigger> = conn
+        .prepare("SELECT payload FROM events WHERE kind = 'world_observed' ORDER BY seq")
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .map(|p| match serde_json::from_str(&p.unwrap()).unwrap() {
+            Event::WorldObserved { trigger, .. } => trigger,
+            _ => unreachable!(),
+        })
+        .collect();
+    assert_eq!(triggers, [RescanTrigger::Startup]);
+    // Born with focus, w1 would have been declared; at startup the OS owns it.
+    let after: ordo_core::State = serde_json::from_str(
+        &conn
+            .query_row("SELECT payload FROM checkpoints WHERE seq = 0", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(after.focus_intent(), FocusIntent::Deferred);
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM dropped_looks WHERE why = 'untrusted'"),
+        1
+    );
+    let report = replay(&conn, run_id, None).unwrap();
+    assert!(report.is_clean(), "{:?}", report.mismatches);
+    let _ = std::fs::remove_dir_all(&dir);
+}

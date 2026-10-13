@@ -110,6 +110,8 @@ pub struct Tally {
 /// Why a snapshot saw nothing to believe.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Blind {
+    /// Accessibility is not granted, so no app's windows can be read.
+    Untrusted,
     /// The display set is still changing.
     Settling,
     NoDisplays,
@@ -121,6 +123,7 @@ pub enum Blind {
 impl Blind {
     pub fn as_str(self) -> &'static str {
         match self {
+            Blind::Untrusted => "untrusted",
             Blind::Settling => "settling",
             Blind::NoDisplays => "no_displays",
             Blind::NoWindows => "no_windows",

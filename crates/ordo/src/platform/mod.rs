@@ -262,6 +262,12 @@ impl WorldSource for MacWorldSource {
         let started = Instant::now();
         // Reads the effector made since the last snapshot are not this one's.
         meter::take();
+        // Untrusted, every app refuses: a walk would read an empty desktop
+        // and call every app unreachable.
+        if !trust::trusted() {
+            self.record_stats(started, SnapshotStats::default());
+            return Err(Blind::Untrusted);
+        }
         // Mid-reconfiguration, frames are wherever macOS has got to with
         // re-homing them and the display list may be half-updated: nothing
         // is believed, corrected, or parked off a transient.

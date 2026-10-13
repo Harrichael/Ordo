@@ -64,11 +64,6 @@ pub enum Msg {
     /// The save-state chord: resume persistence and write the current model
     /// as the new durable state.
     SaveState,
-    /// Accessibility was granted after launch: every look so far saw no
-    /// windows, so the next is the startup look. Nothing was born while Ordo
-    /// was blind, and the OS owned focus throughout. A fence, so no later
-    /// trigger in its batch stands in for it.
-    Sighted,
     /// Telemetry from the restack worker, delivered as a message because the
     /// SQLite logger is engine-thread-only. Never becomes a core event.
     RestackStats(RestackStats),
@@ -201,6 +196,13 @@ pub struct Engine {
     /// the core reads a gesture on the very next look, and a press in the
     /// meantime would clear it.
     gesture_unseen: bool,
+    /// Some look has seen the world. Until one does, Ordo started blind (no
+    /// Accessibility yet, a locked screen, displays asleep), and the first
+    /// look that sees is the startup look, whoever asked for it: nothing was
+    /// born while Ordo couldn't see, and the OS owned focus throughout.
+    /// Any thread's look can be that first one, since a grant reaches every
+    /// thread at once.
+    sighted: bool,
 }
 
 type StateWatcher = Box<dyn FnMut(&State)>;
@@ -223,6 +225,7 @@ impl Engine {
             gate: None,
             held_since: None,
             gesture_unseen: false,
+            sighted: false,
         }
     }
 
@@ -307,7 +310,7 @@ impl Engine {
     /// originate here (or from a `RequestRescan` cascade) — never from an
     /// external producer, which cannot touch the thread-affine world source.
     pub fn observe(&mut self, trigger: RescanTrigger) {
-        if let Some(snap) = self.take_look(&trigger) {
+        if let Some((trigger, snap)) = self.take_look(trigger) {
             self.pump(Event::WorldObserved {
                 at: self.clock.now(),
                 trigger,
@@ -321,7 +324,11 @@ impl Engine {
     /// "missing", and believing that once erased the whole model over a
     /// weekend. A blind look is only logged; the next sighted one self-heals
     /// whatever actually changed.
-    fn take_look(&mut self, trigger: &RescanTrigger) -> Option<WorldSnapshot> {
+    ///
+    /// The first look that sees the world is the startup look, whatever
+    /// asked for it (see `Engine::sighted`), so it comes back with its
+    /// trigger.
+    fn take_look(&mut self, trigger: RescanTrigger) -> Option<(RescanTrigger, WorldSnapshot)> {
         let held = self.looked();
         let snap = self.world.snapshot(self.state.declared_vmonitor());
         self.drain_park_trace();
@@ -329,7 +336,12 @@ impl Engine {
         match snap {
             Ok(snap) => {
                 self.snapshot_costs.push_back(cost);
-                Some(snap)
+                let trigger = if std::mem::replace(&mut self.sighted, true) {
+                    trigger
+                } else {
+                    RescanTrigger::Startup
+                };
+                Some((trigger, snap))
             }
             Err(why) => {
                 let wall_ms = self.clock.now().wall_ms;
@@ -337,7 +349,7 @@ impl Engine {
                     let seq = self.logger.next_seq();
                     let _ = self.logger.log_snapshot_stats(seq, cost, Some(why), wall_ms);
                 }
-                let _ = self.logger.log_dropped_look(why.as_str(), trigger, wall_ms);
+                let _ = self.logger.log_dropped_look(why.as_str(), &trigger, wall_ms);
                 None
             }
         }
@@ -437,7 +449,6 @@ impl Engine {
                                 });
                             }
                             Msg::SaveState => self.effector.persist_workspaces(),
-                            Msg::Sighted => self.observe(RescanTrigger::Startup),
                             Msg::Shutdown => break 'recv,
                             Msg::Hotkey(..)
                             | Msg::RestackStats(_)
@@ -537,12 +548,12 @@ impl Engine {
                 if self.hold_look(reason.clone()) {
                     return;
                 }
-                let Some(snap) = self.take_look(reason) else {
+                let Some((trigger, snap)) = self.take_look(reason.clone()) else {
                     return;
                 };
                 queue.push_back(Event::WorldObserved {
                     at: self.clock.now(),
-                    trigger: reason.clone(),
+                    trigger,
                     snap,
                 });
             }
