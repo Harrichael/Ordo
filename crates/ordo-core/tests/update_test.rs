@@ -4828,6 +4828,54 @@ fn replugging_rehosts_a_windows_frame_without_adopting() {
     assert!(quiet.effects.is_empty(), "{:?}", quiet.effects);
 }
 
+/// A window left at Ordo's park while declared on screen (a restore that
+/// didn't land, once the backend stops standing its promise in for it) is
+/// off every display. That is the mechanism's doing, not a hand's: nothing
+/// adopts it onto the display nearest it, however long it stays, and a
+/// display change carries nothing there.
+#[test]
+fn a_window_left_at_the_park_is_never_adopted_or_carried() {
+    let s = booted(&[1]);
+    let mut wins = std_windows();
+    // Declared on monitor 2, on the second display; seen at the park, its
+    // whole body but one point off the left of the leftmost display.
+    wins[1].snap.frame = rect(0.0 - 400.0 + 1.0, 100.0);
+    wins[1] = on_monitor(wins[1].clone(), 2);
+    let mon_c = Mon {
+        snap: MonitorSnap {
+            id: mid(3),
+            frame: Rect {
+                x: 3840.0,
+                y: 0.0,
+                w: 1920.0,
+                h: 1080.0,
+            },
+            is_main: false,
+        },
+        active: ws(1),
+        count: 3,
+    };
+    let start = ts();
+    let mut st = s;
+    for (ms, mons) in [
+        (0, vec![mon_a(1), mon_b(1)]),
+        (600, vec![mon_a(1), mon_b(1)]),
+        (1_200, vec![mon_a(1), mon_b(1)]),
+        (2_400, vec![mon_a(1), mon_b(1), mon_c.clone()]),
+        (3_600, vec![mon_a(1), mon_b(1), mon_c.clone()]),
+    ] {
+        let step = update(
+            &st,
+            &observed_at(plus_ms(start, ms), mons, wins.clone(), Some(1), RescanTrigger::Periodic),
+        );
+        assert!(monitor_assignments(&step.effects).is_empty(), "{:?}", step.effects);
+        assert_eq!(count_set_frames(&step.effects, 2), 0, "{:?}", step.effects);
+        assert!(!step.notes.iter().any(|n| matches!(n, Note::MonitorAdopted { .. })));
+        st = step.state;
+    }
+    assert_eq!(st.windows[&wid(2)].vmonitor, vm(2));
+}
+
 #[test]
 fn unplugging_never_adopts_the_windows_macos_rehomed() {
     // Full rig, w2 on the second display and declared on monitor 2.

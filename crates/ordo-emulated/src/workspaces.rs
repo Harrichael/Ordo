@@ -21,7 +21,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ordo_core::{
     project, Pid, Point, Rect, VirtualMonitorId, VirtualMonitors, WindowId,
@@ -59,6 +59,12 @@ const CLAMP_SLACK: f64 = 160.0;
 /// permanent, while a visibly misplaced window is obvious and self-heals on
 /// the next switch or command.
 const ENFORCE_LIMIT: u8 = 3;
+
+/// How long after Ordo sends a window onto the screen its promise still
+/// stands in for it if it is found at its park: long enough for the write to
+/// land. Past that the window is believed where it is, and the core and the
+/// log see a restore that didn't land.
+const RESTORE_GRACE: Duration = Duration::from_secs(2);
 
 /// Each app's windows that are off screen, with where each is parked.
 type ParkedByApp = HashMap<Pid, Vec<(WindowId, Point)>>;
@@ -207,6 +213,10 @@ pub struct EmulatedWorkspaces {
     /// re-issuing an identical corner write every pass while the first is
     /// still in flight was a self-sustaining write loop.
     pending_repark: HashSet<WindowId>,
+    /// When Ordo last sent each window onto the screen (a restore, a rehome,
+    /// a rehost): how long its promise may stand in for it at its park (see
+    /// `RESTORE_GRACE`).
+    revealed_at: HashMap<WindowId, Instant>,
     /// Display geometry as of the last enforcement pass. Any change moves the
     /// park corner itself — a systemic event no window should be blamed for.
     last_geometry: Option<Geometry>,
@@ -265,6 +275,7 @@ impl EmulatedWorkspaces {
             enforce_attempts: HashMap::new(),
             park_request: HashMap::new(),
             last_requested: HashMap::new(),
+            revealed_at: HashMap::new(),
             pending_repark: HashSet::new(),
             last_geometry: None,
             state_path: None,
@@ -532,6 +543,7 @@ impl EmulatedWorkspaces {
             self.park_request.remove(id);
             self.last_requested.remove(id);
             self.pending_repark.remove(id);
+            self.revealed_at.remove(id);
         }
     }
 
@@ -543,8 +555,12 @@ impl EmulatedWorkspaces {
     /// and the trace are about, but only its ORIGIN is sent: this model moves
     /// windows, it never resizes them ([`Desktop::move_windows`]).
     fn move_windows(&mut self, d: &dyn Desktop, writes: &[(Pid, WindowId, Rect)]) {
+        let now = d.now();
         for (_, w, f) in writes {
             self.last_requested.insert(*w, *f);
+            if !self.parked.contains(w) {
+                self.revealed_at.insert(*w, now);
+            }
         }
         // Decided before this is called, so `parked` already says which way
         // each write goes.
@@ -897,18 +913,28 @@ impl EmulatedWorkspaces {
     /// monitor scoping, our own park/restore writes logged as external
     /// changes). Covers restore lag too: `saved` outlives the parked flag, so
     /// a just-restored window reads as its real frame while the write is
-    /// still in flight.
+    /// still in flight — for `RESTORE_GRACE` only. A window declared on
+    /// screen and still at its park after that is a restore that didn't land
+    /// (refused, undone, or never sent), and is believed where it is.
     pub fn believed_frames(
         &self,
         frames: &HashMap<WindowId, (Pid, Rect)>,
         screens: &Screens,
+        now: Instant,
     ) -> HashMap<WindowId, Rect> {
         if self.saved.is_empty() && self.homecoming.is_empty() {
             return HashMap::new();
         }
         let g = Geometry::of(screens);
+        let proj = self.ledger.projection();
+        let landing = |w: &WindowId| {
+            self.revealed_at
+                .get(w)
+                .is_some_and(|t| now.saturating_duration_since(*t) < RESTORE_GRACE)
+        };
         let mut believed: HashMap<WindowId, Rect> = frames
             .iter()
+            .filter(|(w, _)| !self.ledger.visible(**w, &proj) || landing(w))
             .filter_map(|(w, (_, f))| {
                 let saved = self.saved.get(w)?;
                 self.reads_parked(*w, f, &g).then_some((*w, *saved))
@@ -1024,11 +1050,21 @@ impl EmulatedWorkspaces {
             .filter(|w| !self.ledger.visible(**w, &proj))
             .copied()
             .collect();
+        // On screen by declaration, yet bookkept parked or found at the park.
         let stranded: Vec<WindowId> = claims
             .keys()
-            .filter(|w| self.ledger.visible(**w, &proj) && self.parked.contains(w))
+            .filter(|w| self.ledger.visible(**w, &proj))
+            .filter(|w| {
+                self.parked.contains(w)
+                    || frames
+                        .get(w)
+                        .is_some_and(|(_, f)| self.reads_parked(**w, f, &g))
+            })
             .copied()
             .collect();
+        // A window back on screen ends its episode.
+        self.enforce_attempts
+            .retain(|w, _| !self.ledger.visible(*w, &proj) || stranded.contains(w));
         // This runs on every snapshot; don't pay for a quiet desktop.
         if hidden.is_empty() && stranded.is_empty() {
             return;
@@ -1159,9 +1195,43 @@ impl EmulatedWorkspaces {
         }
         let mut restored = false;
         for w in stranded {
+            // Not bookkept parked, yet at the park: a restore refused, or
+            // undone by its app, or one macOS put back at its last frame of a
+            // rig where that frame was the park (a replug). Restored again,
+            // counted like a foreign escape from a park.
+            let charged = if self.parked.contains(&w) {
+                None
+            } else {
+                if d.in_flight(w) {
+                    continue;
+                }
+                let n = self.enforce_attempts.get(&w).copied().unwrap_or(0);
+                if n >= ENFORCE_LIMIT {
+                    if n == ENFORCE_LIMIT {
+                        self.enforce_attempts.insert(w, n + 1);
+                        eprintln!(
+                            "ordo: window {} keeps returning to its park; standing down — \
+                             it stays declared on screen",
+                            w.0
+                        );
+                        let mut t = ParkTrace::new(w, ParkTraceKind::Standoff)
+                            .attempt(ENFORCE_LIMIT)
+                            .detail("restore limit reached; declaration kept, writes stopped");
+                        if let Some((_, f)) = frames.get(&w) {
+                            t = t.observed(*f);
+                        }
+                        self.note(t);
+                    }
+                    continue;
+                }
+                Some(if systemic { n } else { n + 1 })
+            };
             if let Some(write) = self.restore(w, frames, &g) {
                 writes.push(write);
                 restored = true;
+            }
+            if let Some(n) = charged {
+                self.enforce_attempts.insert(w, n);
             }
         }
         // A blind-spot park or a restore changed durable promises — and what
@@ -2654,7 +2724,7 @@ mod tests {
         b.move_window_to_workspace(&d, w(1), ws(2)).unwrap();
 
         let frames = frames_of(&d);
-        let believed = b.believed_frames(&frames, &d.screens());
+        let believed = b.believed_frames(&frames, &d.screens(), d.now());
         assert_eq!(
             believed.get(&w(1)),
             Some(&rect(100.0, 100.0)),
@@ -2691,7 +2761,7 @@ mod tests {
         b.move_window_to_workspace(&d, w(1), ws(2)).unwrap(); // parks w1
 
         let frames = d.scan();
-        let believed = b.believed_frames(&frames, &d.screens());
+        let believed = b.believed_frames(&frames, &d.screens(), d.now());
         // The parked window reads as its promise, not the corner artifact…
         assert_eq!(believed.get(&w(1)), Some(&rect(100.0, 100.0)));
         // …and a visible window's observation stands.
@@ -2704,7 +2774,7 @@ mod tests {
         d.freeze();
         b.switch_workspace(&d, ws(2));
         let frames = d.scan();
-        let believed = b.believed_frames(&frames, &d.screens());
+        let believed = b.believed_frames(&frames, &d.screens(), d.now());
         assert_eq!(believed.get(&w(1)), Some(&rect(100.0, 100.0)));
     }
 
@@ -3188,7 +3258,7 @@ mod tests {
             // The core is fed the promise, not the sliver, at every depth —
             // when this failed, MRU scoping and monitor attribution reasoned
             // about a window living at the display corner.
-            let believed = b.believed_frames(&frames_of(&d), &d.screens());
+            let believed = b.believed_frames(&frames_of(&d), &d.screens(), d.now());
             assert_eq!(believed.get(&w(1)), Some(&rect(100.0, 100.0)));
 
             // The promise stayed the window's real frame, so it comes back
@@ -3642,7 +3712,7 @@ mod tests {
             .iter()
             .any(|t| t.kind == ParkTraceKind::Rehost && t.window == w(2)));
         // Belief and screen agree, so the core sees no promise to re-host.
-        assert!(b.believed_frames(&frames_of(&d), &d.screens()).is_empty());
+        assert!(b.believed_frames(&frames_of(&d), &d.screens(), d.now()).is_empty());
     }
 
     /// On one display, the monitor not being viewed is parked, and by default
@@ -3938,7 +4008,7 @@ mod tests {
         b.note_scan(&d, &d.scan(), &d.screens(), None);
         b.enforce_placement(&d, &stale, &d.screens(), d.front());
         assert_eq!(d.frame(w(1)), rect(100.0, 100.0), "left on screen, back home");
-        assert_eq!(b.believed_frames(&stale, &d.screens())[&w(1)], rect(100.0, 100.0));
+        assert_eq!(b.believed_frames(&stale, &d.screens(), d.now())[&w(1)], rect(100.0, 100.0));
         assert_eq!(d.frame(w(2)), rect(2000.0, 100.0));
 
         rescan(&d, &mut b);
@@ -3998,6 +4068,67 @@ mod tests {
             "landed on the new display: {f:?}"
         );
         assert_eq!((f.w, f.h), (800.0, 600.0), "size is the window's own");
+    }
+
+    /// A window on screen whose last restore landed, then found back at its
+    /// park: what remains once macOS, at a replug after sleep, puts it at its
+    /// last frame under the docked rig, which was Ordo's old park (run 61,
+    /// 2026-10-08 07:25: kitty's window, its monitor left blank until the
+    /// user switched away and back).
+    fn restored_then_found_at_its_park() -> (FakeDesktop, EmulatedWorkspaces) {
+        let (d, mut b) = rig();
+        b.switch_workspace(&d, ws(2));
+        b.switch_workspace(&d, ws(1));
+        assert_eq!(d.frame(w(1)), rect(100.0, 100.0), "the restore landed");
+        d.place(w(1), park_frame(d.frame(w(1)), &geo()));
+        b.take_trace();
+        (d, b)
+    }
+
+    fn traced(b: &mut EmulatedWorkspaces, kind: ParkTraceKind) -> usize {
+        b.take_trace()
+            .iter()
+            .filter(|t| t.window == w(1) && t.kind == kind)
+            .count()
+    }
+
+    #[test]
+    fn a_window_declared_on_screen_found_at_its_park_is_restored_once() {
+        let (d, mut b) = restored_then_found_at_its_park();
+        rescan(&d, &mut b);
+        assert_eq!(d.frame(w(1)), rect(100.0, 100.0));
+        assert_eq!(traced(&mut b, ParkTraceKind::Restore), 1);
+        rescan(&d, &mut b);
+        assert_eq!(traced(&mut b, ParkTraceKind::Restore), 0, "nothing more to do");
+    }
+
+    /// The app refuses every restore. Each look restores it again, up to the
+    /// limit, then stands down loudly; the declaration is never touched. Once
+    /// the last restore is older than the grace, the window is believed where
+    /// it really is, the park, instead of at its promise.
+    #[test]
+    fn a_refused_restore_is_retried_under_damping_and_then_believed_where_it_is() {
+        let (d, mut b) = restored_then_found_at_its_park();
+        d.freeze();
+        let park = d.frame(w(1));
+        let mut restores = 0;
+        let mut standoffs = 0;
+        for _ in 0..5 {
+            rescan(&d, &mut b);
+            let trace = b.take_trace();
+            let count = |kind| trace.iter().filter(|t| t.window == w(1) && t.kind == kind).count();
+            restores += count(ParkTraceKind::Restore);
+            standoffs += count(ParkTraceKind::Standoff);
+            let believed = b.believed_frames(&d.scan(), &d.screens(), d.now());
+            assert_eq!(believed.get(&w(1)), Some(&rect(100.0, 100.0)), "a restore is landing");
+        }
+        assert_eq!((restores, standoffs), (ENFORCE_LIMIT as usize, 1));
+        assert_eq!(b.window_ws()[&w(1)], ws(1));
+        assert_eq!(b.window_monitors()[&w(1)], vm(1));
+
+        d.now.set(d.now.get() + RESTORE_GRACE);
+        let believed = b.believed_frames(&d.scan(), &d.screens(), d.now());
+        assert_eq!(believed.get(&w(1)), None, "seen at {park:?}, believed there");
     }
 
     /// A display change is systemic: the view keeps the monitor the core

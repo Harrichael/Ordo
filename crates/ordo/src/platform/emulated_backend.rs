@@ -259,7 +259,8 @@ impl WorkspaceBackend for EmulatedBackend {
         frames: &HashMap<WindowId, (Pid, Rect)>,
         monitors: &[(MonitorId, Rect, bool)],
     ) -> HashMap<WindowId, Rect> {
-        self.model.believed_frames(frames, &screens(monitors))
+        self.model
+            .believed_frames(frames, &screens(monitors), self.desktop.now())
     }
 
     fn take_park_trace(&mut self) -> Vec<ParkTrace> {

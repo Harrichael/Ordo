@@ -1833,10 +1833,15 @@ fn project_windows(
     };
     let busy = |s: &State, w: WindowId| s.pending.iter().any(|p| p.expect.window() == Some(w));
 
+    // A window off every display is Ordo's own park: the corner puts the
+    // whole body off the left of the leftmost display, and macOS stops a
+    // human landing one there. Adopting it, or carrying it to another
+    // display, would file the window where the mechanism left it.
     let misplaced: Vec<WindowRecord> = s
         .windows
         .values()
         .filter(|r| s.is_visible(r) && s.host_of(r.vmonitor).is_some_and(|h| h != r.monitor))
+        .filter(|r| s.monitors.values().any(|m| m.frame.contains(r.frame.center())))
         .cloned()
         .collect();
     let still: std::collections::BTreeSet<WindowId> = misplaced.iter().map(|r| r.id).collect();
