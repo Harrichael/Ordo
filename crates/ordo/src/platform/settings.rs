@@ -4,16 +4,22 @@
 //! on every change. Debug mode is not kept: it is off at every launch (see
 //! [`crate::debug`]).
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::rc::{Rc, Weak};
 
 use crossbeam_channel::Sender;
 use objc2::rc::Retained;
-use objc2::runtime::{AnyObject, Sel};
-use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadOnly};
+use objc2::runtime::AnyObject;
+use objc2::{define_class, msg_send, AnyThread, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{
-    NSControlStateValueOff, NSControlStateValueOn, NSImage, NSMenu, NSMenuItem,
+    NSAttributedStringNSStringDrawing, NSAutoresizingMaskOptions, NSBezierPath, NSColor, NSEvent,
+    NSFont, NSFontAttributeName, NSForegroundColorAttributeName, NSImage, NSMenu, NSMenuItem,
+    NSView,
 };
-use objc2_foundation::{ns_string, MainThreadMarker, NSObject, NSObjectProtocol, NSString, NSUserDefaults};
+use objc2_foundation::{
+    ns_string, MainThreadMarker, NSAttributedString, NSDictionary, NSPoint, NSRect, NSSize,
+    NSString, NSUserDefaults,
+};
 use ordo_emulated::{HideWhen, Hiding, Idle};
 
 use crate::engine::Msg;
@@ -61,83 +67,66 @@ fn save_hiding(hiding: Hiding) {
     }
 }
 
-pub struct Ivars {
-    tx: Sender<Msg>,
-    hiding: Cell<Hiding>,
+/// One of the submenu's choices.
+#[derive(Clone, Copy, PartialEq)]
+enum Choice {
+    Debug,
+    When(HideWhen),
+    Idle(Idle),
 }
 
-define_class!(
-    // SAFETY: NSObject has no subclassing requirements, and Settings does
-    // not implement Drop.
-    #[unsafe(super = NSObject)]
-    #[thread_kind = MainThreadOnly]
-    #[name = "OrdoSettings"]
-    #[ivars = Ivars]
-    pub struct Settings;
-
-    impl Settings {
-        // SAFETY: each signature matches its action selector's.
-        #[unsafe(method(toggleDebug:))]
-        fn toggle_debug(&self, _sender: &NSMenuItem) {
-            crate::debug::set(!crate::debug::enabled());
-        }
-
-        #[unsafe(method(pickWhen:))]
-        fn pick_when(&self, sender: &NSMenuItem) {
-            let when = WHEN[sender.tag() as usize].0;
-            self.change(Hiding { when, ..self.ivars().hiding.get() });
-        }
-
-        #[unsafe(method(pickIdle:))]
-        fn pick_idle(&self, sender: &NSMenuItem) {
-            let idle = IDLE[sender.tag() as usize].0;
-            self.change(Hiding { idle, ..self.ivars().hiding.get() });
-        }
-    }
-
-    unsafe impl NSObjectProtocol for Settings {}
-);
+/// The choices as they stand, and the rows of the submenu last built.
+pub struct Settings {
+    tx: Sender<Msg>,
+    hiding: Cell<Hiding>,
+    rows: RefCell<Vec<Retained<ChoiceRow>>>,
+}
 
 impl Settings {
-    pub fn new(tx: Sender<Msg>, mtm: MainThreadMarker) -> Retained<Self> {
-        let this = Self::alloc(mtm).set_ivars(Ivars {
+    pub fn new(tx: Sender<Msg>) -> Rc<Self> {
+        Rc::new(Settings {
             tx,
             hiding: Cell::new(saved_hiding()),
-        });
-        unsafe { msg_send![super(this), init] }
+            rows: RefCell::new(Vec::new()),
+        })
     }
 
     /// The "Settings" item and its submenu, as things stand now. Built each
     /// time Ordo's menu opens, so the checkmarks are current.
-    pub fn item(&self) -> Retained<NSMenuItem> {
-        let mtm = self.mtm();
-        let hiding = self.ivars().hiding.get();
+    pub fn item(self: &Rc<Self>, mtm: MainThreadMarker) -> Retained<NSMenuItem> {
         let menu = NSMenu::new(mtm);
         menu.setAutoenablesItems(false);
+        let mut rows = Vec::new();
+        let mut add = |choice, title: &str| {
+            let row = ChoiceRow::new(Rc::downgrade(self), choice, title, mtm);
+            let item = NSMenuItem::new(mtm);
+            item.setView(Some(&row));
+            menu.addItem(&item);
+            rows.push(row.clone());
+            row
+        };
 
-        let debug = self.choice("Debug mode", sel!(toggleDebug:), 0, crate::debug::enabled());
-        debug.setToolTip(Some(ns_string!(
+        add(Choice::Debug, "Debug mode").setToolTip(Some(ns_string!(
             "Logs the stacking order at each step of a switch. Costs a few ms per switch; off at every launch."
         )));
-        menu.addItem(&debug);
-
         menu.addItem(&NSMenuItem::separatorItem(mtm));
         menu.addItem(&NSMenuItem::sectionHeaderWithTitle(
             ns_string!("Hide apps with nothing to show"),
             mtm,
         ));
-        for (i, (when, title, _)) in WHEN.iter().enumerate() {
-            menu.addItem(&self.choice(title, sel!(pickWhen:), i, *when == hiding.when));
+        for (when, title, _) in WHEN {
+            add(Choice::When(when), title);
         }
-
         menu.addItem(&NSMenuItem::separatorItem(mtm));
         menu.addItem(&NSMenuItem::sectionHeaderWithTitle(
             ns_string!("An app has nothing to show when"),
             mtm,
         ));
-        for (i, (idle, title, _)) in IDLE.iter().enumerate() {
-            menu.addItem(&self.choice(title, sel!(pickIdle:), i, *idle == hiding.idle));
+        for (idle, title, _) in IDLE {
+            add(Choice::Idle(idle), title);
         }
+        *self.rows.borrow_mut() = rows;
+        self.refresh();
 
         let item = NSMenuItem::new(mtm);
         item.setTitle(ns_string!("Settings"));
@@ -152,24 +141,149 @@ impl Settings {
         item
     }
 
-    fn choice(&self, title: &str, action: Sel, tag: usize, on: bool) -> Retained<NSMenuItem> {
-        let item = unsafe {
-            NSMenuItem::initWithTitle_action_keyEquivalent(
-                NSMenuItem::alloc(self.mtm()),
-                &NSString::from_str(title),
-                Some(action),
-                ns_string!(""),
-            )
-        };
-        unsafe { item.setTarget(Some(self)) };
-        item.setTag(tag as isize);
-        item.setState(if on { NSControlStateValueOn } else { NSControlStateValueOff });
-        item
+    fn is_on(&self, choice: Choice) -> bool {
+        let hiding = self.hiding.get();
+        match choice {
+            Choice::Debug => crate::debug::enabled(),
+            Choice::When(when) => when == hiding.when,
+            Choice::Idle(idle) => idle == hiding.idle,
+        }
+    }
+
+    fn pick(&self, choice: Choice) {
+        let hiding = self.hiding.get();
+        match choice {
+            Choice::Debug => crate::debug::set(!crate::debug::enabled()),
+            Choice::When(when) => self.change(Hiding { when, ..hiding }),
+            Choice::Idle(idle) => self.change(Hiding { idle, ..hiding }),
+        }
+        self.refresh();
     }
 
     fn change(&self, hiding: Hiding) {
-        self.ivars().hiding.set(hiding);
+        self.hiding.set(hiding);
         save_hiding(hiding);
-        let _ = self.ivars().tx.send(Msg::Hiding(hiding));
+        let _ = self.tx.send(Msg::Hiding(hiding));
+    }
+
+    /// Every row's check, so a pick moves its group's at once.
+    fn refresh(&self) {
+        for row in self.rows.borrow().iter() {
+            let on = self.is_on(row.ivars().choice);
+            if row.ivars().on.replace(on) != on {
+                // Now: a menu tracking the mouse may not reach the end of a
+                // run loop pass, where a deferred redraw would happen.
+                row.setNeedsDisplay(true);
+                row.displayIfNeeded();
+            }
+        }
+    }
+}
+
+const ROW_H: f64 = 22.0;
+/// The highlight's inset from the menu's edges, as macOS draws its own.
+const INSET_X: f64 = 5.0;
+const HIGHLIGHT_R: f64 = 4.0;
+const CHECK_X: f64 = 10.0;
+const TITLE_X: f64 = 24.0;
+const PAD_RIGHT: f64 = 20.0;
+
+pub struct RowIvars {
+    settings: Weak<Settings>,
+    choice: Choice,
+    title: String,
+    on: Cell<bool>,
+}
+
+define_class!(
+    // SAFETY: NSView has no subclassing requirements beyond these overrides,
+    // and ChoiceRow does not implement Drop.
+    #[unsafe(super(NSView))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "OrdoSettingsChoiceRow"]
+    #[ivars = RowIvars]
+    pub struct ChoiceRow;
+
+    impl ChoiceRow {
+        #[unsafe(method(isFlipped))]
+        fn is_flipped(&self) -> bool {
+            true
+        }
+
+        // The menu redraws a view item as its highlight changes, the pointer
+        // or the arrow keys moving over it.
+        #[unsafe(method(drawRect:))]
+        fn draw_rect(&self, _dirty: NSRect) {
+            let lit = self.enclosingMenuItem().is_some_and(|item| item.isHighlighted());
+            let width = self.bounds().size.width;
+            if lit {
+                let h = NSRect::new(
+                    NSPoint::new(INSET_X, 0.0),
+                    NSSize::new(width - 2.0 * INSET_X, ROW_H),
+                );
+                NSColor::selectedContentBackgroundColor().setFill();
+                NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(h, HIGHLIGHT_R, HIGHLIGHT_R)
+                    .fill();
+            }
+            let ink = if lit {
+                NSColor::selectedMenuItemTextColor()
+            } else {
+                NSColor::labelColor()
+            };
+            let font = NSFont::menuFontOfSize(0.0);
+            let ivars = self.ivars();
+            if ivars.on.get() {
+                text("✓", &font, &ink).drawAtPoint(NSPoint::new(CHECK_X, 3.0));
+            }
+            text(&ivars.title, &font, &ink).drawAtPoint(NSPoint::new(TITLE_X, 3.0));
+        }
+
+        // Kept by the row, so the press stays with the view its release
+        // comes to.
+        #[unsafe(method(mouseDown:))]
+        fn mouse_down(&self, _event: &NSEvent) {}
+
+        // A view item's click is the view's own, and the menu stays open
+        // through it: what lets several settings be changed in a row.
+        #[unsafe(method(mouseUp:))]
+        fn mouse_up(&self, _event: &NSEvent) {
+            if let Some(settings) = self.ivars().settings.upgrade() {
+                settings.pick(self.ivars().choice);
+            }
+        }
+    }
+);
+
+impl ChoiceRow {
+    fn new(settings: Weak<Settings>, choice: Choice, title: &str, mtm: MainThreadMarker) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(RowIvars {
+            settings,
+            choice,
+            title: title.to_string(),
+            on: Cell::new(false),
+        });
+        let width = TITLE_X
+            + text(title, &NSFont::menuFontOfSize(0.0), &NSColor::labelColor())
+                .size()
+                .width
+            + PAD_RIGHT;
+        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width.ceil(), ROW_H));
+        let this: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
+        this.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
+        this
+    }
+}
+
+fn text(s: &str, font: &NSFont, color: &NSColor) -> Retained<NSAttributedString> {
+    let attrs = NSDictionary::from_slices(
+        unsafe { &[NSFontAttributeName, NSForegroundColorAttributeName] },
+        &[&**font as &AnyObject, &**color],
+    );
+    unsafe {
+        NSAttributedString::initWithString_attributes(
+            NSAttributedString::alloc(),
+            &NSString::from_str(s),
+            Some(&attrs),
+        )
     }
 }

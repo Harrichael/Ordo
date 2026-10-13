@@ -15,6 +15,7 @@
 //! a second decision path.
 
 use std::cell::{Cell, OnceCell};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -548,8 +549,7 @@ struct Ivars {
     /// Kept across rebuilds so a view change can slide the frame it drew.
     map: OnceCell<Retained<MonitorMap>>,
     list: OnceCell<Retained<WorkspaceList>>,
-    /// The target of the Settings submenu's items, which hold it weakly.
-    settings: OnceCell<Retained<Settings>>,
+    settings: OnceCell<Rc<Settings>>,
     open: Cell<bool>,
 }
 
@@ -616,10 +616,10 @@ impl Controller {
             .get_or_init(|| MonitorMap::new(self.mtm(), commands(&self.ivars().mailbox)))
     }
 
-    fn settings(&self) -> &Settings {
+    fn settings(&self) -> &Rc<Settings> {
         self.ivars()
             .settings
-            .get_or_init(|| Settings::new(self.ivars().mailbox.tx.clone(), self.mtm()))
+            .get_or_init(|| Settings::new(self.ivars().mailbox.tx.clone()))
     }
 
     fn list(&self) -> &WorkspaceList {
@@ -688,7 +688,7 @@ impl Controller {
             }
         }
         menu.addItem(&NSMenuItem::separatorItem(mtm));
-        menu.addItem(&self.settings().item());
+        menu.addItem(&self.settings().item(mtm));
     }
 }
 
