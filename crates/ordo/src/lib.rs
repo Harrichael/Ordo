@@ -17,6 +17,7 @@
 //!   `ordo-skylight-sys`), bound to the trait under [`platform`].
 //! - [`clock`] — the one place time is read.
 //! - [`debug`] — the debug-mode switch for costly diagnostics.
+//! - [`instance`] — the one-daemon-per-log claim.
 //! - [`menubar`] — what the menu bar item shows, derived from the core's state.
 //! - [`platform`] — the macOS FFI: displays, Accessibility, SkyLight, mouse.
 //! - [`rescue`] — the log-driven recovery gather.
@@ -28,6 +29,7 @@ pub mod backend;
 pub mod clock;
 pub mod debug;
 pub mod engine;
+pub mod instance;
 pub mod keys;
 pub mod logger;
 pub mod menubar;

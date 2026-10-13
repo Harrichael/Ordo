@@ -126,6 +126,28 @@ fn run(
     use ordo_core::RescanTrigger;
 
     let path = db_path(db);
+    let dir = path.parent().unwrap_or(std::path::Path::new(".")).to_path_buf();
+    // Bound for the rest of the process: `run` never returns, and the claim
+    // is released by the kernel when the process exits.
+    let _claim = match ordo::instance::claim(&dir) {
+        Ok(c) => c,
+        Err(ordo::instance::Refused::Held(lock)) => {
+            let pid = std::fs::read_to_string(pid_path(&path))
+                .ok()
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.is_empty())
+                .map_or("pid unknown".to_string(), |p| format!("pid {p}"));
+            eprintln!(
+                "ordo: another Ordo is already running for this log ({pid}, holding {}); not starting.",
+                lock.display()
+            );
+            std::process::exit(1);
+        }
+        Err(ordo::instance::Refused::Io(lock, e)) => {
+            eprintln!("ordo: cannot claim {}: {e}; not starting.", lock.display());
+            std::process::exit(1);
+        }
+    };
     if observe {
         println!("ordo: observe-only. Logging to {}", path.display());
     } else {
