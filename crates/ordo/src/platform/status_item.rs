@@ -37,12 +37,12 @@ use objc2_foundation::{
     NSPoint, NSRect, NSSize, NSString,
 };
 
-use ordo_core::{Gesture, HotkeyAction, Point, Rect};
+use ordo_core::{Gesture, HotkeyAction};
 
 use crate::engine::Msg;
 use crate::menubar::{MenuBarView, MonitorsView};
 use crate::platform::monitor_map::MonitorMap;
-use crate::platform::settings::{saved_hiding, SettingsPanel};
+use crate::platform::settings::{saved_hiding, Settings};
 use crate::platform::workspace_list::{Row, WorkspaceList};
 
 /// Image height; the status bar centers it vertically.
@@ -79,60 +79,29 @@ struct Mailbox {
     own_menu: OwnMenu,
 }
 
-/// Whether Ordo's own menu or settings panel is open, for the threads that
-/// must not read what happens in them as the user acting on the world: a
-/// click in one is a pick of Ordo's, which reaches the engine as a command if
-/// it asks for one.
+/// Whether Ordo's own menu is open, its Settings submenu included, for the
+/// threads that must not read what happens in it as the user acting on the
+/// world: a click in it is a pick of Ordo's, which reaches the engine as a
+/// command if it asks for one. While it is open it takes every click, since
+/// macOS spends one outside it on closing it.
 #[derive(Clone, Default)]
-pub struct OwnMenu(Arc<Surfaces>);
-
-#[derive(Default)]
-struct Surfaces {
-    menu: AtomicBool,
-    /// The panel's frame in CG coordinates, while it is shown.
-    panel: Mutex<Option<Rect>>,
-}
+pub struct OwnMenu(Arc<AtomicBool>);
 
 impl OwnMenu {
     pub fn is_open(&self) -> bool {
-        self.0.menu.load(Ordering::Relaxed) || self.0.panel.lock().unwrap().is_some()
-    }
-
-    /// Whether a click at `at` is one of Ordo's own. The open menu takes
-    /// every click, since macOS spends one outside it on closing it. The panel
-    /// takes only its own: a click outside closes it and also lands on
-    /// whatever is there, which is the user acting on the world.
-    pub fn takes(&self, at: Point) -> bool {
-        self.0.menu.load(Ordering::Relaxed)
-            || self.0.panel.lock().unwrap().is_some_and(|f| f.contains(at))
+        self.0.load(Ordering::Relaxed)
     }
 
     fn set_menu(&self, tx: &Sender<Msg>, open: bool) {
-        let before = self.is_open();
-        self.0.menu.store(open, Ordering::Relaxed);
-        self.changed(tx, before, "menu", open);
-    }
-
-    pub(crate) fn set_panel(&self, tx: &Sender<Msg>, frame: Option<Rect>) {
-        let before = self.is_open();
-        let open = frame.is_some();
-        *self.0.panel.lock().unwrap() = frame;
-        self.changed(tx, before, "settings", open);
-    }
-
-    /// The core hears only when Ordo's surfaces as a whole open or close: the
-    /// panel opens from the menu, and the two may overlap.
-    fn changed(&self, tx: &Sender<Msg>, before: bool, what: &str, open: bool) {
         let wall_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_millis());
         eprintln!(
-            "ordo: own {what} {} at wall {wall_ms}",
+            "ordo: own menu {} at wall {wall_ms}",
             if open { "opened" } else { "closed" }
         );
-        let after = self.is_open();
-        if after != before {
-            let _ = tx.send(Msg::Gesture(Gesture::OwnMenu { open: after }));
+        if self.0.swap(open, Ordering::Relaxed) != open {
+            let _ = tx.send(Msg::Gesture(Gesture::OwnMenu { open }));
         }
     }
 }
@@ -579,7 +548,8 @@ struct Ivars {
     /// Kept across rebuilds so a view change can slide the frame it drew.
     map: OnceCell<Retained<MonitorMap>>,
     list: OnceCell<Retained<WorkspaceList>>,
-    settings: OnceCell<Retained<SettingsPanel>>,
+    /// The target of the Settings submenu's items, which hold it weakly.
+    settings: OnceCell<Retained<Settings>>,
     open: Cell<bool>,
 }
 
@@ -599,20 +569,6 @@ define_class!(
             crate::platform::trust::ask();
         }
 
-        // SAFETY: the signature matches the action selector's.
-        #[unsafe(method(openSettings:))]
-        fn open_settings(&self, _sender: &NSMenuItem) {
-            // After the menu has finished closing: a popover shown while the
-            // menu still tracks is closed along with it.
-            DispatchQueue::main().exec_async(|| {
-                let mtm = MainThreadMarker::new().expect("runs on the main queue");
-                UI.with(|ui| {
-                    let Some(ui) = ui.get() else { return };
-                    let Some(button) = ui.item.button(mtm) else { return };
-                    ui.controller.settings_panel().show(&button);
-                });
-            });
-        }
     }
 
     unsafe impl NSObjectProtocol for Controller {}
@@ -660,11 +616,10 @@ impl Controller {
             .get_or_init(|| MonitorMap::new(self.mtm(), commands(&self.ivars().mailbox)))
     }
 
-    fn settings_panel(&self) -> &SettingsPanel {
-        self.ivars().settings.get_or_init(|| {
-            let mailbox = &self.ivars().mailbox;
-            SettingsPanel::new(mailbox.tx.clone(), mailbox.own_menu.clone(), self.mtm())
-        })
+    fn settings(&self) -> &Settings {
+        self.ivars()
+            .settings
+            .get_or_init(|| Settings::new(self.ivars().mailbox.tx.clone(), self.mtm()))
     }
 
     fn list(&self) -> &WorkspaceList {
@@ -733,27 +688,7 @@ impl Controller {
             }
         }
         menu.addItem(&NSMenuItem::separatorItem(mtm));
-        menu.addItem(&self.settings(mtm));
-    }
-
-    fn settings(&self, mtm: MainThreadMarker) -> Retained<NSMenuItem> {
-        let item = unsafe {
-            NSMenuItem::initWithTitle_action_keyEquivalent(
-                NSMenuItem::alloc(mtm),
-                ns_string!("Settings…"),
-                Some(sel!(openSettings:)),
-                ns_string!(""),
-            )
-        };
-        unsafe { item.setTarget(Some(self)) };
-        item.setImage(
-            NSImage::imageWithSystemSymbolName_accessibilityDescription(
-                ns_string!("gearshape"),
-                Some(ns_string!("Settings")),
-            )
-            .as_deref(),
-        );
-        item
+        menu.addItem(&self.settings().item());
     }
 }
 

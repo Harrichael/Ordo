@@ -160,14 +160,14 @@ unsafe extern "C-unwind" fn callback(
 
     match ty {
         CGEventType::LeftMouseDown | CGEventType::RightMouseDown | CGEventType::OtherMouseDown => {
-            // A click in Ordo's own menu or settings is no gesture on the
+            // A click while Ordo's own menu is open is no gesture on the
             // world: read as one, it explained an app's re-key onto a hidden
             // workspace, and the core followed it there.
-            let p = CGEvent::location(Some(ev));
-            let at = Point { x: p.x, y: p.y };
-            if ctx.own_menu.takes(at) {
+            if ctx.own_menu.is_open() {
                 return pass;
             }
+            let p = CGEvent::location(Some(ev));
+            let at = Point { x: p.x, y: p.y };
             let gesture = if ctx.menu_bars.contains(at) {
                 Gesture::MenuBar { at }
             } else if ctx.dock.takes(ev, at) {
