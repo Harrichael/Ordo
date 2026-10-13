@@ -55,6 +55,20 @@ pub struct Move {
     pub parks: bool,
 }
 
+/// The displays as one read saw them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Screens {
+    /// Every display's frame. Needed because hiding a window is a question
+    /// about the whole arrangement, not the main screen: macOS keeps a parked
+    /// window's title bar on-screen, so only the HORIZONTAL escape hides it,
+    /// and it has to clear the display at the end of the arrangement —
+    /// escaping past an interior edge just lands the window on the neighbour.
+    pub all: Vec<Rect>,
+    /// The main display's frame — where a re-homed window must land, because
+    /// that is where the user is looking.
+    pub main: Rect,
+}
+
 /// One app to un-hide, and the windows that must not come back with it.
 ///
 /// An empty `hold` is a deliberate statement, not an omission: reveal
@@ -156,19 +170,9 @@ pub trait Desktop {
     /// this call's back — focusing a window of a hidden app un-hides it.
     fn show_apps(&self, apps: &[Unhide]);
 
-    /// The active app, whether or not a window of it is key — Finder holding
-    /// the desktop has none.
-    fn frontmost_app(&self) -> Option<Pid>;
-    /// The main display's frame — where a re-homed window must land, because
-    /// that is where the user is looking.
-    fn main_display(&self) -> Rect;
-
-    /// Every display's frame. Needed because hiding a window is a question
-    /// about the whole arrangement, not the main screen: macOS keeps a parked
-    /// window's title bar on-screen, so only the HORIZONTAL escape hides it,
-    /// and it has to clear the display at the end of the arrangement —
-    /// escaping past an interior edge just lands the window on the neighbour.
-    fn displays(&self) -> Vec<Rect>;
+    /// The displays, read once. A look reads them itself and passes them
+    /// in; commands between looks ask here.
+    fn screens(&self) -> Screens;
     /// Which of `ids` still exist per the WINDOW SERVER's full window list —
     /// authoritative death evidence, unlike an AX scan (one slow app drops
     /// its whole window set from a scan). Must consult all windows, not just

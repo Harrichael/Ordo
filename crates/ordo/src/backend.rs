@@ -198,7 +198,16 @@ pub trait WorkspaceBackend {
     /// Corrections write FRAMES only; a declaration is never rewritten from
     /// what the screen shows. Native makes no placement promises; the
     /// default is a no-op.
-    fn enforce_placement(&mut self, _frames: &HashMap<WindowId, (Pid, Rect)>) {}
+    ///
+    /// `monitors` and `front` (the front app) are the look's own reads, as
+    /// for [`Self::topology`].
+    fn enforce_placement(
+        &mut self,
+        _frames: &HashMap<WindowId, (Pid, Rect)>,
+        _monitors: &[(MonitorId, Rect, bool)],
+        _front: Option<Pid>,
+    ) {
+    }
 
     /// The backend's better knowledge of some windows' real frames, keyed by
     /// window; absent windows are taken as observed. Observation artifacts of
@@ -206,7 +215,11 @@ pub trait WorkspaceBackend {
     /// the promise they encode BEFORE the snapshot is assembled, so the core
     /// never sees the mechanism — or mistakes it for the user or an app
     /// acting. Native has no such mechanism; the default is empty.
-    fn believed_frames(&self, _frames: &HashMap<WindowId, (Pid, Rect)>) -> HashMap<WindowId, Rect> {
+    fn believed_frames(
+        &self,
+        _frames: &HashMap<WindowId, (Pid, Rect)>,
+        _monitors: &[(MonitorId, Rect, bool)],
+    ) -> HashMap<WindowId, Rect> {
         HashMap::new()
     }
 

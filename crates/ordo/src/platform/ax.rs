@@ -51,6 +51,9 @@ pub struct AxWindow {
 
 pub struct AxScan {
     pub windows: Vec<AxWindow>,
+    /// The front app, which the focus read finds on its way to `focused`:
+    /// the one sweep a look makes.
+    pub front: Option<Pid>,
     pub focused: Option<WindowId>,
     pub focus: Duration,
     pub walk: Walk,
@@ -86,10 +89,12 @@ enum Listing {
 /// which window currently has focus.
 pub fn scan() -> AxScan {
     let started = Instant::now();
-    let focused = focused_window();
+    let front = frontmost_app();
+    let focused = front.and_then(focused_window_of);
     let focus = started.elapsed();
     let (windows, walk) = walk();
     AxScan {
+        front,
         focused,
         focus,
         windows,
@@ -236,7 +241,10 @@ fn read_window(
 }
 
 pub fn focused_window() -> Option<WindowId> {
-    let pid = frontmost_app()?;
+    focused_window_of(frontmost_app()?)
+}
+
+fn focused_window_of(pid: Pid) -> Option<WindowId> {
     let el = unsafe { AXUIElement::new_application(pid.0) };
     unsafe { el.set_messaging_timeout(MESSAGING_TIMEOUT_SECS) };
     let focused = unsafe { copy_attr(&el, "AXFocusedWindow") }?;

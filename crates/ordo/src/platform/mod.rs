@@ -392,14 +392,17 @@ impl WorldSource for MacWorldSource {
                 // the snapshot still shows the phantom; the next rescan
                 // absorbs the fix as an (unattributed) external delta.
                 // Acceptable for a standing-invariant check.
-                self.backend.borrow_mut().enforce_placement(&frames);
+                self.backend
+                    .borrow_mut()
+                    .enforce_placement(&frames, &known, scan.front);
             }
         })
         .1;
 
         // Mechanism artifacts (park slivers) never reach the core: the
         // backend substitutes the promise each one encodes.
-        let (believed, believed_took) = timed(|| self.backend.borrow().believed_frames(&frames));
+        let (believed, believed_took) =
+            timed(|| self.backend.borrow().believed_frames(&frames, &known));
         stats.believed = believed_took;
 
         // The substitution above is why no other channel can see parking, so

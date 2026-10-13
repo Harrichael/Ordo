@@ -10,7 +10,9 @@ use std::path::PathBuf;
 use ordo_core::{
     MonitorId, Pid, Rect, VirtualMonitorId, VirtualMonitorsWord, WindowId, WorkspaceId,
 };
-use ordo_emulated::{Desktop, EmulatedWorkspaces, Move, ParkTrace, ParkTraceKind, Unhide};
+use ordo_emulated::{
+    Desktop, EmulatedWorkspaces, Move, ParkTrace, ParkTraceKind, Screens, Unhide,
+};
 
 use crate::app_queue::AppQueues;
 
@@ -76,33 +78,38 @@ impl Desktop for AxDesktop {
         }
     }
 
-    fn frontmost_app(&self) -> Option<Pid> {
-        ax::frontmost_app()
-    }
-
-    fn main_display(&self) -> Rect {
-        let displays = display::active_displays();
-        displays
-            .iter()
-            .find(|d| d.is_main)
-            .or_else(|| displays.first())
-            .map(|d| d.frame)
-            .unwrap_or(Rect {
-                x: 0.0,
-                y: 0.0,
-                w: 1920.0,
-                h: 1080.0,
-            })
-    }
-
-    fn displays(&self) -> Vec<Rect> {
-        display::active_displays().iter().map(|d| d.frame).collect()
+    fn screens(&self) -> Screens {
+        let displays: Vec<_> = display::active_displays()
+            .into_iter()
+            .map(|d| (d.id, d.frame, d.is_main))
+            .collect();
+        screens(&displays)
     }
 
     fn existing_windows(&self, ids: &[WindowId]) -> Option<std::collections::HashSet<WindowId>> {
         let all = super::zorder::all_windows()?;
         let all: std::collections::HashSet<WindowId> = all.into_iter().map(|l| l.id).collect();
         Some(ids.iter().filter(|w| all.contains(w)).copied().collect())
+    }
+}
+
+/// A look's display read in the model's terms. With no displays (asleep),
+/// a stand-in main display, so a frame computed against it stays sane.
+fn screens(monitors: &[(MonitorId, Rect, bool)]) -> Screens {
+    let main = monitors
+        .iter()
+        .find(|(_, _, main)| *main)
+        .or_else(|| monitors.first())
+        .map(|(_, f, _)| *f)
+        .unwrap_or(Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 1920.0,
+            h: 1080.0,
+        });
+    Screens {
+        all: monitors.iter().map(|(_, f, _)| *f).collect(),
+        main,
     }
 }
 
@@ -134,7 +141,8 @@ impl WorkspaceBackend for EmulatedBackend {
         monitors: &[(MonitorId, Rect, bool)],
         user_monitor: Option<VirtualMonitorId>,
     ) -> Result<BackendTopology> {
-        self.model.note_scan(&self.desktop, windows, user_monitor);
+        self.model
+            .note_scan(&self.desktop, windows, &screens(monitors), user_monitor);
         let mons = monitors
             .iter()
             .map(|(id, _, _)| MonitorWorkspace {
@@ -236,12 +244,22 @@ impl WorkspaceBackend for EmulatedBackend {
         self.model.reveal_for_focus(&self.desktop, pid)
     }
 
-    fn enforce_placement(&mut self, frames: &HashMap<WindowId, (Pid, Rect)>) {
-        self.model.enforce_placement(&self.desktop, frames);
+    fn enforce_placement(
+        &mut self,
+        frames: &HashMap<WindowId, (Pid, Rect)>,
+        monitors: &[(MonitorId, Rect, bool)],
+        front: Option<Pid>,
+    ) {
+        self.model
+            .enforce_placement(&self.desktop, frames, &screens(monitors), front);
     }
 
-    fn believed_frames(&self, frames: &HashMap<WindowId, (Pid, Rect)>) -> HashMap<WindowId, Rect> {
-        self.model.believed_frames(&self.desktop, frames)
+    fn believed_frames(
+        &self,
+        frames: &HashMap<WindowId, (Pid, Rect)>,
+        monitors: &[(MonitorId, Rect, bool)],
+    ) -> HashMap<WindowId, Rect> {
+        self.model.believed_frames(frames, &screens(monitors))
     }
 
     fn take_park_trace(&mut self) -> Vec<ParkTrace> {
