@@ -125,6 +125,7 @@ cargo build --release
 signed `~/Applications/Ordo.app` and links `~/.local/bin/ordo`. It signs every
 build with one local certificate, so an Accessibility grant made once survives
 updates. Run it again to update. It does not start Ordo or add a login item.
+`./install.sh` does the same for the checkout it sits in, always.
 
 **Permission**: Ordo needs Accessibility (System Settings → Privacy & Security →
 Accessibility). Without it, it degrades to observe-without-hotkeys rather than
