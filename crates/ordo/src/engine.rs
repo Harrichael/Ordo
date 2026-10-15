@@ -30,6 +30,7 @@ use ordo_core::{
 };
 
 use crate::clock::Clock;
+use crate::freeze::Diag;
 use crate::logger::{HotkeyBatch, Logger};
 #[cfg(target_os = "macos")]
 use crate::platform::drained;
@@ -74,6 +75,10 @@ pub enum Msg {
     /// Telemetry from the restack worker, delivered as a message because the
     /// SQLite logger is engine-thread-only. Never becomes a core event.
     RestackStats(RestackStats),
+    /// A note about the input pipeline from the tap or the freeze worker
+    /// (see [`crate::freeze`]), for the log alone. Carries its own time:
+    /// what matters is when it was seen, and the engine may be busy.
+    FreezeDiag(Diag),
     /// Rescan triggers folded into another look (see [`fold_triggers`]), for
     /// the log alone: the look they were folded into carries one trigger.
     Folded(Vec<RescanTrigger>),
@@ -118,7 +123,7 @@ fn collapse_rescans(batch: Vec<Msg>) -> Vec<Msg> {
     for m in batch {
         match m {
             Msg::Rescan(trigger) => rescans.push(trigger),
-            Msg::Hotkey(..) | Msg::RestackStats(_) => after.push(m),
+            Msg::Hotkey(..) | Msg::RestackStats(_) | Msg::FreezeDiag(_) => after.push(m),
             // Ahead of the look the batch's rescans become, so that look acts
             // on it.
             Msg::AppVisibility(..)
@@ -409,6 +414,10 @@ impl Engine {
                         .logger
                         .log_restack_stats(&stats, self.clock.now().wall_ms);
                 }
+                // Whoever saw it has already said so on stderr; this files it.
+                Msg::FreezeDiag(diag) => {
+                    let _ = self.logger.log_freeze_diag(&diag);
+                }
                 Msg::Folded(triggers) => {
                     let wall_ms = self.clock.now().wall_ms;
                     for t in &triggers {
@@ -470,6 +479,7 @@ impl Engine {
                         Msg::Shutdown => return false,
                         Msg::Hotkey(..)
                         | Msg::RestackStats(_)
+                        | Msg::FreezeDiag(_)
                         | Msg::Folded(_)
                         | Msg::AppVisibility(..)
                         | Msg::Hiding(_) => {

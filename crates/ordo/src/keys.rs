@@ -41,6 +41,10 @@
 //!   - Ctrl+Alt+Cmd+S            → save state: turn the state file back on
 //!     (after an R bring-up) and persist the current arrangement as the new
 //!     durable truth. Idempotent when persistence is already on.
+//!   - Ctrl+Alt+Cmd+D            → freeze snapshot: write down every event
+//!     tap, the secure-input holder, the front app and the top processes
+//!     (see [`crate::freeze`]). Honored even while disengaged, like O: it is
+//!     for the moment input stops reaching the apps, whatever Ordo's mode.
 //!
 //! Modifier matching is deliberately strict so Ordo only swallows the exact
 //! chord: Cmd+Shift+arrows are claimed (the user gave up select-to-line for
@@ -70,6 +74,7 @@ mod code {
     pub const TAB: u16 = 0x30;
     pub const GRAVE: u16 = 0x32; // backtick
     pub const ESCAPE: u16 = 0x35;
+    pub const D: u16 = 0x02;
     pub const O: u16 = 0x1F;
     pub const R: u16 = 0x0F;
     pub const S: u16 = 0x01;
@@ -108,6 +113,10 @@ pub enum Chord {
     /// state. Only meaningful while engaged, so it sits behind the
     /// interception gate like the ordinary hotkeys.
     SaveState,
+    /// Record a freeze snapshot ([`crate::freeze`]). Honored in every mode:
+    /// its moment is a machine that has stopped taking input, and Ordo may
+    /// well be rescued by then.
+    FreezeSnapshot,
 }
 
 /// A system focus gesture seen on a key-down. Passed through untouched; the
@@ -219,6 +228,9 @@ pub fn match_chord(keycode: u16, m: Mods) -> Option<Chord> {
     }
     if m.ctrl && m.alt && m.cmd && keycode == code::S {
         return Some(Chord::SaveState);
+    }
+    if m.ctrl && m.alt && m.cmd && keycode == code::D {
+        return Some(Chord::FreezeSnapshot);
     }
     // A mode switch rather than navigation, so it lives with the full-triple
     // family — but unlike rescue/engage it is only ours while intercepting.
@@ -602,6 +614,25 @@ mod tests {
         assert_eq!(match_chord(code::R, mods(false, false, false, false)), None);
         assert_eq!(match_chord(code::S, mods(true, false, false, false)), None);
         // Cmd+S is Save
+    }
+
+    /// The freeze chord is a full-triple chord like rescue and engage, and
+    /// survives an extra shift as they do; Cmd+D and Cmd+Alt+D (the Dock
+    /// toggle) are not it.
+    #[test]
+    fn the_freeze_snapshot_chord_is_the_triple_with_d_and_nothing_less() {
+        assert_eq!(
+            match_chord(code::D, mods(true, true, false, true)),
+            Some(Chord::FreezeSnapshot)
+        );
+        assert_eq!(
+            match_chord(code::D, mods(true, true, true, true)),
+            Some(Chord::FreezeSnapshot)
+        );
+        assert_eq!(match_chord(code::D, mods(true, false, false, false)), None);
+        assert_eq!(match_chord(code::D, mods(true, true, false, false)), None);
+        assert_eq!(match_chord(code::D, mods(false, true, false, true)), None);
+        assert_eq!(match_chord(code::D, mods(false, false, false, false)), None);
     }
 
     #[test]

@@ -17,6 +17,8 @@
 //!   `ordo-skylight-sys`), bound to the trait under [`platform`].
 //! - [`clock`] — the one place time is read.
 //! - [`debug`] — the debug-mode switch for costly diagnostics.
+//! - [`freeze`] — what is written down about the input pipeline when input
+//!   stops reaching the apps.
 //! - [`instance`] — the one-daemon-per-log claim.
 //! - [`menubar`] — what the menu bar item shows, derived from the core's state.
 //! - [`platform`] — the macOS FFI: displays, Accessibility, SkyLight, mouse.
@@ -29,6 +31,7 @@ pub mod backend;
 pub mod clock;
 pub mod debug;
 pub mod engine;
+pub mod freeze;
 pub mod instance;
 pub mod keys;
 pub mod logger;

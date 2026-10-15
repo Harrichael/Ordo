@@ -22,6 +22,7 @@ pub mod display;
 pub mod display_watch;
 pub mod effector;
 pub mod emulated_backend;
+pub mod freeze;
 pub mod look_gate;
 pub mod meter;
 pub mod mission_control;

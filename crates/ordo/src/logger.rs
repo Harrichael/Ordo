@@ -21,14 +21,17 @@
 //! z-order reassert's timing breakdown (see [`crate::ports::RestackStats`]),
 //! `hotkey_batches` holds how long presses queued behind the engine and how
 //! many a burst folded away (see [`HotkeyBatch`]), `snapshots` holds where
-//! each world snapshot's time went (see [`crate::ports::SnapshotStats`]), and
+//! each world snapshot's time went (see [`crate::ports::SnapshotStats`]),
 //! `dropped_looks` holds every look that left no event of its own (see
-//! [`Logger::log_dropped_look`]).
+//! [`Logger::log_dropped_look`]), and `freeze_diag` holds the notes on the
+//! input pipeline — the OS disabling the tap, the freeze chord's snapshot,
+//! debug mode's tap samples (see [`crate::freeze`]).
 
 use std::path::{Path, PathBuf};
 
 use ordo_emulated::ParkTrace;
 
+use crate::freeze::Diag;
 use crate::ports::{Blind, RestackStats, SnapshotStats};
 use crate::schema;
 use ordo_core::{Effect, Event, Note, OpId, OpOutcome, RescanTrigger, State};
@@ -415,6 +418,17 @@ impl Logger {
         Ok(())
     }
 
+    /// Kind is a column because every question starts by filtering on it;
+    /// the rest rides as JSON, free to change shape without a migration, as
+    /// `park_trace` does. Stamped with the moment it was observed.
+    pub fn log_freeze_diag(&mut self, d: &Diag) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO freeze_diag (run_id, wall_ms, kind, payload) VALUES (?1, ?2, ?3, ?4)",
+            params![self.run_id, d.wall_ms(), d.kind(), json(d)],
+        )?;
+        Ok(())
+    }
+
     pub fn close(&mut self, now_wall_ms: i64) -> rusqlite::Result<()> {
         self.conn.execute(
             "UPDATE runs SET ended_wall = ?1 WHERE run_id = ?2",
@@ -521,5 +535,51 @@ fn note_kind(n: &Note) -> &'static str {
         Note::TearDetected { .. } => "tear_detected",
         Note::TearPersisting => "tear_persisting",
         Note::Diverged { .. } => "diverged",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::freeze::TapDisabledBy;
+
+    /// A note on the input pipeline is filed under its own kind, stamped
+    /// with the moment it was seen rather than the moment it was filed, and
+    /// comes back whole from its JSON.
+    #[test]
+    fn freeze_diags_are_filed_by_kind_at_their_own_time() {
+        let dir = std::env::temp_dir().join(format!("ordo-freeze-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("log.db");
+        let _ = std::fs::remove_file(&db);
+
+        let mut logger = Logger::open(&db, "test", "emulated", 1_000).unwrap();
+        let seen = Diag::TapDisabled {
+            wall_ms: 777,
+            by: TapDisabledBy::Timeout,
+        };
+        logger.log_freeze_diag(&seen).unwrap();
+        logger
+            .log_freeze_diag(&Diag::TapSample {
+                wall_ms: 778,
+                taps: vec![],
+            })
+            .unwrap();
+        drop(logger);
+
+        let conn = Connection::open(&db).unwrap();
+        let rows: Vec<(i64, String, String)> = conn
+            .prepare("SELECT wall_ms, kind, payload FROM freeze_diag ORDER BY wall_ms")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!((rows[0].0, rows[0].1.as_str()), (777, "tap_disabled"));
+        assert_eq!(serde_json::from_str::<Diag>(&rows[0].2).unwrap(), seen);
+        assert_eq!((rows[1].0, rows[1].1.as_str()), (778, "tap_sample"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

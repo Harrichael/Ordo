@@ -30,6 +30,9 @@
 //! works even if the engine thread is wedged: on the second press within the
 //! window it flips interception off (freeing the keyboard immediately),
 //! re-associates the mouse (freeing the pointer), and signals the engine.
+//! The freeze chord likewise bypasses the engine: it pokes the diagnostics
+//! worker ([`super::freeze`]) directly, since its moment is a machine where
+//! only this tap is known to still be hearing the keyboard.
 
 use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
@@ -49,9 +52,12 @@ use objc2_app_kit::NSRunningApplication;
 use objc2_foundation::NSString;
 use ordo_core::{Gesture, HotkeyAction, Point, Rect, WindowId};
 
+use crate::clock::wall_now_ms;
 use crate::engine::Msg;
+use crate::freeze::{Diag, TapDisabledBy};
 use crate::keys::{self, Chord, Mods, WalkKey, Witness};
 use crate::platform::display::{self, MenuBars};
+use crate::platform::freeze::FreezeTrigger;
 use crate::platform::status_item::OwnMenu;
 use crate::platform::zorder;
 
@@ -63,6 +69,7 @@ struct TapContext {
     intercepting: Arc<AtomicBool>,
     menu_bars: MenuBars,
     own_menu: OwnMenu,
+    freeze: FreezeTrigger,
     /// Set after the tap is created, so the callback can re-enable it.
     tap: RefCell<Option<CFRetained<CFMachPort>>>,
     last_rescue: Cell<Option<Instant>>,
@@ -94,6 +101,7 @@ pub fn spawn(
     intercepting: Arc<AtomicBool>,
     menu_bars: MenuBars,
     own_menu: OwnMenu,
+    freeze: FreezeTrigger,
 ) -> bool {
     let (up_tx, up) = crossbeam_channel::bounded(1);
     std::thread::spawn(move || {
@@ -102,6 +110,7 @@ pub fn spawn(
             intercepting,
             menu_bars,
             own_menu,
+            freeze,
             tap: RefCell::new(None),
             last_rescue: Cell::new(None),
             app_switcher_armed: Cell::new(false),
@@ -162,11 +171,22 @@ unsafe extern "C-unwind" fn callback(
     let ctx = &*(userinfo as *const TapContext);
 
     // The OS disables the tap under load or on timeout; turn it back on or
-    // hotkeys quietly stop working.
+    // hotkeys quietly stop working. Noted on the way, as it is rare and the
+    // input pipeline's health is exactly what a freeze is a question about.
     if ty == CGEventType::TapDisabledByTimeout || ty == CGEventType::TapDisabledByUserInput {
         if let Some(tap) = ctx.tap.borrow().as_ref() {
             CGEvent::tap_enable(tap, true);
         }
+        let by = if ty == CGEventType::TapDisabledByTimeout {
+            TapDisabledBy::Timeout
+        } else {
+            TapDisabledBy::UserInput
+        };
+        eprintln!("ordo: macOS disabled the hotkey tap ({}); re-enabled", by.as_str());
+        let _ = ctx.tx.send(Msg::FreezeDiag(Diag::TapDisabled {
+            wall_ms: wall_now_ms(),
+            by,
+        }));
         return event.as_ptr();
     }
 
@@ -266,6 +286,12 @@ unsafe extern "C-unwind" fn callback(
             let _ = ctx.tx.send(Msg::EngageFresh);
             std::ptr::null_mut() // swallow
         }
+        // Straight to the worker, not the engine, which may be stuck inside
+        // an app that has stopped answering.
+        Some(Chord::FreezeSnapshot) => {
+            ctx.freeze.request();
+            std::ptr::null_mut() // swallow
+        }
         Some(chord) if intercepting => match chord {
             Chord::Hotkey(action) => {
                 let _ = ctx.tx.send(Msg::hotkey(action));
@@ -280,7 +306,7 @@ unsafe extern "C-unwind" fn callback(
                 let _ = ctx.tx.send(Msg::SaveState);
                 std::ptr::null_mut()
             }
-            Chord::Engage | Chord::EngageFresh => unreachable!(),
+            Chord::Engage | Chord::EngageFresh | Chord::FreezeSnapshot => unreachable!(),
         },
         _ => {
             match keys::witness(keycode, mods) {

@@ -33,7 +33,7 @@
 use rusqlite::{Connection, Transaction};
 
 /// The schema version this build writes and understands.
-pub const CURRENT_VERSION: i32 = 11;
+pub const CURRENT_VERSION: i32 = 12;
 
 type Migration = fn(&Transaction) -> rusqlite::Result<()>;
 
@@ -49,6 +49,7 @@ const MIGRATIONS: &[Migration] = &[
     m9_snapshot_held,
     m10_snapshot_phases,
     m11_dropped_looks,
+    m12_freeze_diag,
 ];
 
 /// Read the version of an existing log, refusing one written by a newer Ordo.
@@ -244,6 +245,21 @@ CREATE TABLE dropped_looks (
     seq      INTEGER NOT NULL,
     why      TEXT NOT NULL,
     asked_by TEXT NOT NULL
+);
+"#,
+    )
+}
+
+/// Notes on the input pipeline (see [`crate::freeze`]): `kind` is one of
+/// `tap_disabled`, `snapshot`, `tap_sample`; the payload is that kind's JSON.
+fn m12_freeze_diag(tx: &Transaction) -> rusqlite::Result<()> {
+    tx.execute_batch(
+        r#"
+CREATE TABLE freeze_diag (
+    run_id  INTEGER NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+    wall_ms INTEGER NOT NULL,
+    kind    TEXT NOT NULL,
+    payload TEXT NOT NULL
 );
 "#,
     )
@@ -540,6 +556,7 @@ CREATE INDEX events_by_kind ON events(run_id, kind);
             "hotkey_batches",
             "snapshots",
             "dropped_looks",
+            "freeze_diag",
         ] {
             assert!(!columns(&conn, table).is_empty(), "{table} missing");
         }

@@ -32,13 +32,18 @@ impl Default for SystemClock {
 
 impl Clock for SystemClock {
     fn now(&self) -> Ts {
-        let wall_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
         Ts {
-            wall_ms,
+            wall_ms: wall_now_ms(),
             mono_ns: self.mono_base.elapsed().as_nanos() as u64,
         }
     }
+}
+
+/// Wall time for telemetry stamped where it is observed (a thread with no
+/// `Clock`, such as the tap's), never for a core event.
+pub fn wall_now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }

@@ -158,6 +158,7 @@ fn run(
         }
         println!("ordo: rescue (off) = Ctrl+Alt+Cmd+Escape pressed twice within 2s.");
         println!("ordo: engage (on)  = Ctrl+Alt+Cmd+O.");
+        println!("ordo: freeze snapshot = Ctrl+Alt+Cmd+D (logged to freeze_diag, and here).");
     }
     println!("ordo: requires Accessibility permission (System Settings > Privacy & Security > Accessibility).");
     println!("ordo: press Ctrl-C to stop.");
@@ -182,12 +183,21 @@ fn run(
         // Observe mode raises nothing, but is as blind without the grant.
         ordo::platform::trust::when_trusted(needs_access.clone(), tx.clone(), || true);
     } else {
+        // The freeze diagnostics worker: the tap pokes it, it reports to the
+        // engine. Neither the tap nor the engine can afford the gathering.
+        let freeze = ordo::platform::freeze::spawn(tx.clone());
         let (tx, intercepting, menu_bars, own_menu) =
             (tx.clone(), intercepting.clone(), menu_bars.clone(), own_menu.clone());
         let observer_tx = tx.clone();
         ordo::platform::trust::when_trusted(needs_access.clone(), tx.clone(), move || {
             // The tap runs even when paused — it's what hears the engage chord.
-            if !tap::spawn(tx.clone(), intercepting.clone(), menu_bars.clone(), own_menu.clone()) {
+            if !tap::spawn(
+                tx.clone(),
+                intercepting.clone(),
+                menu_bars.clone(),
+                own_menu.clone(),
+                freeze.clone(),
+            ) {
                 return false;
             }
             // New-window corralling depends on the WindowCreated hint this emits.
