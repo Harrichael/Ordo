@@ -99,20 +99,6 @@ The two rules that make it work:
   disengages interception and gathers displaced windows back on-screen.
 - **Engage switch**: `Ctrl+Alt+Cmd+O` — the reverse: re-engage after a rescue,
   or bring a `run --paused` daemon alive for the first time.
-- **Freeze snapshot**: `Ctrl+Alt+Cmd+D` — for the day clicks and keys stop
-  reaching every app while Ordo's hotkeys still work. Writes down every
-  event tap on the machine (owner, filter or listen, enabled, mask, raw
-  latency), who holds secure input, the front app by the window server and
-  by the apps, the button and modifier state the HID and session layers each
-  believe, and the processes by CPU (with every line naming a remote-control
-  tool or tap owner kept whole), into the log's `freeze_diag` table and onto
-  stderr. Honored in every mode but `--observe`, off the tap thread, with no
-  dependence on the main thread or the menu bar. The same table records each
-  time macOS disables Ordo's tap (it re-enables itself), and the tap list
-  whenever its shape changes (read every 5 s). During a freeze the order is
-  **D, then Hammerspoon's `Ctrl+Alt+Cmd+K`, then D again**: K stops the
-  suspected injector, which destroys the evidence the first D captures, and
-  the second D shows what changed.
 
 Two workspace backends behind one trait:
 

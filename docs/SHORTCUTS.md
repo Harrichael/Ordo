@@ -23,7 +23,6 @@
 | Ctrl + Alt + Cmd + O | Engage WITH the state file: undo a rescue or bring a `--paused` run alive, loading the saved organization |
 | Ctrl + Alt + Cmd + R | Engage WITHOUT the state file: blank workspace model; the file is neither read nor written until S or O |
 | Ctrl + Alt + Cmd + S | Save state: turn the state file back on and persist the current arrangement as the new truth |
-| Ctrl + Alt + Cmd + D | Freeze snapshot: when input stops reaching the apps, record every event tap, the secure-input holder, the front app and the top processes into the log (`freeze_diag`) and stderr. Works in every mode but `--observe` |
 
 When Ordo changes focus, the mouse pointer follows to the center of the newly
 focused window — for an MRU chord, once Alt is released. New windows open on
