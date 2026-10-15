@@ -143,7 +143,11 @@ pub enum HotkeyAction {
     /// what a queued run of Prev/Next coalesces into (see
     /// [`crate::coalesce_hotkeys`]), so a burst of presses costs one switch.
     WorkspaceSwitchTo(WorkspaceId),
-    /// Alt+Tab: most-recently-used window in the current workspace.
+    /// Alt+Tab: most-recently-used window in the current workspace. Each of
+    /// the six MRU chords starts a walk down its list ([`crate::MruWalk`]),
+    /// showing the most recent window at once; the Alt release commits.
+    /// Pressed again mid-walk, a chord commits and starts afresh, so a held
+    /// Alt with Tab tapped toggles between two windows as it always did.
     MruWorkspace,
     /// Alt+Shift+Tab: MRU in the current workspace AND the focused monitor.
     MruMonitor,
@@ -156,6 +160,24 @@ pub enum HotkeyAction {
     MruMonitorApp,
     /// Ctrl+Alt+Backtick: `MruOtherMonitor`, within the focused app.
     MruOtherMonitorApp,
+    /// Alt+Down / Alt+Up with the walk's Alt still held: show the next
+    /// candidate down the ring, or the previous one up, clamped at both
+    /// ends. Index 0 is the window the walk left. The shell sends these only
+    /// while a walk is under way; at any other time the arrows are the apps'.
+    MruStepDown,
+    MruStepUp,
+    /// Show the walk's candidate at this index. No key binding mints this; it
+    /// is what a queued run of steps coalesces into (see
+    /// [`crate::coalesce_hotkeys`]), as `WorkspaceSwitchTo` is for switches.
+    MruStepTo(usize),
+    /// Alt released after an MRU chord, or whatever the shell takes for that
+    /// release when it went unseen (a click, a key arriving with Alt up): the
+    /// walk ends on the window it shows, which is now chosen. Every other
+    /// hotkey commits the walk under way the same way before it acts.
+    MruCommit,
+    /// Esc with the walk's Alt held: the walk ends back on the window it
+    /// left, the order untouched.
+    MruCancel,
     /// Alt+End: banish the focused window to the back of the MRU history and
     /// the back of the visual stack, and focus the next MRU window — "done
     /// with this one, stop offering it (or showing it)".
@@ -208,6 +230,34 @@ pub enum HotkeyAction {
         from: VirtualMonitorId,
         to: VirtualMonitorId,
     },
+}
+
+impl HotkeyAction {
+    /// The chords that start an MRU walk. What the shell arms the walk's
+    /// keys on.
+    pub fn starts_walk(self) -> bool {
+        matches!(
+            self,
+            HotkeyAction::MruWorkspace
+                | HotkeyAction::MruMonitor
+                | HotkeyAction::MruApp
+                | HotkeyAction::MruOtherMonitor
+                | HotkeyAction::MruMonitorApp
+                | HotkeyAction::MruOtherMonitorApp
+        )
+    }
+
+    /// The keys of a walk under way: the steps, the commit and the cancel.
+    pub fn walks(self) -> bool {
+        matches!(
+            self,
+            HotkeyAction::MruStepDown
+                | HotkeyAction::MruStepUp
+                | HotkeyAction::MruStepTo(_)
+                | HotkeyAction::MruCommit
+                | HotkeyAction::MruCancel
+        )
+    }
 }
 
 /// Why a rescan ran. Purely diagnostic except for `AxHint(WindowCreated)`,

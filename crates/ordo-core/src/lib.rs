@@ -54,6 +54,6 @@ pub use mru::FocusHistory;
 pub use project::{after_merge, after_move, anchor_after_add, project, Projection};
 pub use reconcile::Delta;
 pub use state::{
-    FocusIntent, Mode, MonitorRecord, PendingOp, State, VirtualMonitors, WindowRecord,
+    FocusIntent, Mode, MonitorRecord, MruWalk, PendingOp, State, VirtualMonitors, WindowRecord,
 };
 pub use update::{coalesce_hotkeys, update, Note, Step};

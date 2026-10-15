@@ -65,7 +65,15 @@ The two rules that make it work:
   `cargo run --example menubar_preview`.
 - **MRU window focus**: `Alt+Tab` (in workspace), `Alt+Shift+Tab` (+ monitor),
   `Ctrl+Alt+Tab` (the *other* monitor); the same three with Backtick for Tab
-  stay within the focused app. The mouse warps to the focused window's center.
+  stay within the focused app. A tap focuses the most recent other window in
+  that scope. Keep Alt held and `Down` / `Up` walk further down the scope's
+  MRU list and back up it (no wrap; the top is the window you left), each
+  candidate really focused and on top while shown. Releasing Alt chooses the
+  window shown: only then does it move to the front of the MRU list and the
+  mouse warp to its center. `Esc` with Alt held goes back to where you
+  started. The chord again with Alt held chooses the window shown and starts
+  over, so a held Alt with Tab tapped toggles between two windows as it
+  always did. Outside a walk, `Alt+Up/Down/Esc` belong to the apps.
 - **New-window placement**: a newly created window is corralled onto the focused
   workspace and monitor.
 - **Move window to the adjacent monitor**: `Cmd+Shift+Left/Right` — focus and

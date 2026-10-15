@@ -21,6 +21,12 @@
 //!   - Ctrl+Alt+Tab              → MRU window on the OTHER monitor
 //!   - Alt+Backtick, Alt+Shift+Backtick, Ctrl+Alt+Backtick → the three Tab
 //!     chords above, within the focused app
+//!   - Alt+Down / Alt+Up, Alt+Esc → while one of the six MRU chords is held
+//!     (Alt still down since it): walk further down the chord's list, back
+//!     up it, or back to the window it left. Releasing Alt commits the
+//!     window shown; the chord again commits and starts over, so a held Alt
+//!     with Tab tapped toggles as before. These are Ordo's ONLY during such a
+//!     walk ([`walk_key`], gated by the tap); otherwise they are the apps'
 //!   - Alt+End                   → demote the focused window to the back of
 //!     the MRU history and focus the next one
 //!   - Ctrl+Alt+Cmd+Escape       → rescue candidate (engages on a double-press;
@@ -56,6 +62,11 @@ use ordo_core::{HotkeyAction, WorkspaceId};
 mod code {
     pub const LEFT: u16 = 0x7B;
     pub const RIGHT: u16 = 0x7C;
+    pub const DOWN: u16 = 0x7D;
+    pub const UP: u16 = 0x7E;
+    /// The Option keys, as a flags-changed event names the one that moved.
+    pub const OPTION: u16 = 0x3A;
+    pub const RIGHT_OPTION: u16 = 0x3D;
     pub const TAB: u16 = 0x30;
     pub const GRAVE: u16 = 0x32; // backtick
     pub const ESCAPE: u16 = 0x35;
@@ -123,6 +134,37 @@ pub fn witness(keycode: u16, m: Mods) -> Option<Witness> {
         code::GRAVE => Some(Witness::WindowCycle),
         _ => None,
     }
+}
+
+/// A key of an MRU walk ([`ordo_core::MruWalk`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WalkKey {
+    Down,
+    Up,
+    Cancel,
+}
+
+/// Which walk key a key-down is, under Alt — with whatever Shift or Ctrl the
+/// chord had, since the hand that holds Alt+Shift+Tab is still on Shift when
+/// it reaches for the arrow — and never under Cmd. Consulted only while the
+/// tap has a walk armed; the same keys are the apps' at any other time.
+pub fn walk_key(keycode: u16, m: Mods) -> Option<WalkKey> {
+    if !m.alt || m.cmd {
+        return None;
+    }
+    match keycode {
+        code::DOWN => Some(WalkKey::Down),
+        code::UP => Some(WalkKey::Up),
+        code::ESCAPE => Some(WalkKey::Cancel),
+        _ => None,
+    }
+}
+
+/// Whether a modifier change ends an Alt hold: Alt is up — or Alt itself just
+/// went DOWN, which during a hold means its release went unseen (the tap was
+/// disabled meanwhile, or secure input had the keyboard).
+pub fn ends_alt_hold(keycode: u16, m: Mods) -> bool {
+    !m.alt || keycode == code::OPTION || keycode == code::RIGHT_OPTION
 }
 
 /// At most one key press is reported per this interval. Typing runs to ten
@@ -258,10 +300,11 @@ impl Key {
     }
 }
 
-/// The key each action answers to, or `None` for one that is the menu
-/// bar's alone. Total over the actions, so a new one is given a key or
-/// explicitly none; where a config one day binds keys, it overrides this.
-/// [`match_chord`] is its inverse (tested).
+/// The key each action answers to, or `None` for one with no chord of its
+/// own: the menu bar's, and the keys of an MRU walk, which are Ordo's only
+/// while one is under way. Total over the actions, so a new one is given a
+/// key or explicitly none; where a config one day binds keys, it overrides
+/// this. [`match_chord`] is its inverse (tested).
 pub fn key_for(action: &HotkeyAction) -> Option<Key> {
     use HotkeyAction::*;
     let key = |code: u16, cmd: bool, alt: bool, shift: bool, ctrl: bool| {
@@ -297,6 +340,7 @@ pub fn key_for(action: &HotkeyAction) -> Option<Key> {
         CarryFocusedToWorkspacePrev => key(code::LEFT, true, false, false, true),
         CarryFocusedToWorkspaceNext => key(code::RIGHT, true, false, false, true),
         MergeMonitors { .. } | AddMonitor | MoveWorkspace { .. } | MoveMonitor { .. } => None,
+        MruStepDown | MruStepUp | MruStepTo(_) | MruCommit | MruCancel => None,
     }
 }
 
@@ -611,10 +655,45 @@ mod tests {
         };
         assert_eq!(key_for(&moved), None);
         assert_eq!(key_for(&AddMonitor), None);
+        // The walk's keys have no chord: the arrows are only Ordo's mid-walk.
+        assert_eq!(key_for(&MruStepDown), None);
+        assert_eq!(key_for(&MruCommit), None);
         assert_eq!(
             key_for(&WorkspaceSwitchTo(WorkspaceId(3))).and_then(|k| k.legend()),
             Some("⌥⌘3".to_string())
         );
+    }
+
+    /// The walk's keys are the arrows and Esc under Alt — with the Shift or
+    /// Ctrl of the chord that started it, never with Cmd — and no chord of
+    /// `match_chord`'s, so outside a walk the tap passes them through.
+    #[test]
+    fn walk_keys_are_the_arrows_and_esc_under_alt_and_never_chords() {
+        let alt = mods(false, true, false, false);
+        assert_eq!(walk_key(code::DOWN, alt), Some(WalkKey::Down));
+        assert_eq!(walk_key(code::UP, alt), Some(WalkKey::Up));
+        assert_eq!(walk_key(code::ESCAPE, alt), Some(WalkKey::Cancel));
+        assert_eq!(walk_key(code::DOWN, mods(false, true, true, false)), Some(WalkKey::Down));
+        assert_eq!(walk_key(code::UP, mods(false, true, false, true)), Some(WalkKey::Up));
+        for key in [code::DOWN, code::UP, code::ESCAPE] {
+            assert_eq!(walk_key(key, mods(false, false, false, false)), None);
+            assert_eq!(walk_key(key, mods(true, true, false, false)), None);
+            assert_eq!(match_chord(key, alt), None);
+        }
+        assert_eq!(walk_key(code::TAB, alt), None);
+    }
+
+    /// Alt coming up ends the hold. So does Alt going DOWN, since during a
+    /// hold that can only mean its release was missed; Shift or Ctrl joining
+    /// the hold does not.
+    #[test]
+    fn an_alt_hold_ends_on_its_release_or_on_alt_pressed_anew() {
+        let shift_keycode = 0x38;
+        assert!(ends_alt_hold(code::OPTION, mods(false, false, false, false)));
+        assert!(ends_alt_hold(code::OPTION, mods(false, true, false, false)));
+        assert!(ends_alt_hold(code::RIGHT_OPTION, mods(false, true, false, false)));
+        assert!(!ends_alt_hold(shift_keycode, mods(false, true, true, false)));
+        assert!(ends_alt_hold(shift_keycode, mods(false, false, true, false)));
     }
 
     #[test]

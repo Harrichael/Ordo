@@ -12,6 +12,8 @@
 | Alt + Backtick (`) | Focus MRU window in the current workspace and app |
 | Alt + Shift + Backtick | Focus MRU window in the current workspace, monitor and app |
 | Ctrl + Alt + Backtick | Focus MRU window of the focused app on the other monitor |
+| Alt + Down / Up (Alt still held from an MRU chord) | Walk further down the chord's MRU list / back up it (no wrap); release Alt to choose the window shown. The chord again chooses the window shown and starts over |
+| Alt + Esc (Alt still held from an MRU chord) | Back to the window the walk started from, nothing chosen |
 | Cmd + Shift + Left / Right | Move the focused window to the previous / next virtual monitor (focus and mouse go with it; a hidden monitor is viewed) |
 | Cmd + Alt + J / K | View the previous / next virtual monitor: focus its MRU window and, where displays are short, show its windows in place of the current monitor's (no wrap) |
 | Ctrl + Alt + Cmd + V | Virtualization on / off: off collapses every virtual monitor onto the displays present |
@@ -23,7 +25,8 @@
 | Ctrl + Alt + Cmd + S | Save state: turn the state file back on and persist the current arrangement as the new truth |
 
 When Ordo changes focus, the mouse pointer follows to the center of the newly
-focused window. New windows open on the focused workspace and monitor.
+focused window — for an MRU chord, once Alt is released. New windows open on
+the focused workspace and monitor.
 
 Virtual monitors are positions, left to right, not displays: unplug the
 external display and its monitor's windows are hidden (or, with virtualization

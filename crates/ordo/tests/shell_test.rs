@@ -757,6 +757,47 @@ fn a_gesture_keeps_its_place_between_hotkeys_and_replays_clean() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// An MRU walk through the real message loop: the chord, the steps and the
+/// Alt release are hotkeys like any other, so a logged walk replays clean,
+/// and what it leaves is the window shown when Alt came up — chosen once,
+/// at the release, which is when the mouse follows.
+#[test]
+fn a_logged_mru_walk_replays_clean() {
+    let dir = std::env::temp_dir().join(format!("ordo-walk-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = dir.join("walk.db");
+    let _ = std::fs::remove_file(&db);
+    let os = fake_os(FocusPolicy::Lands);
+    let run_id = {
+        let logger = Logger::open(&db, "test", "emulated", 1_000).unwrap();
+        let run_id = logger.run_id();
+        let engine = engine_on(&os, logger);
+        let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
+        // Workspace 1 holds w1 (focused) and w3: Alt+Tab shows w3, Up goes
+        // back to w1, Down shows w3 again, and the release chooses it.
+        tx.send(Msg::hotkey(HotkeyAction::MruWorkspace)).unwrap();
+        tx.send(Msg::hotkey(HotkeyAction::MruStepUp)).unwrap();
+        tx.send(Msg::hotkey(HotkeyAction::MruStepDown)).unwrap();
+        tx.send(Msg::hotkey(HotkeyAction::MruCommit)).unwrap();
+        tx.send(Msg::Shutdown).unwrap();
+        engine.run(rx);
+        run_id
+    };
+    assert_eq!(os.borrow().focused, Some(WindowId(3)));
+    let conn = Connection::open(&db).unwrap();
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM effects WHERE kind = 'focus_window'"),
+        3
+    );
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM effects WHERE kind = 'warp_mouse'"),
+        1
+    );
+    let report = replay(&conn, run_id, None).unwrap();
+    assert!(report.is_clean(), "{:?}", report.mismatches);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Presses that queue behind the engine are one burst: they fold into a single
 /// switch, and the log keeps what the core event can't — how many there were
 /// and how long they waited — since the core stamps hotkeys at dequeue.

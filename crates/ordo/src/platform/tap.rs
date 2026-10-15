@@ -18,6 +18,14 @@
 //! core lets it explain only the focus change right after it within the app
 //! typed into, and never a follow onto a hidden workspace.
 //!
+//! An MRU chord ARMS a walk ([`ordo_core::MruWalk`]): until Alt comes up, the
+//! arrows and Esc are Ordo's and are sent as the walk's steps, and the Alt
+//! release is sent as its commit. The tap only detects; the core runs the
+//! walk. The rule that matters is that the arrows can never stay hijacked:
+//! every other key, a click, or a key arriving with Alt up — the release
+//! went unseen, under secure input or a tap disabled by the OS — disarms
+//! the walk and commits it, and so does Alt going down anew.
+//!
 //! The rescue chord is handled here, ahead of everything, so the kill switch
 //! works even if the engine thread is wedged: on the second press within the
 //! window it flips interception off (freeing the keyboard immediately),
@@ -39,10 +47,10 @@ use objc2_core_graphics::{
 
 use objc2_app_kit::NSRunningApplication;
 use objc2_foundation::NSString;
-use ordo_core::{Gesture, Point, Rect, WindowId};
+use ordo_core::{Gesture, HotkeyAction, Point, Rect, WindowId};
 
 use crate::engine::Msg;
-use crate::keys::{self, Chord, Mods, Witness};
+use crate::keys::{self, Chord, Mods, WalkKey, Witness};
 use crate::platform::display::{self, MenuBars};
 use crate::platform::status_item::OwnMenu;
 use crate::platform::zorder;
@@ -61,8 +69,21 @@ struct TapContext {
     /// Cmd+Tab was pressed and Cmd is still held: the app switcher acts on the
     /// release, which is when the gesture is reported.
     app_switcher_armed: Cell<bool>,
+    /// An MRU chord was sent and Alt is still held: the arrows and Esc are
+    /// the walk's until it comes up (see the module doc).
+    walk_armed: Cell<bool>,
     keys: RefCell<keys::KeyWitness>,
     dock: DockWitness,
+}
+
+impl TapContext {
+    /// The walk the tap armed for is over. `commit` tells the core so, where
+    /// no chord of its own is about to: a chord commits the walk itself.
+    fn end_walk(&self, commit: bool) {
+        if self.walk_armed.replace(false) && commit {
+            let _ = self.tx.send(Msg::hotkey(HotkeyAction::MruCommit));
+        }
+    }
 }
 
 /// Spawn the tap on its own thread with its own run loop. The thread runs until
@@ -84,6 +105,7 @@ pub fn spawn(
             tap: RefCell::new(None),
             last_rescue: Cell::new(None),
             app_switcher_armed: Cell::new(false),
+            walk_armed: Cell::new(false),
             keys: RefCell::new(keys::KeyWitness::default()),
             dock: DockWitness::new(),
         }));
@@ -158,8 +180,13 @@ unsafe extern "C-unwind" fn callback(
         ctrl: flags.contains(CGEventFlags::MaskControl),
     };
 
+    let keycode = CGEvent::integer_value_field(Some(ev), CGEventField::KeyboardEventKeycode) as u16;
+
     match ty {
         CGEventType::LeftMouseDown | CGEventType::RightMouseDown | CGEventType::OtherMouseDown => {
+            // Before the click is read: the walk's window is where the user
+            // was when they reached for the mouse.
+            ctx.end_walk(true);
             // A click while Ordo's own menu is open is no gesture on the
             // world: read as one, it explained an app's re-key onto a hidden
             // workspace, and the core followed it there.
@@ -182,25 +209,49 @@ unsafe extern "C-unwind" fn callback(
             if !mods.cmd && ctx.app_switcher_armed.replace(false) {
                 let _ = ctx.tx.send(Msg::Gesture(Gesture::SystemSwitch));
             }
+            if ctx.walk_armed.get() && keys::ends_alt_hold(keycode, mods) {
+                ctx.end_walk(true);
+            }
             return pass;
         }
         CGEventType::KeyDown => {}
         _ => return pass,
     }
 
-    let keycode = CGEvent::integer_value_field(Some(ev), CGEventField::KeyboardEventKeycode) as u16;
-    let typed = ctx.keys.borrow_mut().report(
-        keycode,
-        mods,
-        ctx.intercepting.load(Ordering::Relaxed),
-        Instant::now(),
-    );
+    let intercepting = ctx.intercepting.load(Ordering::Relaxed);
+
+    // The walk's own keys, while Alt is still held from its chord. Any other
+    // key ends the walk below: a chord of ours tells the core itself, and
+    // everything else — a key the app gets, or one arriving with Alt up,
+    // after a release that went unseen — is told here.
+    if ctx.walk_armed.get() && intercepting {
+        if let Some(key) = keys::walk_key(keycode, mods) {
+            let action = match key {
+                WalkKey::Down => HotkeyAction::MruStepDown,
+                WalkKey::Up => HotkeyAction::MruStepUp,
+                WalkKey::Cancel => HotkeyAction::MruCancel,
+            };
+            if key == WalkKey::Cancel {
+                ctx.walk_armed.set(false);
+            }
+            let _ = ctx.tx.send(Msg::hotkey(action));
+            return std::ptr::null_mut();
+        }
+    }
+
+    let typed = ctx
+        .keys
+        .borrow_mut()
+        .report(keycode, mods, intercepting, Instant::now());
+
+    let chord = keys::match_chord(keycode, mods);
+    ctx.end_walk(!(intercepting && matches!(chord, Some(Chord::Hotkey(_)))));
 
     // The engage chord is checked before the interception gate — its whole job
     // is to work while Ordo is disengaged (post-rescue, or a --paused start).
     // Everything else is only ours when intercepting; while disengaged, all
     // other keys (including our own hotkeys) belong to the apps again.
-    match keys::match_chord(keycode, mods) {
+    match chord {
         Some(Chord::Engage) => {
             // Flip the flag here, symmetric with rescue's fast path, so
             // engagement doesn't depend on the engine being responsive.
@@ -215,9 +266,10 @@ unsafe extern "C-unwind" fn callback(
             let _ = ctx.tx.send(Msg::EngageFresh);
             std::ptr::null_mut() // swallow
         }
-        Some(chord) if ctx.intercepting.load(Ordering::Relaxed) => match chord {
+        Some(chord) if intercepting => match chord {
             Chord::Hotkey(action) => {
                 let _ = ctx.tx.send(Msg::hotkey(action));
+                ctx.walk_armed.set(action.starts_walk());
                 std::ptr::null_mut()
             }
             Chord::RescueCandidate => {

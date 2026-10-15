@@ -259,6 +259,19 @@ fn hotkey(action: HotkeyAction) -> Event {
     Event::Hotkey { at: ts(), action }
 }
 
+/// An MRU chord tapped — pressed and Alt released at once — the way the
+/// chords worked before walks: the window is focused on the press and
+/// chosen on the release. One step, both halves' effects in order.
+fn tapped(s: &State, action: HotkeyAction) -> Step {
+    let pressed = update(s, &hotkey(action));
+    let released = update(&pressed.state, &hotkey(HotkeyAction::MruCommit));
+    Step {
+        state: released.state,
+        effects: [pressed.effects, released.effects].concat(),
+        notes: [pressed.notes, released.notes].concat(),
+    }
+}
+
 fn gesture(gesture: Gesture) -> Event {
     Event::Gesture { at: ts(), gesture }
 }
@@ -483,7 +496,7 @@ fn an_unresolved_workspace_is_unknown_not_a_fact() {
 #[test]
 fn alt_tab_focuses_mru_in_workspace_and_warps_mouse() {
     let s = booted(&[3, 2, 1]); // history: [1, 2, 3]
-    let step = update(&s, &hotkey(HotkeyAction::MruWorkspace));
+    let step = tapped(&s, HotkeyAction::MruWorkspace);
     assert_eq!(focus_targets(&step.effects), vec![wid(2)]);
     // Mouse comes along, to the center of w2's frame (2000,100,400,300).
     assert!(step
@@ -525,7 +538,7 @@ fn alt_shift_tab_stays_on_the_focused_monitor() {
 #[test]
 fn ctrl_alt_tab_jumps_to_the_mru_window_on_the_other_monitor() {
     let s = booted(&[3, 2, 1]); // focused w1 on A; w2 lives on B, w3 on A
-    let step = update(&s, &hotkey(HotkeyAction::MruOtherMonitor));
+    let step = tapped(&s, HotkeyAction::MruOtherMonitor);
     assert_eq!(focus_targets(&step.effects), vec![wid(2)]);
     // The mouse crosses over with the focus, to w2's center.
     assert!(step
@@ -610,6 +623,317 @@ fn alt_tab_toggles_between_top_two() {
 
     let step2 = update(&obs.state, &hotkey(HotkeyAction::MruWorkspace));
     assert_eq!(focus_targets(&step2.effects), vec![wid(1)]);
+}
+
+// --- MRU walks ---------------------------------------------------------------
+// An MRU chord held is a walk down its list: Down/Up show candidates, the Alt
+// release (MruCommit) chooses the one shown, Esc (MruCancel) goes back.
+
+/// The standard world plus w4 (pid 300) on monitor A.
+fn four_windows() -> Vec<Win> {
+    let mut wins = std_windows();
+    wins.push(win(4, 300, 1, rect(1000.0, 700.0)));
+    wins
+}
+
+/// A look at the four-window world, focus on `focused`.
+fn see(s: &State, focused: u32) -> State {
+    update(
+        s,
+        &observed(
+            vec![mon_a(1), mon_b(1)],
+            four_windows(),
+            Some(focused),
+            RescanTrigger::Periodic,
+        ),
+    )
+    .state
+}
+
+fn warps(effects: &[Effect]) -> Vec<Point> {
+    effects
+        .iter()
+        .filter_map(|e| match e {
+            Effect::WarpMouse { to } => Some(*to),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Alt+Tab tapped is what it always was. The press focuses the most recent
+/// other window and puts it on top; the release chooses it — into the MRU
+/// order, and the mouse to it. Until then the order stands: showing is not
+/// using, and the looks in between record nothing.
+#[test]
+fn an_mru_chord_focuses_on_the_press_and_chooses_on_the_release() {
+    let s = booted(&[3, 2, 1]); // history [1, 2, 3]
+    let pressed = update(&s, &hotkey(HotkeyAction::MruWorkspace));
+    assert_eq!(focus_targets(&pressed.effects), vec![wid(2)]);
+    assert_eq!(
+        restacks(&pressed.effects),
+        vec![(vec![wid(2), wid(1), wid(3)], true)]
+    );
+    assert!(warps(&pressed.effects).is_empty());
+    assert_eq!(pressed.state.focus_intent(), FocusIntent::Window(wid(2)));
+    assert_eq!(history(&pressed.state), [wid(1), wid(2), wid(3)]);
+
+    let seen = look(&pressed.state, 2).state;
+    assert_eq!(history(&seen), [wid(1), wid(2), wid(3)]);
+
+    let released = update(&seen, &hotkey(HotkeyAction::MruCommit));
+    assert!(focus_targets(&released.effects).is_empty(), "the press's grant stands");
+    assert_eq!(warps(&released.effects), vec![Point { x: 2200.0, y: 250.0 }]);
+    assert_eq!(history(&released.state), [wid(2), wid(1), wid(3)]);
+    assert_eq!(released.state.focus_intent(), FocusIntent::Window(wid(2)));
+    assert!(released.state.walk.is_none());
+
+    // An Alt release at any other time is nothing.
+    let idle = update(&released.state, &hotkey(HotkeyAction::MruCommit));
+    assert!(idle.effects.is_empty());
+    assert_eq!(idle.state, released.state);
+}
+
+/// Each step down shows the next candidate — focused, on top of a stack
+/// that is otherwise the MRU order — and the release chooses the one shown.
+/// Only it moves to the front: the windows passed over keep their places.
+#[test]
+fn walking_down_and_releasing_chooses_the_window_shown_and_only_it() {
+    let s = booted_with(&four_windows(), &[4, 3, 2, 1]); // history [1, 2, 3, 4]
+    let pressed = see(&update(&s, &hotkey(HotkeyAction::MruWorkspace)).state, 2);
+    let down = update(&pressed, &hotkey(HotkeyAction::MruStepDown));
+    assert_eq!(focus_targets(&down.effects), vec![wid(3)]);
+    assert_eq!(
+        restacks(&down.effects),
+        vec![(vec![wid(3), wid(1), wid(2), wid(4)], true)]
+    );
+    assert!(warps(&down.effects).is_empty());
+    let down = update(&see(&down.state, 3), &hotkey(HotkeyAction::MruStepDown));
+    assert_eq!(focus_targets(&down.effects), vec![wid(4)]);
+    let shown = see(&down.state, 4);
+    assert_eq!(history(&shown), [wid(1), wid(2), wid(3), wid(4)]);
+    assert_eq!(shown.focus_intent(), FocusIntent::Window(wid(4)));
+
+    let released = update(&shown, &hotkey(HotkeyAction::MruCommit));
+    assert_eq!(history(&released.state), [wid(4), wid(1), wid(2), wid(3)]);
+    assert_eq!(released.state.focus_intent(), FocusIntent::Window(wid(4)));
+    assert_eq!(warps(&released.effects), vec![Point { x: 1200.0, y: 850.0 }]);
+    assert!(released.state.walk.is_none());
+}
+
+/// The ruling: the chord pressed again with Alt still held does not step. It
+/// commits the window shown and starts a new walk from it, so a held Alt with
+/// Tab tapped toggles between two windows exactly as before. A chord of
+/// another scope mid-walk does the same, in its own scope.
+#[test]
+fn the_chord_again_mid_walk_commits_and_starts_over_so_a_held_alt_toggles() {
+    let s = booted_with(&four_windows(), &[4, 3, 2, 1]); // history [1, 2, 3, 4]
+    let first = see(&update(&s, &hotkey(HotkeyAction::MruWorkspace)).state, 2);
+    let again = update(&first, &hotkey(HotkeyAction::MruWorkspace));
+    assert_eq!(focus_targets(&again.effects), vec![wid(1)]);
+    assert_eq!(warps(&again.effects), vec![Point { x: 2200.0, y: 250.0 }], "w2 chosen");
+    assert_eq!(history(&again.state), [wid(2), wid(1), wid(3), wid(4)]);
+    let third = update(&see(&again.state, 1), &hotkey(HotkeyAction::MruWorkspace));
+    assert_eq!(focus_targets(&third.effects), vec![wid(2)]);
+    assert_eq!(history(&third.state), [wid(1), wid(2), wid(3), wid(4)]);
+    let released = update(&see(&third.state, 2), &hotkey(HotkeyAction::MruCommit));
+    assert_eq!(history(&released.state), [wid(2), wid(1), wid(3), wid(4)]);
+
+    // Showing w1 (monitor A), Alt+Shift+Tab: w1 chosen, then a walk over A.
+    let monitor = update(&see(&again.state, 1), &hotkey(HotkeyAction::MruMonitor));
+    assert_eq!(history(&monitor.state), [wid(1), wid(2), wid(3), wid(4)]);
+    assert_eq!(focus_targets(&monitor.effects), vec![wid(3)]);
+    assert_eq!(
+        monitor.state.walk.as_ref().map(|k| k.ring.clone()),
+        Some(vec![wid(1), wid(3), wid(4)])
+    );
+}
+
+/// Esc brings back the window the walk left and the stack to MRU order, and
+/// the walk is over: the order is untouched, and the Alt release that
+/// follows has nothing to commit.
+#[test]
+fn esc_ends_the_walk_back_where_it_began_with_the_order_untouched() {
+    let s = booted_with(&four_windows(), &[4, 3, 2, 1]);
+    let pressed = see(&update(&s, &hotkey(HotkeyAction::MruWorkspace)).state, 2);
+    let walked = see(&update(&pressed, &hotkey(HotkeyAction::MruStepDown)).state, 3);
+    let cancelled = update(&walked, &hotkey(HotkeyAction::MruCancel));
+    assert_eq!(focus_targets(&cancelled.effects), vec![wid(1)]);
+    assert_eq!(
+        restacks(&cancelled.effects),
+        vec![(vec![wid(1), wid(2), wid(3), wid(4)], true)]
+    );
+    assert!(warps(&cancelled.effects).is_empty());
+    assert!(cancelled.state.walk.is_none());
+    assert_eq!(history(&cancelled.state), [wid(1), wid(2), wid(3), wid(4)]);
+    assert_eq!(cancelled.state.focus_intent(), FocusIntent::Window(wid(1)));
+
+    let released = update(&see(&cancelled.state, 1), &hotkey(HotkeyAction::MruCommit));
+    assert!(released.effects.is_empty());
+    assert_eq!(history(&released.state), [wid(1), wid(2), wid(3), wid(4)]);
+}
+
+/// The walk clamps at both ends: a step past the last candidate, or above
+/// the window it left, does nothing. Up from the first candidate shows that
+/// window again, and a release there chooses nothing.
+#[test]
+fn the_walk_clamps_at_both_ends_and_up_returns_to_the_window_it_left() {
+    let s = booted(&[3, 2, 1]); // history [1, 2, 3]
+    let pressed = update(&s, &hotkey(HotkeyAction::MruWorkspace)).state;
+    let down = update(&look(&pressed, 2).state, &hotkey(HotkeyAction::MruStepDown));
+    assert_eq!(focus_targets(&down.effects), vec![wid(3)]);
+    let at_end = look(&down.state, 3).state;
+    let past = update(&at_end, &hotkey(HotkeyAction::MruStepDown));
+    assert!(past.effects.is_empty());
+    assert_eq!(past.state, at_end);
+
+    let up = update(&at_end, &hotkey(HotkeyAction::MruStepUp));
+    assert_eq!(focus_targets(&up.effects), vec![wid(2)]);
+    let up = update(&look(&up.state, 2).state, &hotkey(HotkeyAction::MruStepUp));
+    assert_eq!(focus_targets(&up.effects), vec![wid(1)]);
+    assert_eq!(restacks(&up.effects), vec![(vec![wid(1), wid(2), wid(3)], true)]);
+    let at_start = look(&up.state, 1).state;
+    let above = update(&at_start, &hotkey(HotkeyAction::MruStepUp));
+    assert!(above.effects.is_empty());
+    assert_eq!(above.state, at_start);
+
+    let released = update(&at_start, &hotkey(HotkeyAction::MruCommit));
+    assert!(released.effects.is_empty());
+    assert_eq!(history(&released.state), [wid(1), wid(2), wid(3)]);
+    assert_eq!(released.state.focus_intent(), FocusIntent::Window(wid(1)));
+    assert!(released.state.walk.is_none());
+}
+
+/// A window that closes mid-walk leaves the ring. When it was the one shown,
+/// the next one down is shown in its place (the last, past the end), as a
+/// close hands focus on; whatever the app keyed meanwhile is not followed.
+/// Another window closing changes nothing on screen.
+#[test]
+fn a_window_closing_mid_walk_leaves_the_ring_and_the_shown_one_moves_on() {
+    let s = booted_with(&four_windows(), &[4, 3, 2, 1]); // history [1, 2, 3, 4]
+    let pressed = see(&update(&s, &hotkey(HotkeyAction::MruWorkspace)).state, 2);
+    let showing_3 = see(&update(&pressed, &hotkey(HotkeyAction::MruStepDown)).state, 3);
+    let without = |gone: u32, focused: u32| {
+        let wins: Vec<Win> = four_windows()
+            .into_iter()
+            .filter(|w| w.snap.id != wid(gone))
+            .collect();
+        observed(vec![mon_a(1), mon_b(1)], wins, Some(focused), RescanTrigger::Periodic)
+    };
+
+    // w3 closes and its app keys w1: w4 is shown instead.
+    let closed = update(&showing_3, &without(3, 1));
+    assert_eq!(focus_targets(&closed.effects), vec![wid(4)]);
+    assert!(closed.notes.contains(&Note::FocusHandedOn {
+        closed: wid(3),
+        to: Some(wid(4)),
+    }));
+    assert_eq!(
+        restacks(&closed.effects),
+        vec![(vec![wid(4), wid(1), wid(2)], true)]
+    );
+    assert_eq!(
+        closed.state.walk.as_ref().map(|k| (k.ring.clone(), k.shown)),
+        Some((vec![wid(1), wid(2), wid(4)], 2))
+    );
+    let up = update(&closed.state, &hotkey(HotkeyAction::MruStepUp));
+    assert_eq!(focus_targets(&up.effects), vec![wid(2)]);
+    let released = update(&up.state, &hotkey(HotkeyAction::MruCommit));
+    assert_eq!(history(&released.state)[0], wid(2));
+
+    // The window the walk left closes while w3 is shown: nothing to show.
+    let origin_gone = update(&showing_3, &without(1, 3));
+    assert!(focus_targets(&origin_gone.effects).is_empty());
+    assert_eq!(
+        origin_gone.state.walk.as_ref().map(|k| (k.ring.clone(), k.shown)),
+        Some((vec![wid(2), wid(3), wid(4)], 1))
+    );
+    let up = update(&origin_gone.state, &hotkey(HotkeyAction::MruStepUp));
+    assert_eq!(focus_targets(&up.effects), vec![wid(2)]);
+}
+
+/// Any other press ends the walk on the window shown before it acts, as the
+/// Alt release would, so the walk can never outlive the hold: the shell
+/// sends the commit for a click or a key it saw with Alt up, and a gesture
+/// reaching the core without one ends the walk with nothing chosen.
+#[test]
+fn any_other_press_commits_the_walk_first_and_a_gesture_ends_it() {
+    let s = booted_with(&four_windows(), &[4, 3, 2, 1]); // history [1, 2, 3, 4]
+    let pressed = see(&update(&s, &hotkey(HotkeyAction::MruWorkspace)).state, 2);
+    let showing_3 = see(&update(&pressed, &hotkey(HotkeyAction::MruStepDown)).state, 3);
+
+    let switched = update(&showing_3, &hotkey(HotkeyAction::WorkspaceNext));
+    assert_eq!(count_switches(&switched.effects), 1);
+    assert_eq!(history(&switched.state), [wid(3), wid(1), wid(2), wid(4)]);
+    assert!(switched.state.walk.is_none());
+
+    // The release went unseen; the click arrives behind the shell's commit.
+    let committed = update(&showing_3, &hotkey(HotkeyAction::MruCommit)).state;
+    let clicked = update(&committed, &click(2200.0, 250.0)).state;
+    assert_eq!(history(&clicked), [wid(3), wid(1), wid(2), wid(4)]);
+    assert_eq!(clicked.focus_intent(), FocusIntent::Deferred);
+    assert!(clicked.walk.is_none());
+
+    let swiped = update(&showing_3, &gesture(Gesture::SystemSwitch)).state;
+    assert_eq!(history(&swiped), [wid(1), wid(2), wid(3), wid(4)]);
+    assert!(swiped.walk.is_none());
+    // The arrows are nobody's now.
+    let stray = update(&swiped, &hotkey(HotkeyAction::MruStepDown));
+    assert!(stray.effects.is_empty());
+    assert_eq!(stray.state, swiped);
+}
+
+/// A candidate on a hidden monitor is shown as it would be chosen: its
+/// monitor viewed first, and the walk back views the monitor it left.
+#[test]
+fn a_candidate_on_a_hidden_monitor_is_viewed_when_shown() {
+    let s = undocked(&[3, 2, 1]); // history [1, 2, 3]; w2 hidden on monitor 2
+    let pressed = update(&s, &hotkey(HotkeyAction::MruWorkspace));
+    assert_eq!(focus_targets(&pressed.effects), vec![wid(2)]);
+    let viewed = pressed
+        .effects
+        .iter()
+        .position(|e| matches!(e, Effect::ViewMonitor { target, .. } if *target == vm(2)));
+    let granted = pressed
+        .effects
+        .iter()
+        .position(|e| matches!(e, Effect::FocusWindow { window, .. } if *window == wid(2)));
+    assert!(viewed.is_some_and(|v| granted.is_some_and(|g| v < g)), "{:?}", pressed.effects);
+
+    let back = update(&pressed.state, &hotkey(HotkeyAction::MruStepUp));
+    assert_eq!(focus_targets(&back.effects), vec![wid(1)]);
+    assert!(back
+        .effects
+        .iter()
+        .any(|e| matches!(e, Effect::ViewMonitor { target, .. } if *target == vm(1))));
+}
+
+/// Queued steps fold into one step to where they would end, clamped as the
+/// walk clamps; after any other press they are left alone, since that press
+/// may start a walk of a length not known here.
+#[test]
+fn queued_walk_steps_coalesce_into_one() {
+    use HotkeyAction::*;
+    let s = booted(&[3, 2, 1]); // history [1, 2, 3]
+    let walking = update(&s, &hotkey(MruWorkspace)).state; // ring [1, 2, 3], shown 1
+    assert_eq!(
+        coalesce_hotkeys(&walking, &[MruStepDown, MruStepDown, MruStepDown]),
+        vec![MruStepTo(2)]
+    );
+    assert_eq!(coalesce_hotkeys(&walking, &[MruStepDown, MruStepUp]), vec![]);
+    assert_eq!(
+        coalesce_hotkeys(&walking, &[MruStepUp, MruStepUp, MruCommit]),
+        vec![MruStepTo(0), MruCommit]
+    );
+    assert_eq!(
+        coalesce_hotkeys(&walking, &[MruStepDown, MruWorkspace, MruStepDown]),
+        vec![MruStepTo(2), MruWorkspace, MruStepDown]
+    );
+    assert_eq!(
+        coalesce_hotkeys(&s, &[MruStepDown, MruStepDown]),
+        vec![MruStepDown, MruStepDown]
+    );
+    let stepped = update(&walking, &hotkey(MruStepTo(2)));
+    assert_eq!(focus_targets(&stepped.effects), vec![wid(3)]);
 }
 
 // --- workspace switching ------------------------------------------------------
@@ -2411,7 +2735,7 @@ fn a_key_window_ordo_does_not_manage_is_left_alone() {
     let s = update(&State::new(), &observed(mons(), wins.clone(), None, RescanTrigger::Startup)).state;
     let s = used(&s, 1, mons(), wins.clone());
     let s = used(&s, 3, mons(), wins.clone());
-    let s = update(&s, &hotkey(HotkeyAction::MruWorkspace)).state;
+    let s = tapped(&s, HotkeyAction::MruWorkspace).state;
     assert_eq!(s.focus_intent(), FocusIntent::Window(wid(1)));
     let s = update(&s, &observed(mons(), wins.clone(), Some(1), RescanTrigger::Periodic)).state;
     let s = update(&s, &gesture(Gesture::Key)).state;
@@ -3478,7 +3802,7 @@ fn a_grant_landing_on_a_sibling_is_corrected_and_does_not_reorder_mru() {
 #[test]
 fn mru_records_declarations_and_where_a_click_lands() {
     let s = booted(&[3, 2, 1]); // history [1, 2, 3], all on ws1
-    let step = update(&s, &hotkey(HotkeyAction::MruWorkspace)); // -> w2
+    let step = tapped(&s, HotkeyAction::MruWorkspace); // -> w2
     assert_eq!(
         step.state.focus_history.iter().next(),
         Some(wid(2)),
@@ -3590,8 +3914,8 @@ fn a_click_the_user_moved_on_from_explains_nothing_later() {
 #[test]
 fn a_key_press_explains_the_focus_change_right_after_it_and_nothing_later() {
     let s = booted(&[3, 2, 1]);
-    let to_2 = update(&s, &hotkey(HotkeyAction::MruWorkspace)).state;
-    let to_1 = update(&look(&to_2, 2).state, &hotkey(HotkeyAction::MruWorkspace)).state;
+    let to_2 = tapped(&s, HotkeyAction::MruWorkspace).state;
+    let to_1 = tapped(&look(&to_2, 2).state, HotkeyAction::MruWorkspace).state;
     let on_1 = look(&to_1, 1).state;
     assert_eq!(on_1.focus_intent(), FocusIntent::Window(wid(1)));
     assert_eq!(history(&on_1), [wid(1), wid(2), wid(3)]);
@@ -3623,8 +3947,8 @@ fn a_key_press_explains_the_focus_change_right_after_it_and_nothing_later() {
 #[test]
 fn another_app_grabbing_focus_while_the_user_types_is_fought() {
     let s = booted(&[3, 2, 1]);
-    let to_2 = update(&s, &hotkey(HotkeyAction::MruWorkspace)).state;
-    let to_1 = update(&look(&to_2, 2).state, &hotkey(HotkeyAction::MruWorkspace)).state;
+    let to_2 = tapped(&s, HotkeyAction::MruWorkspace).state;
+    let to_1 = tapped(&look(&to_2, 2).state, HotkeyAction::MruWorkspace).state;
     let typing = update(&look(&to_1, 1).state, &gesture(Gesture::Key)).state;
     let typing = update(&look(&typing, 1).state, &gesture(Gesture::Key)).state;
     let grabbed = look(&typing, 2); // another app's window
@@ -3741,7 +4065,7 @@ fn a_gesture_hands_focus_to_the_os_and_every_command_takes_it_back() {
         "start: the OS owns focus"
     );
 
-    let declared = update(&s, &hotkey(HotkeyAction::MruWorkspace)).state;
+    let declared = tapped(&s, HotkeyAction::MruWorkspace).state;
     assert_eq!(declared.focus_intent(), FocusIntent::Window(wid(2)));
     let deferred = update(&declared, &gesture(Gesture::SystemSwitch)).state;
     assert_eq!(deferred.focus_intent(), FocusIntent::Deferred);
@@ -4986,7 +5310,7 @@ fn the_monitor_the_user_is_at_is_declared_not_read() {
 #[test]
 fn a_window_whose_app_is_silent_through_an_unplug_stays_in_the_model() {
     // The user Ctrl+Alt+Tabbed to w2 (Slack, monitor 2), on the second display.
-    let jumped = update(&booted(&[3, 2, 1]), &hotkey(HotkeyAction::MruOtherMonitor)).state;
+    let jumped = tapped(&booted(&[3, 2, 1]), HotkeyAction::MruOtherMonitor).state;
     let s = update(
         &jumped,
         &observed(vec![mon_a(1), mon_b(1)], std_windows(), Some(2), RescanTrigger::Periodic),

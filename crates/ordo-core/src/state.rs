@@ -173,6 +173,30 @@ pub(crate) struct Away {
     pub(crate) within: Option<Pid>,
 }
 
+/// An MRU chord held: the user walks the chord's candidates with the arrows,
+/// each shown as a commit would leave it — focused, and on top of the stack
+/// — but entering the order only when the walk ends on it. Showing is not
+/// using: were each step recorded, the walk would reorder the very list it
+/// walks, and every candidate passed over on the way down would come back
+/// ahead of the one chosen.
+///
+/// `ring[0]` is the window the walk left, the rest the chord's candidates,
+/// most recent first; never fewer than two, since a walk with nowhere to
+/// step ends. It ends in a commit (the Alt release, or any press that is not
+/// a step, which commits before it acts), in a cancel, or in a declaration
+/// of some other window (see [`State::declare_focus`]).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MruWalk {
+    pub ring: Vec<WindowId>,
+    pub shown: usize,
+}
+
+impl MruWalk {
+    pub fn shown(&self) -> WindowId {
+        self.ring[self.shown]
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct State {
     pub mode: Mode,
@@ -197,8 +221,9 @@ pub struct State {
     pub focused: Option<WindowId>,
     /// Private with one writer (`declare_focus`) so a declaration can never be
     /// written without also resetting its damping episode and recording it in
-    /// the MRU history. `serde(default)` = `Deferred`: a checkpoint from before
-    /// this field, like a fresh start, has nothing to enforce.
+    /// the MRU history (but for a walk's shown window, see there).
+    /// `serde(default)` = `Deferred`: a checkpoint from before this field,
+    /// like a fresh start, has nothing to enforce.
     #[serde(default)]
     focus_intent: FocusIntent,
     /// Grants issued by ENFORCEMENT for the current declaration (the command's
@@ -263,6 +288,9 @@ pub struct State {
     #[serde(default)]
     pub(crate) conceded: Option<Pid>,
     pub focus_history: FocusHistory,
+    /// The MRU walk under way, if any. See [`MruWalk`].
+    #[serde(default)]
+    pub walk: Option<MruWalk>,
     /// Visible windows found standing on a display other than their monitor's,
     /// and when (`mono_ns`) each was first seen there. Adoption waits on this:
     /// macOS re-homes a vanished display's windows a beat BEFORE it reports
@@ -315,6 +343,7 @@ impl State {
             key_unmanaged: false,
             conceded: None,
             focus_history: FocusHistory::new(),
+            walk: None,
             misplaced_since: BTreeMap::new(),
             moving: BTreeSet::new(),
             vanished: BTreeMap::new(),
@@ -343,10 +372,22 @@ impl State {
     /// and the old focus that snapshot shows parked is the command's doing,
     /// not the click's. Likewise a standing concession: the command is fresh
     /// evidence that the user wants the slot moved, so it is fought for anew.
+    ///
+    /// The one exception to the recording is the window an MRU walk is
+    /// showing: declared, so it is enforced like any other, but not recorded
+    /// until the walk commits (see [`MruWalk`]). A declaration of anything
+    /// else ends the walk, without a record: the user was taken elsewhere —
+    /// a window born with focus, a close handing focus on, a rescue.
     pub(crate) fn declare_focus(&mut self, intent: FocusIntent) {
-        if let FocusIntent::Window(w) = intent {
-            let root = self.root_of(w);
-            self.focus_history.touch(root);
+        let shown = self.walk.as_ref().map(MruWalk::shown);
+        match intent {
+            FocusIntent::Window(w) if shown == Some(w) => {}
+            FocusIntent::Window(w) => {
+                self.walk = None;
+                let root = self.root_of(w);
+                self.focus_history.touch(root);
+            }
+            _ => self.walk = None,
         }
         self.focus_intent = intent;
         self.focus_corrections = 0;

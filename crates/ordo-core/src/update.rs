@@ -7,11 +7,13 @@ use crate::event::{
     AxHintKind, Event, Gesture, HotkeyAction, Input, OpOutcome, RescanTrigger, WorldSnapshot,
 };
 use crate::ids::{
-    MonitorId, OpId, Pid, Rect, VirtualMonitorId, WindowId, WorkspaceId, FRAME_EPSILON,
+    MonitorId, OpId, Pid, Point, Rect, VirtualMonitorId, WindowId, WorkspaceId, FRAME_EPSILON,
 };
 use crate::project::{after_move, Projection};
 use crate::reconcile::{self, Delta};
-use crate::state::{Away, Awaited, FocusIntent, Landing, Mode, PendingOp, State, WindowRecord};
+use crate::state::{
+    Away, Awaited, FocusIntent, Landing, Mode, MruWalk, PendingOp, State, WindowRecord,
+};
 
 /// How long an expectation may go unmet before its op is declared lost.
 ///
@@ -119,7 +121,8 @@ pub enum Note {
         from_app: Pid,
     },
     /// The window holding focus closed, and focus went to the next window in
-    /// the MRU order on its monitor (`to`), or that monitor's desktop (`None`).
+    /// the MRU order on its monitor (`to`), or that monitor's desktop (`None`)
+    /// — or, mid-walk, to the next window down the walk's ring.
     FocusHandedOn {
         closed: WindowId,
         to: Option<WindowId>,
@@ -241,14 +244,24 @@ fn desired_stack(s: &State) -> Vec<WindowId> {
     // A window floating above the ordinary layer (the screenshot tool's
     // window is layer 3) is above every ordinary one whatever is raised, and
     // the worker, reading only layer 0, would wait for it on every restack.
-    s.focus_history
+    let mut order: Vec<WindowId> = s
+        .focus_history
         .iter()
         .filter(|w| {
             s.declared_workspace_of(*w) == Some(here)
                 && s.declared_vmonitor_of(*w).is_some_and(|m| proj.is_hosted(m))
                 && s.windows.get(w).is_some_and(|r| r.layer == 0)
         })
-        .collect()
+        .collect();
+    // A walk's shown window heads the stack from wherever it stands in the
+    // order it has not entered yet.
+    if let Some(w) = s.walk.as_ref().map(MruWalk::shown) {
+        if let Some(i) = order.iter().position(|x| *x == w) {
+            order.remove(i);
+            order.insert(0, w);
+        }
+    }
+    order
 }
 
 /// The effects that reveal windows. Each scrambles the real stack (parking
@@ -467,14 +480,36 @@ fn op_ended(s: &mut State, op: OpId) {
 /// nobody can type into a parked window — with the projection the world will
 /// be under once that view lands, for restacking and warping against. The
 /// caller emits the focus grant AFTER the view, as a switch does: the grant
-/// must follow the moves and un-hide that reveal the window.
+/// must follow the moves and un-hide that reveal the window. Read against
+/// the DECLARED projection, so a second command before the look that
+/// confirms the first's view (a walk stepping back) still views the monitor
+/// the first left.
 fn view_for(s: &State, target: WindowId) -> (Option<VirtualMonitorId>, Projection) {
     let vm = s.windows[&target].vmonitor;
-    let proj = s.projection();
+    let proj = s.declared_projection();
     if proj.is_hosted(vm) || s.virtual_monitors.is_none() {
         return (None, proj);
     }
     (Some(vm), s.projection_with(Some(vm), None))
+}
+
+/// Hand focus to `target`, its monitor viewed just before the grant where it
+/// is hidden, and say where the mouse would go to follow: the window's
+/// center under the projection that view leaves.
+fn focus_in_view(
+    s: &mut State,
+    target: WindowId,
+    now_ns: u64,
+    fx: &mut Vec<Effect>,
+    notes: &mut Vec<Note>,
+) -> (OpId, Point) {
+    let (view, proj) = view_for(s, target);
+    let center = s.projected_frame_in(&s.windows[&target], &proj).center();
+    if let Some(vm) = view {
+        push_view(s, vm, now_ns, fx);
+    }
+    let op = push_focus(s, target, true, now_ns, fx, notes);
+    (op, center)
 }
 
 /// The user reached for focus through the OS rather than through Ordo (by any
@@ -591,6 +626,10 @@ enum Command {
     Focus {
         target: WindowId,
     },
+    /// Start an MRU walk down `ring`, showing its first candidate.
+    Walk {
+        ring: Vec<WindowId>,
+    },
     Demote {
         from: WindowId,
         to: WindowId,
@@ -625,6 +664,14 @@ fn handle_hotkey(
     fx: &mut Vec<Effect>,
     notes: &mut Vec<Note>,
 ) {
+    if action.walks() {
+        walk(s, action, now_ns, fx, notes);
+        return;
+    }
+    // Any other press ends the walk under way first, as the Alt release
+    // would: an MRU chord then starts another from the window just chosen,
+    // which is what makes a held Alt with Tab tapped toggle as it always did.
+    commit_walk(s, fx);
     // A hotkey that resolves to nothing (clamped at an edge, nothing focused)
     // touched neither the world nor the declaration.
     let Some(cmd) = resolve(s, action) else {
@@ -632,12 +679,77 @@ fn handle_hotkey(
     };
     let before = desired_stack(s);
     let (focus, op) = execute(s, cmd, now_ns, fx, notes);
+    settle(s, focus, op, &before, fx);
+}
+
+/// What every command ends in: its declaration, the restack that calls for,
+/// and a look at its landing.
+fn settle(s: &mut State, focus: FocusIntent, op: OpId, before: &[WindowId], fx: &mut Vec<Effect>) {
     s.declare_focus(focus);
     let revealed = fx.iter().any(reveals);
-    restack_to_intent(s, &before, revealed, fx);
+    restack_to_intent(s, before, revealed, fx);
     fx.push(Effect::RequestRescan {
         reason: RescanTrigger::PostEffect { op },
     });
+}
+
+/// A key of the walk under way. Nothing without one: the shell swallows the
+/// arrows from the chord on, and the core may have had nowhere to walk.
+fn walk(
+    s: &mut State,
+    action: HotkeyAction,
+    now_ns: u64,
+    fx: &mut Vec<Effect>,
+    notes: &mut Vec<Note>,
+) {
+    let Some(k) = &s.walk else {
+        return;
+    };
+    let last = k.ring.len() - 1;
+    let index = match action {
+        HotkeyAction::MruStepDown => (k.shown + 1).min(last),
+        HotkeyAction::MruStepUp => k.shown.saturating_sub(1),
+        HotkeyAction::MruStepTo(i) => i.min(last),
+        HotkeyAction::MruCancel => 0,
+        HotkeyAction::MruCommit => return commit_walk(s, fx),
+        _ => unreachable!("not a walk key"),
+    };
+    // Clamped at an edge: nothing to show.
+    if index != k.shown {
+        show(s, index, now_ns, fx, notes);
+    }
+    if action == HotkeyAction::MruCancel {
+        s.walk = None;
+    }
+}
+
+/// Show the walk's `index`: focused and on top, as a commit would leave it,
+/// and no more — no warp, no place in the order (see `MruWalk`).
+fn show(s: &mut State, index: usize, now_ns: u64, fx: &mut Vec<Effect>, notes: &mut Vec<Note>) {
+    let before = desired_stack(s);
+    let k = s.walk.as_mut().expect("a walk is under way");
+    k.shown = index;
+    let target = k.shown();
+    let (op, _) = focus_in_view(s, target, now_ns, fx, notes);
+    settle(s, FocusIntent::Window(target), op, &before, fx);
+}
+
+/// End the walk on the window it shows: now chosen, it enters the order, and
+/// the mouse follows it as it follows a Focus. The walk's own grant put the
+/// focus there already. Back at the window the walk left, nothing was chosen.
+fn commit_walk(s: &mut State, fx: &mut Vec<Effect>) {
+    let Some(k) = s.walk.take() else {
+        return;
+    };
+    if k.shown == 0 {
+        return;
+    }
+    let chosen = k.shown();
+    if let Some(r) = s.windows.get(&chosen) {
+        let center = s.projected_frame_in(r, &s.declared_projection()).center();
+        fx.push(Effect::WarpMouse { to: center });
+    }
+    s.declare_focus(FocusIntent::Window(chosen));
 }
 
 fn resolve(s: &State, action: HotkeyAction) -> Option<Command> {
@@ -703,25 +815,48 @@ fn resolve(s: &State, action: HotkeyAction) -> Option<Command> {
             if focused_rec.is_none() && (monitors != Monitors::Any || same_app) {
                 return None;
             }
-            let target = s.focus_history.most_recent(focused, |w| {
-                let Some(r) = s.windows.get(&w) else {
-                    return false;
-                };
-                if r.workspace != cur_ws {
-                    return false;
+            let candidates: Vec<WindowId> = s
+                .focus_history
+                .iter()
+                .filter(|w| Some(*w) != focused)
+                .filter(|w| {
+                    let Some(r) = s.windows.get(w) else {
+                        return false;
+                    };
+                    if r.workspace != cur_ws {
+                        return false;
+                    }
+                    // Monitor scoping reads the DECLARED virtual monitor,
+                    // never the display: two virtual monitors collapsed onto
+                    // one display are still two monitors to Alt+Shift+Tab.
+                    let on_monitor = match monitors {
+                        Monitors::Any => true,
+                        Monitors::Focused => {
+                            focused_rec.is_some_and(|f| r.vmonitor == f.vmonitor)
+                        }
+                        Monitors::Other => focused_rec.is_some_and(|f| r.vmonitor != f.vmonitor),
+                    };
+                    on_monitor && (!same_app || focused_rec.is_some_and(|f| r.app == f.app))
+                })
+                .collect();
+            let first = *candidates.first()?;
+            match focused {
+                // Nothing to walk back to: the window is focused outright.
+                None => Some(Command::Focus { target: first }),
+                Some(origin) => {
+                    let mut ring = vec![origin];
+                    ring.extend(candidates);
+                    Some(Command::Walk { ring })
                 }
-                // Monitor scoping reads the DECLARED virtual monitor, never
-                // the display: two virtual monitors collapsed onto one
-                // display are still two monitors to Alt+Shift+Tab.
-                let on_monitor = match monitors {
-                    Monitors::Any => true,
-                    Monitors::Focused => focused_rec.is_some_and(|f| r.vmonitor == f.vmonitor),
-                    Monitors::Other => focused_rec.is_some_and(|f| r.vmonitor != f.vmonitor),
-                };
-                on_monitor && (!same_app || focused_rec.is_some_and(|f| r.app == f.app))
-            })?;
-            Some(Command::Focus { target })
+            }
         }
+
+        // The walk's keys never resolve: see `walk`.
+        HotkeyAction::MruStepDown
+        | HotkeyAction::MruStepUp
+        | HotkeyAction::MruStepTo(_)
+        | HotkeyAction::MruCommit
+        | HotkeyAction::MruCancel => None,
 
         HotkeyAction::MruDemote => {
             let workspace = s.current_workspace()?;
@@ -886,14 +1021,7 @@ fn execute(
         }
 
         Command::Focus { target } => {
-            // A target on a hidden monitor gets its monitor viewed just before
-            // the grant.
-            let (view, proj) = view_for(s, target);
-            let center = s.projected_frame_in(&s.windows[&target], &proj).center();
-            if let Some(vm) = view {
-                push_view(s, vm, now_ns, fx);
-            }
-            let op = push_focus(s, target, true, now_ns, fx, notes);
+            let (op, center) = focus_in_view(s, target, now_ns, fx, notes);
             // Warp optimistically off our own belief of the frame rather than
             // waiting for the focus to be observed — a mouse that lags its
             // window by a rescan round-trip feels broken. The mouse follows
@@ -903,15 +1031,19 @@ fn execute(
             (FocusIntent::Window(target), op)
         }
 
+        Command::Walk { ring } => {
+            // Shown, not chosen: the mouse stays until the commit (see
+            // `commit_walk`), and the declaration below enters no order.
+            let target = ring[1];
+            s.walk = Some(MruWalk { ring, shown: 1 });
+            let (op, _) = focus_in_view(s, target, now_ns, fx, notes);
+            (FocusIntent::Window(target), op)
+        }
+
         Command::Demote { from, to } => {
             let root = s.root_of(from);
             s.focus_history.demote(root);
-            let (view, proj) = view_for(s, to);
-            let center = s.projected_frame_in(&s.windows[&to], &proj).center();
-            if let Some(vm) = view {
-                push_view(s, vm, now_ns, fx);
-            }
-            let op = push_focus(s, to, true, now_ns, fx, notes);
+            let (op, center) = focus_in_view(s, to, now_ns, fx, notes);
             fx.push(Effect::WarpMouse { to: center });
             (FocusIntent::Window(to), op)
         }
@@ -1104,16 +1236,41 @@ enum Monitors {
 /// single-action batch passes through untouched, so the common unqueued press
 /// keeps its exact logged shape.
 ///
+/// A run of MRU walk steps at the head of the batch folds the same way, into
+/// one step to where the walk under way would end up. Steps behind any other
+/// press are left as they are: that press may start a walk, whose ring is
+/// not known here.
+///
 /// Lives in the core because "what a run of commands is equivalent to" is
 /// command semantics; the engine only decides when a batch exists.
 pub fn coalesce_hotkeys(s: &State, actions: &[HotkeyAction]) -> Vec<HotkeyAction> {
     if actions.len() <= 1 {
         return actions.to_vec();
     }
-    let Some(cur) = s.declared_workspace() else {
-        return actions.to_vec();
-    };
     let mut out = Vec::new();
+    let mut actions = actions;
+    if let Some(k) = &s.walk {
+        let last = k.ring.len() - 1;
+        let mut sim = k.shown;
+        let mut steps = 0;
+        for a in actions {
+            sim = match *a {
+                HotkeyAction::MruStepDown => (sim + 1).min(last),
+                HotkeyAction::MruStepUp => sim.saturating_sub(1),
+                HotkeyAction::MruStepTo(i) => i.min(last),
+                _ => break,
+            };
+            steps += 1;
+        }
+        if sim != k.shown {
+            out.push(HotkeyAction::MruStepTo(sim));
+        }
+        actions = &actions[steps..];
+    }
+    let Some(cur) = s.declared_workspace() else {
+        out.extend_from_slice(actions);
+        return out;
+    };
     // `sim` walks the workspace the queued presses would have landed on;
     // `walk_start` is where the current fold began, so a net-zero bounce
     // (including bounces off a clamped edge) emits nothing at all.
@@ -1165,8 +1322,12 @@ fn handle_snapshot(
     // Whatever the app keys in the look that closed the focused window is
     // the close's fallout, even inside the second after the click that
     // closed it: where focus goes next is Ordo's to say.
-    let hand_on = hand_on_from_close(pre, s, &deltas);
-    if hand_on.is_none() && !s.own_menu && !s.key_unmanaged {
+    let reshown = prune_walk(s);
+    let hand_on = match reshown {
+        Some(_) => None,
+        None => hand_on_from_close(pre, s, &deltas),
+    };
+    if hand_on.is_none() && reshown.is_none() && !s.own_menu && !s.key_unmanaged {
         record_landing(s, trigger, now_ns, notes);
     }
     // A display came or went. Every window on the vanished display was just
@@ -1253,9 +1414,18 @@ fn handle_snapshot(
 
     let mut last_op: Option<OpId> = None;
 
-    let handed_on = hand_on.is_some();
+    let handed_on = hand_on.is_some() || reshown.is_some();
     if let Some(hand_on) = hand_on {
         hand_on_focus(s, hand_on, now_ns, notes, &mut last_op, fx);
+    }
+    if let Some((closed, next)) = reshown {
+        let (op, _) = focus_in_view(s, next, now_ns, fx, notes);
+        s.declare_focus(FocusIntent::Window(next));
+        notes.push(Note::FocusHandedOn {
+            closed,
+            to: Some(next),
+        });
+        last_op = Some(op);
     }
 
     // The user's hands outrank stale intent: an unexplained frame change on
@@ -1713,6 +1883,31 @@ fn hand_on_focus(
             s.declare_focus(FocusIntent::Desktop);
             notes.push(Note::FocusHandedOn { closed, to: None });
             *last_op = Some(op);
+        }
+    }
+}
+
+/// The walk after a look: windows the window server no longer has leave its
+/// ring, and a walk left with nowhere to step ends. When the shown window
+/// was among them the walk moves on to the next one down, or the last; that
+/// window, and the one closed, are returned for the look to grant as a
+/// close hands focus on.
+fn prune_walk(s: &mut State) -> Option<(WindowId, WindowId)> {
+    let k = s.walk.as_mut()?;
+    let showing = k.shown();
+    k.ring.retain(|w| s.windows.contains_key(w));
+    if k.ring.len() < 2 {
+        s.walk = None;
+        return None;
+    }
+    match k.ring.iter().position(|w| *w == showing) {
+        Some(i) => {
+            k.shown = i;
+            None
+        }
+        None => {
+            k.shown = k.shown.min(k.ring.len() - 1);
+            Some((showing, k.shown()))
         }
     }
 }
