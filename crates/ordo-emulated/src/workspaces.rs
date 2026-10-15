@@ -153,6 +153,29 @@ impl Geometry {
     }
 }
 
+/// A standard macOS title bar: the band at a window's top that it is dragged
+/// by. Clicking the body only clicks into the app.
+const TITLE_BAR: f64 = 28.0;
+
+/// How much of the title bar, across, a display must show for it to be
+/// grabbable. Every park corner, past and present, shows 1pt and falls short.
+const MIN_GRAB: f64 = 40.0;
+
+/// Can the user not drag this window back? macOS only guarantees a window is
+/// not ENTIRELY off screen; a window whose title bar is off every display can
+/// be seen but not moved.
+fn out_of_reach(f: &Rect, g: &Geometry) -> bool {
+    let bar = Rect {
+        h: TITLE_BAR.min(f.h),
+        ..*f
+    };
+    !g.displays.iter().any(|d| {
+        let w = (d.x + d.w).min(bar.x + bar.w) - d.x.max(bar.x);
+        let h = (d.y + d.h).min(bar.y + bar.h) - d.y.max(bar.y);
+        w >= MIN_GRAB && h >= bar.h / 2.0
+    })
+}
+
 fn overlap(a: &Rect, b: &Rect) -> f64 {
     let w = (a.x + a.w).min(b.x + b.w) - a.x.max(b.x);
     let h = (a.y + a.h).min(b.y + b.h) - a.y.max(b.y);
@@ -1517,13 +1540,14 @@ impl EmulatedWorkspaces {
         let (pid, f) = (*pid, *f);
         let host = self.host_rect(window, g);
         let (kind, want) = match self.saved.get(&window).copied() {
-            // A promise that is itself a park artifact is not a promise. It is
-            // residue from before the corner was recognizable, persisted to
-            // disk, so it outlives the bug that wrote it. Honoring it re-parks
-            // the window the instant its workspace comes up — the window you
-            // cannot switch to. A promise has no request to anchor on (it may
+            // Never restore a window to where it cannot be dragged back, even
+            // a frame it truly held: something other than Ordo can shove a
+            // window off screen just before a park saves it, and honoring that
+            // strands it on every switch back. This also catches promises that
+            // are park artifacts, persisted to disk before the corner was
+            // recognizable. A promise has no request to anchor on (it may
             // predate this process), so this is the geometric test.
-            Some(s) if in_park_corner(&s, g) => (
+            Some(s) if out_of_reach(&s, g) => (
                 ParkTraceKind::PoisonedPromise,
                 rehome_into(&s, host.unwrap_or(g.main)),
             ),
@@ -3397,6 +3421,53 @@ mod tests {
             restored.x >= MAIN.x && restored.y >= MAIN.y && restored.x + restored.w <= MAIN.w,
             "and must land somewhere reachable: {restored:?}"
         );
+    }
+
+    /// A window can hold a frame the user cannot drag it back from — its
+    /// title bar off every display — if something other than Ordo put it
+    /// there just before a park saved it. Restoring that frame would strand
+    /// the window on every switch back, so it re-homes instead. A window
+    /// with its title bar on screen is restored exactly where it was, however
+    /// little of its body shows.
+    #[test]
+    fn a_promise_whose_title_bar_is_off_screen_re_homes() {
+        let at = |x: f64, y: f64| Rect {
+            x,
+            y,
+            w: 1470.0,
+            h: 923.0,
+        };
+        let strip_off_the_left = at(MAIN.x - 1470.0 + 12.0, MAIN.y - 41.0);
+        let bar_above_the_top = at(MAIN.x + 100.0, MAIN.y - 41.0);
+        let hung_off_the_bottom = at(MAIN.x + 100.0, MAIN.y + MAIN.h - 30.0);
+
+        for (saved, rehomes) in [
+            (strip_off_the_left, true),
+            (bar_above_the_top, true),
+            (hung_off_the_bottom, false),
+        ] {
+            let d = FakeDesktop::new(&[(w(1), Pid(10), rect(100.0, 100.0))]);
+            let mut b = EmulatedWorkspaces::new(3);
+            b.note_scan(&d, &d.scan(), &d.screens(), None);
+            b.move_window_to_workspace(&d, w(1), ws(2)).unwrap();
+            b.saved.insert(w(1), saved);
+            // A docked frame outranks the promise; only the promise is at issue.
+            b.home.remove(&w(1));
+
+            b.switch_workspace(&d, ws(2));
+            let restored = d.frame(w(1));
+            if rehomes {
+                assert!(
+                    restored.x >= MAIN.x && restored.y >= MAIN.y,
+                    "{saved:?} must re-home on screen, landed {restored:?}"
+                );
+            } else {
+                assert!(
+                    same_position(&restored, &saved),
+                    "{saved:?} must be honored, landed {restored:?}"
+                );
+            }
+        }
     }
 
     #[test]
