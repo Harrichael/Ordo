@@ -11,7 +11,7 @@ use ordo_core::{
     MonitorId, Pid, Rect, VirtualMonitorId, VirtualMonitorsWord, WindowId, WorkspaceId,
 };
 use ordo_emulated::{
-    Desktop, EmulatedWorkspaces, Move, ParkTrace, ParkTraceKind, Screens, Unhide,
+    Desktop, EmulatedWorkspaces, Move, ParkTrace, Screens, Unhide,
 };
 
 use crate::app_queue::AppQueues;
@@ -264,15 +264,7 @@ impl WorkspaceBackend for EmulatedBackend {
     }
 
     fn take_park_trace(&mut self) -> Vec<ParkTrace> {
-        let mut trace = self.model.take_trace();
-        trace.extend(
-            self.desktop
-                .queues
-                .take_chains()
-                .into_iter()
-                .map(|c| ParkTrace::app(c.pid, ParkTraceKind::AppChain).chain(c)),
-        );
-        trace
+        self.model.take_trace()
     }
 
     fn capabilities(&self) -> Capabilities {

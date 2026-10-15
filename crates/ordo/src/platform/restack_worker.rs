@@ -107,7 +107,8 @@ impl RestackHandle {
 /// Spawn the worker; the thread lives until the process exits (same lifetime
 /// contract as the tap thread). AX and CG calls are plain Mach IPC and safe
 /// off the main thread — the reassert builds its own elements per pass and
-/// holds nothing between passes.
+/// holds nothing between passes. Its focus reads go through AppKit's app
+/// list, so each job runs under its own pool (see [`super::drained`]).
 pub fn spawn(tx: Sender<Msg>, signals: Arc<RaiseSignals>, queues: AppQueues) -> RestackHandle {
     let shared = Arc::new(Shared {
         generation: AtomicU64::new(0),
@@ -139,76 +140,84 @@ pub fn spawn(tx: Sender<Msg>, signals: Arc<RaiseSignals>, queues: AppQueues) -> 
                     slot = shared.wake.wait(slot).unwrap();
                 }
             };
-            let cancel = || shared.generation.load(Ordering::SeqCst) != generation;
-            let focus = |w: WindowId| {
-                super::zorder::owner_of(w)
-                    .is_some_and(|pid| queues.focus_if_current(ordo_core::Pid(pid), w, focus_gen))
-            };
-            let waited = Instant::now();
-            landing.wait(waited + LANDING_WAIT, &cancel);
-            let landing_wait_ms = waited.elapsed().as_millis() as u64;
-            let mut stats = super::zorder::reassert_stack(
-                &order,
-                &attached,
-                focus_top,
-                &cancel,
-                Some(&signals),
-                &focus,
-            );
-            if let Some(s) = &mut stats {
-                s.landing_wait_ms = landing_wait_ms;
-            }
-            let issued = stats.as_ref().is_some_and(|s| !s.raises.is_empty());
-            let watch = stats
-                .as_ref()
-                .is_some_and(|s| s.converged && !s.aborted && (issued || owed));
-            owed = match &stats {
-                None => owed,
-                Some(s) if s.aborted => owed || issued,
-                Some(_) => false,
-            };
-            if let Some(stats) = stats {
-                if tx.send(Msg::RestackStats(stats)).is_err() {
-                    return; // engine gone; nothing left to report to
+            // False once the engine is gone: nothing left to report to.
+            let engine_alive = super::drained(|| {
+                let cancel = || shared.generation.load(Ordering::SeqCst) != generation;
+                let focus = |w: WindowId| {
+                    super::zorder::owner_of(w).is_some_and(|pid| {
+                        queues.focus_if_current(ordo_core::Pid(pid), w, focus_gen)
+                    })
+                };
+                let waited = Instant::now();
+                landing.wait(waited + LANDING_WAIT, &cancel);
+                let landing_wait_ms = waited.elapsed().as_millis() as u64;
+                let mut stats = super::zorder::reassert_stack(
+                    &order,
+                    &attached,
+                    focus_top,
+                    &cancel,
+                    Some(&signals),
+                    &focus,
+                );
+                if let Some(s) = &mut stats {
+                    s.landing_wait_ms = landing_wait_ms;
                 }
-            }
-            if !watch {
-                continue;
-            }
-            // Ghost watch: an 808/815 for an ORDERED window after convergence is
-            // a landing we stopped waiting for, touching down where the read-back
-            // can no longer see it. The cursor starts HERE — our own raises'
-            // events are behind it — and is refreshed past each rerun's own
-            // events, or the watch would feed on itself. Two reruns is the cap:
-            // more within one watch means something (a user, an app) is actively
-            // reordering, and the next real generation owns that fight.
-            let ordered = |w: u32| order.contains(&WindowId(w));
-            let deadline = Instant::now() + Duration::from_millis(GHOST_WATCH_MS);
-            let mut cursor = signals.cursor();
-            for _ in 0..2 {
-                match signals.wait(&mut cursor, &ordered, deadline, &cancel) {
-                    WaitOutcome::Hint => {
-                        // The rerun is the read-back: it exits converged with
-                        // zero raises when the order in fact still holds. It
-                        // never takes focus: a late landing doesn't move focus,
-                        // and a click in the watch window would be fought.
-                        if let Some(mut stats) = super::zorder::reassert_stack(
-                            &order,
-                            &attached,
-                            false,
-                            &cancel,
-                            Some(&signals),
-                            &focus,
-                        ) {
-                            stats.ghost_pass = true;
-                            if tx.send(Msg::RestackStats(stats)).is_err() {
-                                return;
-                            }
-                        }
-                        cursor = signals.cursor();
+                let issued = stats.as_ref().is_some_and(|s| !s.raises.is_empty());
+                let watch = stats
+                    .as_ref()
+                    .is_some_and(|s| s.converged && !s.aborted && (issued || owed));
+                owed = match &stats {
+                    None => owed,
+                    Some(s) if s.aborted => owed || issued,
+                    Some(_) => false,
+                };
+                if let Some(stats) = stats {
+                    if tx.send(Msg::RestackStats(stats)).is_err() {
+                        return false;
                     }
-                    WaitOutcome::Timeout | WaitOutcome::Cancelled => break,
                 }
+                if !watch {
+                    return true;
+                }
+                // Ghost watch: an 808/815 for an ORDERED window after convergence is
+                // a landing we stopped waiting for, touching down where the read-back
+                // can no longer see it. The cursor starts HERE — our own raises'
+                // events are behind it — and is refreshed past each rerun's own
+                // events, or the watch would feed on itself. Two reruns is the cap:
+                // more within one watch means something (a user, an app) is actively
+                // reordering, and the next real generation owns that fight.
+                let ordered = |w: u32| order.contains(&WindowId(w));
+                let deadline = Instant::now() + Duration::from_millis(GHOST_WATCH_MS);
+                let mut cursor = signals.cursor();
+                for _ in 0..2 {
+                    match signals.wait(&mut cursor, &ordered, deadline, &cancel) {
+                        WaitOutcome::Hint => {
+                            // The rerun is the read-back: it exits converged with
+                            // zero raises when the order in fact still holds. It
+                            // never takes focus: a late landing doesn't move focus,
+                            // and a click in the watch window would be fought.
+                            if let Some(mut stats) = super::zorder::reassert_stack(
+                                &order,
+                                &attached,
+                                false,
+                                &cancel,
+                                Some(&signals),
+                                &focus,
+                            ) {
+                                stats.ghost_pass = true;
+                                if tx.send(Msg::RestackStats(stats)).is_err() {
+                                    return false;
+                                }
+                            }
+                            cursor = signals.cursor();
+                        }
+                        WaitOutcome::Timeout | WaitOutcome::Cancelled => break,
+                    }
+                }
+                true
+            });
+            if !engine_alive {
+                return;
             }
         }
     });

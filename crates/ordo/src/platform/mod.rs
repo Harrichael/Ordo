@@ -88,6 +88,21 @@ pub fn ax_queues() -> AppQueues {
     AppQueues::new(|pid| Box::new(ax::AxApp::open(pid)))
 }
 
+/// Run `f` under its own autorelease pool.
+///
+/// Every long-running loop that calls AppKit off the main thread wraps each
+/// pass in this. Those threads pump no run loop, so nothing else ever drains
+/// what AppKit autoreleases on them: `runningApplications` alone autoreleases
+/// its array and every app's bundle id per call, plus a whole fresh set of
+/// NSRunningApplication objects each time the system's running-app list has
+/// changed since the last call. A pool nobody drains grows for the life of
+/// the process. One pool per pass; not per call site,
+/// which scatters and still misses callees, and not per thread, which never
+/// drains.
+pub fn drained<T>(f: impl FnOnce() -> T) -> T {
+    objc2::rc::autoreleasepool(|_| f())
+}
+
 /// Builds a full snapshot each call: displays + AX windows + backend workspace
 /// classification, joined into the core's vocabulary.
 pub struct MacWorldSource {
@@ -107,6 +122,8 @@ pub struct MacWorldSource {
     last_raw: HashMap<WindowId, Rect>,
     /// Drained by the engine after each `snapshot()`.
     trace: Vec<ParkTrace>,
+    /// The apps' write queues, read for the chains they have finished.
+    queues: AppQueues,
     stats: Option<SnapshotStats>,
     /// Each window's layer and parent, asked once, when it is first seen: they
     /// are fixed at creation, and the asking costs a few milliseconds a
@@ -168,6 +185,7 @@ impl MacWorldSource {
         settle: display_watch::DisplaySettle,
         unreachable: Unreachable,
         own_menu: status_item::OwnMenu,
+        queues: AppQueues,
     ) -> Self {
         MacWorldSource {
             backend,
@@ -176,6 +194,7 @@ impl MacWorldSource {
             unreachable,
             last_raw: HashMap::new(),
             trace: Vec::new(),
+            queues,
             stats: None,
             facts: HashMap::new(),
             last_windows: HashMap::new(),
@@ -416,6 +435,14 @@ impl WorldSource for MacWorldSource {
         // only, and paired with the belief it was replaced by.
         self.trace
             .extend(self.backend.borrow_mut().take_park_trace());
+        // The apps' finished write chains go with it, whichever backend
+        // queued them; nothing else ever takes them.
+        self.trace.extend(
+            self.queues
+                .take_chains()
+                .into_iter()
+                .map(|c| ParkTrace::app(c.pid, ParkTraceKind::AppChain).chain(c)),
+        );
         for (w, (_, raw)) in &frames {
             if self.last_raw.get(w).is_some_and(|p| p == raw) {
                 continue;

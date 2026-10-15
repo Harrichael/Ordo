@@ -22,7 +22,7 @@
 //! NSWorkspace launch notifications, but it needs no delegate and self-heals if
 //! an app wasn't AX-ready the instant it launched.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ptr::NonNull;
 
@@ -46,19 +46,21 @@ struct Ctx {
 pub fn spawn(tx: Sender<Msg>) {
     std::thread::spawn(move || {
         let ctx = Box::into_raw(Box::new(Ctx { tx }));
-        let mut attached: HashSet<i32> = HashSet::new();
-        // Keep observers alive for the thread's lifetime.
-        let mut observers: Vec<CFRetained<AXObserver>> = Vec::new();
+        // Every pid tried, with its observer while the app lives; None for an
+        // app that refused one.
+        let mut observers: HashMap<i32, Option<CFRetained<AXObserver>>> = HashMap::new();
 
         loop {
-            attach_new(&mut attached, &mut observers, ctx as *mut c_void);
-            // Pump this thread's run loop so callbacks fire, returning
-            // periodically to attach to freshly-launched apps.
-            CFRunLoop::run_in_mode(
-                unsafe { kCFRunLoopDefaultMode },
-                ATTACH_INTERVAL_SECS,
-                false,
-            );
+            super::drained(|| {
+                attach(&mut observers, ctx as *mut c_void);
+                // Pump this thread's run loop so callbacks fire, returning
+                // periodically to attach to freshly-launched apps.
+                CFRunLoop::run_in_mode(
+                    unsafe { kCFRunLoopDefaultMode },
+                    ATTACH_INTERVAL_SECS,
+                    false,
+                );
+            });
         }
     });
 }
@@ -98,26 +100,33 @@ pub fn spawn_space_watcher(tx: Sender<Msg>) {
     });
 }
 
-fn attach_new(
-    attached: &mut HashSet<i32>,
-    observers: &mut Vec<CFRetained<AXObserver>>,
-    ctx: *mut c_void,
-) {
-    let apps = NSWorkspace::sharedWorkspace().runningApplications();
-    for app in apps.iter() {
-        if !super::ax::managed(&app) {
+/// Attach to every managed app not yet tried, and let go of the apps that
+/// are gone: a quit app's observer is dead weight, and an app later given
+/// the same pid would be taken for it and never watched.
+fn attach(observers: &mut HashMap<i32, Option<CFRetained<AXObserver>>>, ctx: *mut c_void) {
+    let live: Vec<i32> = NSWorkspace::sharedWorkspace()
+        .runningApplications()
+        .iter()
+        .filter(|a| super::ax::managed(a))
+        .map(|a| a.processIdentifier())
+        .filter(|pid| *pid > 0)
+        .collect();
+    observers.retain(|pid, observer| {
+        if live.contains(pid) {
+            return true;
+        }
+        if let (Some(observer), Some(rl)) = (observer.as_ref(), CFRunLoop::current()) {
+            unsafe { rl.remove_source(Some(&observer.run_loop_source()), kCFRunLoopDefaultMode) };
+        }
+        false
+    });
+    for pid in live {
+        if observers.contains_key(&pid) {
             continue;
         }
-        let pid = app.processIdentifier();
-        if pid <= 0 || attached.contains(&pid) {
-            continue;
-        }
-        if let Some(observer) = attach_one(pid, ctx) {
-            observers.push(observer);
-        }
-        // Mark attached either way: a failed attach is usually an AX-less app,
-        // and retrying it every 3s forever is just noise.
-        attached.insert(pid);
+        // Kept either way: a failed attach is usually an AX-less app, and
+        // retrying it every 3s forever is just noise.
+        observers.insert(pid, attach_one(pid, ctx));
     }
 }
 

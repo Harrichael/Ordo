@@ -31,7 +31,14 @@ use ordo_core::{
 
 use crate::clock::Clock;
 use crate::logger::{HotkeyBatch, Logger};
+#[cfg(target_os = "macos")]
+use crate::platform::drained;
 use crate::ports::{Effector, LookGate, RestackStats, SnapshotStats, WorldSource};
+
+#[cfg(not(target_os = "macos"))]
+fn drained<T>(f: impl FnOnce() -> T) -> T {
+    f()
+}
 
 /// The longest a look is held back while the apps are busy. Bounds how stale
 /// the core's picture of frames and focus can get during a burst, and keeps
@@ -368,103 +375,113 @@ impl Engine {
     /// not: the batch's rescans become one look ahead of its hotkeys (see
     /// [`collapse_rescans`]).
     pub fn run(mut self, rx: Receiver<Msg>) {
-        self.observe(RescanTrigger::Startup);
-        self.publish();
-        'recv: while let Ok(msg) = rx.recv() {
+        drained(|| {
+            self.observe(RescanTrigger::Startup);
+            self.publish();
+        });
+        while let Ok(msg) = rx.recv() {
             let mut batch = vec![msg];
             while let Ok(m) = rx.try_recv() {
                 batch.push(m);
             }
-            let batch = collapse_rescans(batch);
-            let mut hotkeys: Vec<(HotkeyAction, Instant)> = Vec::new();
-            for m in batch {
-                match m {
-                    Msg::Hotkey(action, pressed) => hotkeys.push((action, pressed)),
-                    // Deliberately NOT a coalescing fence: worker stats land
-                    // mid-burst by construction (each burst switch aborts its
-                    // predecessor's reassert, which reports back during the
-                    // very key repeats being folded), and letting telemetry
-                    // split a run would re-execute the stale intermediate
-                    // switch the folding exists to skip.
-                    Msg::RestackStats(stats) => {
-                        let _ = self
-                            .logger
-                            .log_restack_stats(&stats, self.clock.now().wall_ms);
+            if !drained(|| self.handle_batch(batch)) {
+                break;
+            }
+        }
+        let _ = self.logger.close(self.clock.now().wall_ms);
+    }
+
+    /// One pass of the loop; false once a shutdown was asked for.
+    fn handle_batch(&mut self, batch: Vec<Msg>) -> bool {
+        let batch = collapse_rescans(batch);
+        let mut hotkeys: Vec<(HotkeyAction, Instant)> = Vec::new();
+        for m in batch {
+            match m {
+                Msg::Hotkey(action, pressed) => hotkeys.push((action, pressed)),
+                // Deliberately NOT a coalescing fence: worker stats land
+                // mid-burst by construction (each burst switch aborts its
+                // predecessor's reassert, which reports back during the
+                // very key repeats being folded), and letting telemetry
+                // split a run would re-execute the stale intermediate
+                // switch the folding exists to skip.
+                Msg::RestackStats(stats) => {
+                    let _ = self
+                        .logger
+                        .log_restack_stats(&stats, self.clock.now().wall_ms);
+                }
+                Msg::Folded(triggers) => {
+                    let wall_ms = self.clock.now().wall_ms;
+                    for t in &triggers {
+                        let _ = self.logger.log_dropped_look("folded", t, wall_ms);
                     }
-                    Msg::Folded(triggers) => {
-                        let wall_ms = self.clock.now().wall_ms;
-                        for t in &triggers {
-                            let _ = self.logger.log_dropped_look("folded", t, wall_ms);
-                        }
-                    }
-                    // Not a fence either: a switch's own un-hides report
-                    // mid-burst. Recording it is instant.
-                    Msg::AppVisibility(pid, hidden) => {
-                        self.effector.note_app_visibility(pid, hidden);
-                    }
-                    Msg::Hiding(hiding) => self.effector.set_hiding(hiding),
-                    // Nor a key press, which may overtake presses queued in
-                    // the same batch: a command after it only clears what it
-                    // would have explained. Its look is held like any other,
-                    // since it licenses no follow, and the hold ends well
-                    // within the time it explains a focus change for.
-                    Msg::Gesture(Gesture::Key) => self.pump(Event::Gesture {
-                        at: self.clock.now(),
-                        gesture: Gesture::Key,
-                    }),
-                    other => {
-                        self.flush_hotkeys(&mut hotkeys);
-                        match other {
-                            Msg::Rescan(trigger) => self.look(trigger),
-                            Msg::Gesture(gesture) => {
-                                self.gesture_unseen = true;
-                                self.pump(Event::Gesture {
-                                    at: self.clock.now(),
-                                    gesture,
-                                })
-                            }
-                            Msg::Rescue => self.pump(Event::RescueEngaged {
+                }
+                // Not a fence either: a switch's own un-hides report
+                // mid-burst. Recording it is instant.
+                Msg::AppVisibility(pid, hidden) => {
+                    self.effector.note_app_visibility(pid, hidden);
+                }
+                Msg::Hiding(hiding) => self.effector.set_hiding(hiding),
+                // Nor a key press, which may overtake presses queued in
+                // the same batch: a command after it only clears what it
+                // would have explained. Its look is held like any other,
+                // since it licenses no follow, and the hold ends well
+                // within the time it explains a focus change for.
+                Msg::Gesture(Gesture::Key) => self.pump(Event::Gesture {
+                    at: self.clock.now(),
+                    gesture: Gesture::Key,
+                }),
+                other => {
+                    self.flush_hotkeys(&mut hotkeys);
+                    match other {
+                        Msg::Rescan(trigger) => self.look(trigger),
+                        Msg::Gesture(gesture) => {
+                            self.gesture_unseen = true;
+                            self.pump(Event::Gesture {
                                 at: self.clock.now(),
-                            }),
-                            // For both engage flavors the backend is set up
-                            // FIRST, so the post-engage rescan reports the
-                            // model the user chose (file-loaded or blank) and
-                            // the core re-learns the world from it.
-                            Msg::Engage => {
-                                self.effector.bring_up_workspaces(true);
-                                self.pump(Event::Engaged {
-                                    at: self.clock.now(),
-                                });
-                                self.observe(RescanTrigger::BackendHint {
-                                    kind: "engage".into(),
-                                });
-                            }
-                            Msg::EngageFresh => {
-                                self.effector.bring_up_workspaces(false);
-                                self.pump(Event::Engaged {
-                                    at: self.clock.now(),
-                                });
-                                self.observe(RescanTrigger::BackendHint {
-                                    kind: "engage_fresh".into(),
-                                });
-                            }
-                            Msg::SaveState => self.effector.persist_workspaces(),
-                            Msg::Shutdown => break 'recv,
-                            Msg::Hotkey(..)
-                            | Msg::RestackStats(_)
-                            | Msg::Folded(_)
-                            | Msg::AppVisibility(..)
-                            | Msg::Hiding(_) => {
-                                unreachable!("handled above")
-                            }
+                                gesture,
+                            })
+                        }
+                        Msg::Rescue => self.pump(Event::RescueEngaged {
+                            at: self.clock.now(),
+                        }),
+                        // For both engage flavors the backend is set up
+                        // FIRST, so the post-engage rescan reports the
+                        // model the user chose (file-loaded or blank) and
+                        // the core re-learns the world from it.
+                        Msg::Engage => {
+                            self.effector.bring_up_workspaces(true);
+                            self.pump(Event::Engaged {
+                                at: self.clock.now(),
+                            });
+                            self.observe(RescanTrigger::BackendHint {
+                                kind: "engage".into(),
+                            });
+                        }
+                        Msg::EngageFresh => {
+                            self.effector.bring_up_workspaces(false);
+                            self.pump(Event::Engaged {
+                                at: self.clock.now(),
+                            });
+                            self.observe(RescanTrigger::BackendHint {
+                                kind: "engage_fresh".into(),
+                            });
+                        }
+                        Msg::SaveState => self.effector.persist_workspaces(),
+                        Msg::Shutdown => return false,
+                        Msg::Hotkey(..)
+                        | Msg::RestackStats(_)
+                        | Msg::Folded(_)
+                        | Msg::AppVisibility(..)
+                        | Msg::Hiding(_) => {
+                            unreachable!("handled above")
                         }
                     }
                 }
             }
-            self.flush_hotkeys(&mut hotkeys);
-            self.publish();
         }
-        let _ = self.logger.close(self.clock.now().wall_ms);
+        self.flush_hotkeys(&mut hotkeys);
+        self.publish();
+        true
     }
 
     fn flush_hotkeys(&mut self, hotkeys: &mut Vec<(HotkeyAction, Instant)>) {
