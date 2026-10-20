@@ -67,12 +67,12 @@ Some apps move their parked windows to the display's left edge (x=0, keeping y) 
 ## 3. Notifications and app-initiated windows need a window role
 
 **Evidence** (window subroles across the whole log):
-- **Outlook's reminder** reports `AXStandardWindow` (400×127). It was adopted as a normal window: run 22, workspace 1, monitor 2. It would be parked when the user switches away.
+- **Outlook's reminder** reports `AXStandardWindow` (400×127), top-level at layer 3 (runs 59–70). As a regular app's floating window it follows the user from workspace to workspace (`State::floats`); a background app's, like the screenshot window, parks with its workspace.
 - **Subroles flip on real windows.** Main windows (Outlook Inbox, OneNote, Teams, Terminal) sometimes report `AXDialog`.
 - **Popups are clean.** Chrome and OneNote popups report `AXUnknown` or no subrole (about 150×22). They are currently managed as windows.
 - **Chrome's find bar,** window 44863, lived 226 snapshots inside its Chrome window and holds its own ledger claim.
 
-**Deployed (9585ccd):** snapshots record each window's `layer` and `parent`, from the window server, asked once per window. Run 38 saw 14 attached Chrome windows (address-bar suggestions, link-hover bubbles). Still to collect: Chrome Cmd+F, an Outlook reminder, dialogs, call popups.
+**Deployed (9585ccd):** snapshots record each window's `layer` and `parent`, from the window server, asked once per window. Run 38 saw 14 attached Chrome windows (address-bar suggestions, link-hover bubbles). Still to collect: Chrome Cmd+F, dialogs, call popups.
 
 **Proposed shape:**
 1. **Attached popups** (have a parent): follow the parent, no workspace of their own. Done for stacking and the MRU order (3e5d609: the history holds root windows, and a restack carries each root's attached windows as part of its footprint). Parking and workspace placement still treat them as windows of their own.

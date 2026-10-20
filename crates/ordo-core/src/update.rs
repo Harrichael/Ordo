@@ -218,8 +218,7 @@ pub fn update(state: &State, event: &Event) -> Step {
 /// on screen now. `desired_stack` reads declarations.
 fn mru_stack(s: &State, ws: WorkspaceId) -> Vec<WindowId> {
     let proj = s.projection();
-    s.focus_history
-        .iter()
+    s.focus_order()
         .filter(|w| {
             s.windows
                 .get(w)
@@ -403,6 +402,10 @@ fn is_focus_grant(e: &Expectation) -> bool {
 /// Switch every monitor to `target`. The single emitter, because a switch is
 /// also Ordo's word on where the user is going: it replaces the workspace
 /// intent, and the switch it overtakes can never be confirmed now.
+///
+/// Floating windows go along: each is declared onto the destination first,
+/// as a carry declares its window, so the switch finds it already a resident
+/// there and neither parks nor restores it.
 fn push_switch(
     s: &mut State,
     target: WorkspaceId,
@@ -410,6 +413,21 @@ fn push_switch(
     fx: &mut Vec<Effect>,
     notes: &mut Vec<Note>,
 ) -> OpId {
+    let floating: Vec<WindowId> = s
+        .windows
+        .keys()
+        .copied()
+        .filter(|w| follows(s, *w) && s.declared_workspace_of(*w) != Some(target))
+        .collect();
+    for window in floating {
+        let op = s.mint_op();
+        fx.push(Effect::AssignWindowToWorkspace { op, window, target });
+        let on = Expectation::WindowOn {
+            window,
+            workspace: target,
+        };
+        expect(s, op, on, now_ns, notes);
+    }
     let op = s.mint_op();
     fx.push(Effect::SwitchWorkspace { op, target });
     supersede(
@@ -816,8 +834,7 @@ fn resolve(s: &State, action: HotkeyAction) -> Option<Command> {
                 return None;
             }
             let candidates: Vec<WindowId> = s
-                .focus_history
-                .iter()
+                .focus_order()
                 .filter(|w| Some(*w) != focused)
                 .filter(|w| {
                     let Some(r) = s.windows.get(w) else {
@@ -863,8 +880,8 @@ fn resolve(s: &State, action: HotkeyAction) -> Option<Command> {
             let from = s.declared_focus()?;
             // Demoting is only meaningful if focus can actually go somewhere
             // else; with nowhere to go, do nothing.
-            let to = s.focus_history.most_recent(Some(from), |w| {
-                s.windows.get(&w).is_some_and(|r| r.workspace == workspace)
+            let to = s.focus_order().find(|w| {
+                *w != from && s.windows.get(w).is_some_and(|r| r.workspace == workspace)
             })?;
             Some(Command::Demote { from, to })
         }
@@ -1101,7 +1118,7 @@ fn execute(
             // an empty monitor is still a place to be.
             let ws = s.current_workspace().expect("resolved against a workspace");
             let proj = s.projection_with(Some(target), None);
-            let head = s.focus_history.iter().find(|w| {
+            let head = s.focus_order().find(|w| {
                 s.windows
                     .get(w)
                     .is_some_and(|r| r.workspace == ws && r.vmonitor == target)
@@ -1598,6 +1615,8 @@ fn handle_snapshot(
         }
     }
 
+    bring_floating_along(s, now_ns, notes, &mut last_op, fx);
+
     project_windows(
         s,
         &deltas,
@@ -1980,6 +1999,60 @@ fn settled_moves(s: &mut State, deltas: &[Delta], entry_expectations: &[Expectat
         return false;
     }
     true
+}
+
+/// A floating window that Ordo still moves with the user: once its moves have
+/// failed `DAMPING_LIMIT` times (a native Space move refused), it stays where
+/// it is, rather than costing every switch a blocking move that cannot land.
+fn follows(s: &State, w: WindowId) -> bool {
+    s.floats(w) && s.windows.get(&w).is_some_and(|r| r.ws_corrections < DAMPING_LIMIT)
+}
+
+/// A floating window declared off the workspace the user is on is moved to
+/// it. Switches take floating windows along (`push_switch`); this is for one
+/// filed elsewhere before Ordo saw it float, such as by a state file from an
+/// earlier run. Damped like any placement: it stands down after
+/// `DAMPING_LIMIT` tries.
+fn bring_floating_along(
+    s: &mut State,
+    now_ns: u64,
+    notes: &mut Vec<Note>,
+    last_op: &mut Option<OpId>,
+    fx: &mut Vec<Effect>,
+) {
+    let Some(here) = s.declared_workspace() else {
+        return;
+    };
+    let strays: Vec<WindowId> = s
+        .windows
+        .keys()
+        .copied()
+        .filter(|w| follows(s, *w) && s.declared_workspace_of(*w) != Some(here))
+        .collect();
+    for window in strays {
+        correct_window(
+            s,
+            window,
+            CorrectionAxis::Workspace,
+            now_ns,
+            notes,
+            last_op,
+            fx,
+            |op| {
+                (
+                    Effect::MoveWindowToWorkspace {
+                        op,
+                        window,
+                        target: here,
+                    },
+                    Expectation::WindowOn {
+                        window,
+                        workspace: here,
+                    },
+                )
+            },
+        );
+    }
 }
 
 /// How long a window must stand on another display before its monitor

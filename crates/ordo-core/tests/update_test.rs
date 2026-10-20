@@ -142,6 +142,7 @@ fn win(id: u32, pid: i32, workspace: u8, frame: Rect) -> Win {
             subrole: None,
             layer: None,
             parent: None,
+            background_app: false,
         },
         workspace: ws(workspace),
         monitor: None,
@@ -2647,10 +2648,9 @@ fn quitting_the_focused_app_from_the_dock_hands_focus_on_within_its_monitor() {
 
 #[test]
 fn a_window_floating_above_the_ordinary_layer_is_never_restacked() {
-    // The screenshot tool's window (w4) floats at layer 3, above every
-    // ordinary window whatever is raised; the restack worker reads only layer
-    // 0 and would wait for it on every restack. It belongs to workspace 1 all
-    // the same.
+    // A floating window (w4, layer 3) is above every ordinary window
+    // whatever is raised; the restack worker reads only layer
+    // 0 and would wait for it on every restack.
     let mut floating = win(4, 400, 1, rect(300.0, 600.0));
     floating.snap.layer = Some(3);
     let wins = vec![
@@ -2667,7 +2667,6 @@ fn a_window_floating_above_the_ordinary_layer_is_never_restacked() {
     let orders: Vec<_> = restacks(&away.effects).into_iter().chain(restacks(&back.effects)).collect();
     assert!(!orders.is_empty());
     assert!(orders.iter().all(|(order, _)| !order.contains(&wid(4))), "{orders:?}");
-    assert_eq!(back.state.windows[&wid(4)].workspace, WorkspaceId(1));
 }
 
 /// kitty (app 100) is key in w1; its w2 is parked on workspace 2. The user
@@ -4221,6 +4220,234 @@ fn damping_budgets_are_independent_per_axis() {
     assert_eq!(ws_moves, 3, "workspace axis: initial + 2 retries");
     assert_eq!(frame_sets, 3, "frame axis: initial + 2 retries");
     assert!(diverged);
+}
+
+// --- floating windows ---------------------------------------------------------
+
+/// Outlook's reminder (w9): an ordinary app window that floats at window-server
+/// layer 3, at the bottom right of monitor A.
+fn reminder(workspace: u8) -> Win {
+    let mut w = win(9, 900, workspace, rect(1500.0, 850.0));
+    w.snap.layer = Some(3);
+    w
+}
+
+/// The windows a step declared onto a workspace ahead of its switch. The
+/// order is the proof: declared before the switch, a window is already a
+/// resident of the destination when the switch lands, so the backend neither
+/// parks nor restores it.
+fn taken_along(effects: &[Effect]) -> Vec<(WindowId, WorkspaceId)> {
+    let switch = effects
+        .iter()
+        .position(|e| matches!(e, Effect::SwitchWorkspace { .. }))
+        .expect("a switch was issued");
+    effects[..switch]
+        .iter()
+        .filter_map(|e| match e {
+            Effect::AssignWindowToWorkspace { window, target, .. } => Some((*window, *target)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn moves(effects: &[Effect]) -> Vec<(WindowId, WorkspaceId)> {
+    effects
+        .iter()
+        .filter_map(|e| match e {
+            Effect::MoveWindowToWorkspace { window, target, .. } => Some((*window, *target)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_floating_window_stays_on_screen_across_workspace_switches() {
+    // The user works in w1 on workspace 1; w2 waits on workspace 2. Each
+    // switch declares the reminder onto the destination before the switch
+    // goes out, as a carry does, so the switch never parks it. The ordinary
+    // w1 stays filed on workspace 1, hidden while the user is away.
+    let mons = |n: u8| vec![mon_a(n), mon_b(n)];
+    let world = |reminder_on: u8| {
+        vec![
+            win(1, 100, 1, rect(100.0, 100.0)),
+            win(2, 200, 2, rect(2000.0, 100.0)),
+            reminder(reminder_on),
+        ]
+    };
+    let s = update(&State::new(), &observed(mons(1), world(1), Some(1), RescanTrigger::Startup)).state;
+
+    let away = update(&s, &hotkey(HotkeyAction::WorkspaceSwitchTo(ws(2))));
+    assert_eq!(taken_along(&away.effects), vec![(wid(9), ws(2))]);
+    let there = update(
+        &away.state,
+        &observed(mons(2), world(2), Some(2), RescanTrigger::PostEffect { op: switch_op(&away.effects) }),
+    );
+    let s = &there.state;
+    assert!(s.is_visible(&s.windows[&wid(9)]));
+    assert!(!s.is_visible(&s.windows[&wid(1)]));
+    assert!(moves(&there.effects).is_empty(), "{:?}", there.effects);
+
+    let back = update(s, &hotkey(HotkeyAction::WorkspaceSwitchTo(ws(1))));
+    assert_eq!(taken_along(&back.effects), vec![(wid(9), ws(1))]);
+    let home = update(
+        &back.state,
+        &observed(mons(1), world(1), Some(1), RescanTrigger::PostEffect { op: switch_op(&back.effects) }),
+    );
+    let s = &home.state;
+    assert!(s.is_visible(&s.windows[&wid(9)]));
+    assert!(s.is_visible(&s.windows[&wid(1)]));
+    assert!(moves(&home.effects).is_empty(), "{:?}", home.effects);
+}
+
+#[test]
+fn a_floating_window_filed_on_another_workspace_is_brought_to_the_users() {
+    // The reminder was filed on workspace 3 before Ordo knew it floats (it
+    // was born there, or a state file says so), and sits parked while the
+    // user works on workspace 1. The first look moves it here.
+    let mons = || vec![mon_a(1), mon_b(1)];
+    let world = |reminder_on: u8| vec![win(1, 100, 1, rect(100.0, 100.0)), reminder(reminder_on)];
+    let first = update(&State::new(), &observed(mons(), world(3), Some(1), RescanTrigger::Startup));
+    assert_eq!(moves(&first.effects), vec![(wid(9), ws(1))]);
+
+    let landed = update(&first.state, &observed(mons(), world(1), Some(1), RescanTrigger::Periodic));
+    assert!(landed.state.is_visible(&landed.state.windows[&wid(9)]));
+    assert!(moves(&landed.effects).is_empty());
+}
+
+#[test]
+fn a_floating_window_that_cannot_be_moved_is_left_where_it_is() {
+    // Under the native backend a Space move can be refused. Each refused move
+    // of the reminder spends the damping budget; once it is spent the
+    // reminder stays filed where it is, and switches stop paying a blocking
+    // move for it.
+    let mons = || vec![mon_a(1), mon_b(1)];
+    let world = || vec![win(1, 100, 1, rect(100.0, 100.0)), win(2, 200, 2, rect(2000.0, 100.0)), reminder(3)];
+    let mut step = update(&State::new(), &observed(mons(), world(), Some(1), RescanTrigger::Startup));
+    let mut tries = 0;
+    for _ in 0..10 {
+        let mut s = step.state;
+        for e in &step.effects {
+            if let Effect::MoveWindowToWorkspace { op, .. } = e {
+                tries += 1;
+                let refused = OpOutcome::Failed {
+                    detail: "window did not move".into(),
+                };
+                s = update(&s, &Event::EffectResult { at: ts(), op: *op, outcome: refused }).state;
+            }
+        }
+        step = update(&s, &observed(mons(), world(), Some(1), RescanTrigger::Periodic));
+    }
+    assert_eq!(tries, 3);
+    let away = update(&step.state, &hotkey(HotkeyAction::WorkspaceSwitchTo(ws(2))));
+    assert!(taken_along(&away.effects).is_empty(), "{:?}", away.effects);
+}
+
+#[test]
+fn a_floating_popup_stays_with_its_window_and_a_floating_windows_child_goes_with_it() {
+    // w5 is a suggestion popup floating over the editor w1: it belongs with
+    // w1 and stays on workspace 1. w10 is an ordinary sheet attached to the
+    // reminder: it goes where the reminder goes.
+    let mut popup = win(5, 100, 1, rect(150.0, 150.0));
+    popup.snap.layer = Some(3);
+    popup.snap.parent = Some(wid(1));
+    let mut sheet = win(10, 900, 1, rect(1520.0, 870.0));
+    sheet.snap.parent = Some(wid(9));
+    let wins = vec![
+        win(1, 100, 1, rect(100.0, 100.0)),
+        win(2, 200, 2, rect(2000.0, 100.0)),
+        reminder(1),
+        popup,
+        sheet,
+    ];
+    let s = update(
+        &State::new(),
+        &observed(vec![mon_a(1), mon_b(1)], wins, Some(1), RescanTrigger::Startup),
+    )
+    .state;
+    let away = update(&s, &hotkey(HotkeyAction::WorkspaceSwitchTo(ws(2))));
+    assert_eq!(taken_along(&away.effects), vec![(wid(9), ws(2)), (wid(10), ws(2))]);
+}
+
+#[test]
+fn a_background_apps_floating_window_keeps_its_workspace() {
+    // The screenshot tool's window (w4) floats at layer 3 too, but its app
+    // has no Dock icon, and the user works in it like an app window: it stays
+    // filed on its workspace and parks when the user leaves, even one filed
+    // away from where the user is.
+    let mut shot = win(4, 400, 1, rect(300.0, 600.0));
+    shot.snap.layer = Some(3);
+    shot.snap.background_app = true;
+    let mut filed_away = shot.clone();
+    filed_away.workspace = ws(3);
+    let world = |shot: Win| vec![win(1, 100, 1, rect(100.0, 100.0)), win(2, 200, 2, rect(2000.0, 100.0)), shot];
+    let s = update(
+        &State::new(),
+        &observed(vec![mon_a(1), mon_b(1)], world(shot), Some(1), RescanTrigger::Startup),
+    )
+    .state;
+    let away = update(&s, &hotkey(HotkeyAction::WorkspaceSwitchTo(ws(2))));
+    assert!(taken_along(&away.effects).is_empty(), "{:?}", away.effects);
+
+    let elsewhere = update(
+        &State::new(),
+        &observed(vec![mon_a(1), mon_b(1)], world(filed_away), Some(1), RescanTrigger::Startup),
+    );
+    assert!(moves(&elsewhere.effects).is_empty(), "{:?}", elsewhere.effects);
+    assert!(!elsewhere.state.is_visible(&elsewhere.state.windows[&wid(4)]));
+}
+
+#[test]
+fn the_alt_walk_never_lands_on_a_window_that_follows_the_user() {
+    // The user used w3, then the reminder (w9), then w1. Alt+Tab goes back
+    // to w3: the reminder rides above every workspace, and offered once used
+    // it would head the walk on all of them. Alt+End passes it by the same
+    // way. A click still focuses it, as the history above shows.
+    let wins = || {
+        vec![
+            win(1, 100, 1, rect(100.0, 100.0)),
+            win(3, 100, 1, rect(600.0, 100.0)),
+            reminder(1),
+        ]
+    };
+    let mons = || vec![mon_a(1), mon_b(1)];
+    let s = update(&State::new(), &observed(mons(), wins(), None, RescanTrigger::Startup)).state;
+    let s = used(&s, 3, mons(), wins());
+    let s = used(&s, 9, mons(), wins());
+    let s = used(&s, 1, mons(), wins());
+
+    let walked = update(&s, &hotkey(HotkeyAction::MruWorkspace));
+    assert_eq!(focus_targets(&walked.effects), vec![wid(3)]);
+    assert_eq!(walked.state.walk.as_ref().map(|k| k.ring.clone()), Some(vec![wid(1), wid(3)]));
+
+    let demoted = update(&s, &hotkey(HotkeyAction::MruDemote));
+    assert_eq!(focus_targets(&demoted.effects), vec![wid(3)]);
+}
+
+#[test]
+fn closing_a_window_never_hands_focus_to_one_that_follows_the_user() {
+    // The user used w3, then the reminder (w9), then w1, all on workspace 1.
+    // w1 closes and Outlook keys its reminder. Focus goes to w3, the
+    // workspace's own next window: in the reminder, the user's next Enter
+    // would dismiss it.
+    let wins = || {
+        vec![
+            win(1, 100, 1, rect(100.0, 100.0)),
+            win(3, 300, 1, rect(600.0, 100.0)),
+            reminder(1),
+        ]
+    };
+    let mons = || vec![mon_a(1), mon_b(1)];
+    let s = update(&State::new(), &observed(mons(), wins(), None, RescanTrigger::Startup)).state;
+    let s = used(&s, 3, mons(), wins());
+    let s = used(&s, 9, mons(), wins());
+    let s = used(&s, 1, mons(), wins());
+
+    let closed = update(&s, &observed(mons(), without(&wins(), &[1]), Some(9), RescanTrigger::Periodic));
+    assert_eq!(focus_targets(&closed.effects), vec![wid(3)]);
+    assert!(closed.notes.contains(&Note::FocusHandedOn {
+        closed: wid(1),
+        to: Some(wid(3)),
+    }));
 }
 
 // --- replay & determinism -----------------------------------------------------

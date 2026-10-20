@@ -67,6 +67,9 @@ pub struct WindowRecord {
     /// windows on one layer overlap each other in the stack.
     #[serde(default)]
     pub layer: i32,
+    /// OBSERVED: see `WindowSnap::background_app`.
+    #[serde(default)]
+    pub background_app: bool,
     /// The last look didn't read this window (its app didn't answer, or
     /// dropped it from its list) while the window server still has it: the
     /// record is as last seen.
@@ -413,6 +416,27 @@ impl State {
         root
     }
 
+    /// Whether `w` floats above the ordinary layer (a reminder, an
+    /// always-on-top panel), and so follows the user from workspace to
+    /// workspace. Read off its root: a popup floating over an ordinary window
+    /// belongs with that window, and an ordinary child of a floating window
+    /// goes where it goes. A background app's window keeps its workspace:
+    /// the user works in it like an app window (the screenshot tool's).
+    pub fn floats(&self, w: WindowId) -> bool {
+        self.windows
+            .get(&self.root_of(w))
+            .is_some_and(|r| r.layer > 0 && !r.background_app)
+    }
+
+    /// The focus history as Ordo hands focus on from it, most recent first.
+    /// A window that follows the user is left out: it rides above every
+    /// workspace, so once used it would be every workspace's next focus, and
+    /// keys meant for the window under it would land in it (Enter dismisses a
+    /// reminder). A click still focuses it.
+    pub fn focus_order(&self) -> impl Iterator<Item = WindowId> + '_ {
+        self.focus_history.iter().filter(|w| !self.floats(*w))
+    }
+
     /// The declared window while it is actually in the model. A declaration
     /// about a window that is absent (closed, or dropped by one flaky scan)
     /// is vacuous rather than wrong: nothing to enforce, nothing for commands
@@ -648,7 +672,7 @@ impl State {
         let on_here = |w: &WindowId| self.declared_workspace_of(*w) == Some(here);
         self.focus_target()
             .filter(on_here)
-            .or_else(|| self.focus_history.iter().find(on_here))
+            .or_else(|| self.focus_order().find(on_here))
             .and_then(|w| self.declared_vmonitor_of(w))
     }
 

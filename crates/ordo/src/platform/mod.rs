@@ -485,6 +485,7 @@ impl WorldSource for MacWorldSource {
                 subrole: w.subrole.clone(),
                 layer: facts.get(&w.id).and_then(|f| f.layer),
                 parent: facts.get(&w.id).and_then(|f| f.parent),
+                background_app: !w.regular,
             })
             .collect();
 

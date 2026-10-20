@@ -269,6 +269,7 @@ pub(crate) fn apply_snapshot(s: &mut State, snap: &WorldSnapshot) {
                 frame: w.frame,
                 parent: w.parent,
                 layer: w.layer.unwrap_or(0),
+                background_app: w.background_app,
                 unread: false,
                 ws_corrections,
                 frame_corrections,

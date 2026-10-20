@@ -25,7 +25,7 @@ const CAP: usize = 512;
 /// app — would need lockstep edits on every window move, destroy, and monitor
 /// hot-plug, exactly the class of bookkeeping bug this project exists to
 /// avoid. Instead there is one mutation site (`touch`) and scoping happens at
-/// read time: `most_recent` filters by a predicate over the caller's current
+/// read time: readers filter `iter()` by a predicate over the caller's current
 /// window records. Move-to-front dedupe gives the classic alt-tab toggle
 /// between the top two windows of any scope for free.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -66,20 +66,6 @@ impl FocusHistory {
 
     pub fn remove(&mut self, w: WindowId) {
         self.order.retain(|x| *x != w);
-    }
-
-    /// Most recent window matching `pred`, skipping `skip` (the currently
-    /// focused window — "switch to MRU" never means "stay put").
-    pub fn most_recent(
-        &self,
-        skip: Option<WindowId>,
-        mut pred: impl FnMut(WindowId) -> bool,
-    ) -> Option<WindowId> {
-        self.order
-            .iter()
-            .copied()
-            .filter(|w| Some(*w) != skip)
-            .find(|w| pred(*w))
     }
 
     pub fn iter(&self) -> impl Iterator<Item = WindowId> + '_ {

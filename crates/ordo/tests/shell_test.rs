@@ -327,6 +327,7 @@ fn win(id: u32, pid: i32, x: f64) -> WindowSnap {
         subrole: None,
         layer: None,
         parent: None,
+        background_app: false,
     }
 }
 

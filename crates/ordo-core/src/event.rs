@@ -361,6 +361,11 @@ pub struct WindowSnap {
     pub layer: Option<i32>,
     #[serde(default)]
     pub parent: Option<WindowId>,
+    /// Its app has no Dock icon (activation policy not Regular). Ordo admits
+    /// such an app's windows only when it names the app. Defaulted so older
+    /// logs still replay.
+    #[serde(default)]
+    pub background_app: bool,
 }
 
 /// The workspace layer, as the backend tells it. Absence means UNKNOWN, never
