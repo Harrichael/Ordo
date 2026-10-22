@@ -953,9 +953,10 @@ fn each_snapshot_logs_what_it_cost_against_its_own_event() {
 #[test]
 fn a_view_change_on_one_display_runs_end_to_end_and_replays_clean() {
     // The laptop rig, through the real engine, logger and replay: the
-    // external display is gone, so w2 and w4 (monitor 2) are hidden. Cmd+Alt+K
-    // views monitor 2 — focus goes to its MRU window, the backend's word
-    // confirms the anchor — and the logged run replays without divergence.
+    // external display is gone, so w2 and w4 (monitor 2) are hidden.
+    // Cmd+Alt+Right views monitor 2 — focus goes to its MRU window, the
+    // backend's word confirms the anchor — and the logged run replays
+    // without divergence.
     let dir = std::env::temp_dir().join(format!("ordo-view-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let db = dir.join("view.db");
@@ -1126,7 +1127,7 @@ fn the_menu_bar_shows_every_workspace_and_follows_a_pick_from_its_menu() {
 #[test]
 fn the_menu_bar_shows_which_monitor_the_one_display_is_showing() {
     // The laptop rig: one display, two virtual monitors. Monitor 2 is hidden
-    // with its one window on this workspace; Cmd+Alt+K brings it up and
+    // with its one window on this workspace; Cmd+Alt+Right brings it up and
     // monitor 1's two windows go out of sight in its place.
     let os = fake_os(FocusPolicy::Lands);
     {

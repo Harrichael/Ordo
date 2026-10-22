@@ -35,7 +35,7 @@ pub struct MonitorsView {
     pub displays: Vec<MonitorId>,
     /// One per virtual monitor, in order.
     pub monitors: Vec<MonitorEntry>,
-    /// The anchor Cmd+Alt+J/K step from; always on screen.
+    /// The anchor Cmd+Alt+Left/Right step from; always on screen.
     pub viewed: VirtualMonitorId,
     pub enabled: bool,
 }

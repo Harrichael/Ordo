@@ -81,7 +81,7 @@ The two rules that make it work:
 - **Virtual monitors** (emulated backend): every window is declared onto a
   virtual monitor — a position, left to right, not a piece of hardware. With a
   display per monitor they map one to one. With fewer displays (the laptop
-  unplugged), `Cmd+Alt+J/K` view the previous/next monitor (no wrap; global,
+  unplugged), `Cmd+Alt+Left/Right` view the previous/next monitor (no wrap; global,
   not per workspace), showing its windows and hiding the current one's —
   a monitor with nothing on it gets its display's desktop as focus, as a
   click on empty desktop would, so an empty monitor is still a place to be — and

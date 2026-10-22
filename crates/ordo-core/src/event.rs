@@ -189,7 +189,7 @@ pub enum HotkeyAction {
     /// there too, so the window is never moved out of sight.
     MoveFocusedToMonitorPrev,
     MoveFocusedToMonitorNext,
-    /// Cmd+Alt+J / Cmd+Alt+K: view the adjacent virtual monitor, clamped at
+    /// Cmd+Alt+Left / Right: view the adjacent virtual monitor, clamped at
     /// the ends. Global — not per workspace. Focus goes to that monitor's MRU
     /// window, so on a full rig this is a focus jump between displays and with
     /// one display it also reveals the monitor's windows.

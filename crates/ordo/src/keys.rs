@@ -8,7 +8,7 @@
 //!     their Cmd-digit tab switching.
 //!   - Cmd+Shift+Left / Right    → move the focused window to the previous /
 //!     next virtual monitor, dragging focus and mouse along with it
-//!   - Cmd+Alt+J / Cmd+Alt+K     → view the previous / next virtual monitor
+//!   - Cmd+Alt+Left / Right      → view the previous / next virtual monitor
 //!     (focus jumps to its MRU window; where displays are short, its windows
 //!     are revealed and the current monitor's hidden)
 //!   - Ctrl+Alt+Cmd+V            → virtualization on/off: off collapses every
@@ -47,8 +47,9 @@
 //!     for the moment input stops reaching the apps, whatever Ordo's mode.
 //!
 //! Modifier matching is deliberately strict so Ordo only swallows the exact
-//! chord: Cmd+Shift+arrows are claimed (the user gave up select-to-line for
-//! them, same trade as Cmd+arrows), but Cmd+Alt+arrows etc. pass through.
+//! chord: Cmd+Shift+arrows and Cmd+Alt+arrows are claimed (the user gave up
+//! select-to-line and browser tab switching for them, same trade as
+//! Cmd+arrows), but Cmd+Alt+Shift+arrows etc. pass through.
 //!
 //! A second, separate table ([`witness`]) names macOS's OWN focus-moving
 //! chords — Cmd+Tab and Cmd+` — which Ordo never swallows but must see: they
@@ -79,8 +80,6 @@ mod code {
     pub const R: u16 = 0x0F;
     pub const S: u16 = 0x01;
     pub const END: u16 = 0x77;
-    pub const J: u16 = 0x26;
-    pub const K: u16 = 0x28;
     pub const V: u16 = 0x09;
 
     /// Virtual keycodes for the top-row digits 1..9, in order. GOTCHA: these
@@ -246,13 +245,6 @@ pub fn match_chord(keycode: u16, m: Mods) -> Option<Chord> {
         if let Some(i) = code::DIGITS.iter().position(|c| *c == keycode) {
             return Some(Chord::Hotkey(WorkspaceSwitchTo(WorkspaceId(i as u8 + 1))));
         }
-        // Virtual monitors live under the same Cmd+Alt prefix as the direct
-        // workspace jumps: J/K step the view (vim's down/up, here left/right).
-        match keycode {
-            code::J => return Some(Chord::Hotkey(ViewMonitorPrev)),
-            code::K => return Some(Chord::Hotkey(ViewMonitorNext)),
-            _ => {}
-        }
     }
 
     match keycode {
@@ -260,6 +252,8 @@ pub fn match_chord(keycode: u16, m: Mods) -> Option<Chord> {
         code::RIGHT if only_cmd(m) => Some(Chord::Hotkey(WorkspaceNext)),
         code::LEFT if cmd_shift(m) => Some(Chord::Hotkey(MoveFocusedToMonitorPrev)),
         code::RIGHT if cmd_shift(m) => Some(Chord::Hotkey(MoveFocusedToMonitorNext)),
+        code::LEFT if cmd_alt(m) => Some(Chord::Hotkey(ViewMonitorPrev)),
+        code::RIGHT if cmd_alt(m) => Some(Chord::Hotkey(ViewMonitorNext)),
         code::LEFT if cmd_ctrl(m) => Some(Chord::Hotkey(CarryFocusedToWorkspacePrev)),
         code::RIGHT if cmd_ctrl(m) => Some(Chord::Hotkey(CarryFocusedToWorkspaceNext)),
         code::TAB if m.ctrl && m.alt && !m.cmd && !m.shift => Some(Chord::Hotkey(MruOtherMonitor)),
@@ -290,8 +284,6 @@ impl Key {
                 let i = code::DIGITS.iter().position(|d| *d == c)?;
                 char::from_digit(i as u32 + 1, 10)?
             }
-            code::J => 'J',
-            code::K => 'K',
             code::V => 'V',
             code::LEFT => '←',
             code::RIGHT => '→',
@@ -346,8 +338,8 @@ pub fn key_for(action: &HotkeyAction) -> Option<Key> {
         MruDemote => key(code::END, false, true, false, false),
         MoveFocusedToMonitorPrev => key(code::LEFT, true, false, true, false),
         MoveFocusedToMonitorNext => key(code::RIGHT, true, false, true, false),
-        ViewMonitorPrev => key(code::J, true, true, false, false),
-        ViewMonitorNext => key(code::K, true, true, false, false),
+        ViewMonitorPrev => key(code::LEFT, true, true, false, false),
+        ViewMonitorNext => key(code::RIGHT, true, true, false, false),
         ToggleVirtualMonitors => key(code::V, true, true, false, true),
         CarryFocusedToWorkspacePrev => key(code::LEFT, true, false, false, true),
         CarryFocusedToWorkspaceNext => key(code::RIGHT, true, false, false, true),
@@ -356,7 +348,7 @@ pub fn key_for(action: &HotkeyAction) -> Option<Key> {
     }
 }
 
-/// Cmd, and none of the others — so Cmd+Alt/Ctrl+arrow keeps working.
+/// Cmd, and none of the others — so the decorated arrows stay distinct chords.
 fn only_cmd(m: Mods) -> bool {
     m.cmd && !m.alt && !m.shift && !m.ctrl
 }
@@ -404,16 +396,16 @@ mod tests {
         let t0 = Instant::now();
         let plain = mods(false, false, false, false);
         let mut keys = KeyWitness::default();
-        assert!(keys.report(code::J, plain, true, t0));
-        assert!(!keys.report(code::K, plain, true, t0 + Duration::from_millis(100)));
-        assert!(keys.report(code::K, plain, true, t0 + Duration::from_millis(400)));
+        assert!(keys.report(code::S, plain, true, t0));
+        assert!(!keys.report(code::V, plain, true, t0 + Duration::from_millis(100)));
+        assert!(keys.report(code::V, plain, true, t0 + Duration::from_millis(400)));
 
         let mut keys = KeyWitness::default();
         let cmd = mods(true, false, false, false);
         assert!(!keys.report(code::RIGHT, cmd, true, t0), "Cmd+Right is Ordo's");
         assert!(!keys.report(code::TAB, cmd, true, t0), "Cmd+Tab is macOS's switcher");
-        assert!(!keys.report(code::J, plain, false, t0), "nothing while paused");
-        assert!(keys.report(code::J, plain, true, t0));
+        assert!(!keys.report(code::S, plain, false, t0), "nothing while paused");
+        assert!(keys.report(code::S, plain, true, t0));
     }
 
     #[test]
@@ -487,14 +479,14 @@ mod tests {
     }
 
     #[test]
-    fn cmd_alt_j_k_view_monitors_and_the_triple_v_toggles_virtualization() {
+    fn cmd_alt_arrows_view_monitors_and_the_triple_v_toggles_virtualization() {
         let chord = mods(true, true, false, false);
         assert_eq!(
-            match_chord(code::J, chord),
+            match_chord(code::LEFT, chord),
             Some(Chord::Hotkey(ViewMonitorPrev))
         );
         assert_eq!(
-            match_chord(code::K, chord),
+            match_chord(code::RIGHT, chord),
             Some(Chord::Hotkey(ViewMonitorNext))
         );
         // The toggle is a full-triple chord, and survives an extra shift like
@@ -508,12 +500,14 @@ mod tests {
             Some(Chord::Hotkey(ToggleVirtualMonitors))
         );
         assert_eq!(match_chord(code::V, chord), None);
-        // Cmd+V is Paste, Cmd+J/K are the apps' — only the exact chords are ours.
-        for key in [code::J, code::K, code::V] {
-            assert_eq!(match_chord(key, mods(true, false, false, false)), None);
-            assert_eq!(match_chord(key, mods(false, true, false, false)), None);
-            assert_eq!(match_chord(key, mods(true, true, true, false)), None);
-            assert_eq!(match_chord(key, mods(false, false, false, false)), None);
+        // Cmd+V is Paste — only the exact chord is ours.
+        for m in [
+            mods(true, false, false, false),
+            mods(false, true, false, false),
+            mods(true, true, true, false),
+            mods(false, false, false, false),
+        ] {
+            assert_eq!(match_chord(code::V, m), None);
         }
     }
 
@@ -529,11 +523,11 @@ mod tests {
             Some(Chord::Hotkey(MoveFocusedToMonitorNext))
         );
         // …but any other decoration still belongs to the apps.
+        assert_eq!(match_chord(code::LEFT, mods(true, true, true, false)), None);
         assert_eq!(
-            match_chord(code::RIGHT, mods(true, true, false, false)),
+            match_chord(code::RIGHT, mods(false, true, false, false)),
             None
         );
-        assert_eq!(match_chord(code::LEFT, mods(true, true, true, false)), None);
     }
 
     #[test]

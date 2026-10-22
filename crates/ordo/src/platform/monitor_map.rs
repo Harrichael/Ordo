@@ -640,7 +640,7 @@ fn draw_tile(r: NSRect, number: u8, windows: usize, shown: bool, viewed: bool) {
     path.setLineWidth(1.0);
     path.stroke();
 
-    // The anchor Cmd+Alt+J/K step from: its number in the accent, not its
+    // The anchor Cmd+Alt+Left/Right step from: its number in the accent, not its
     // outline, which would merge into the frame's edge.
     let number_color = if viewed {
         NSColor::controlAccentColor()

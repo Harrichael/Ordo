@@ -4924,9 +4924,9 @@ fn moving_a_window_to_a_hidden_monitor_views_it_and_never_touches_its_frame() {
 fn moving_onto_an_empty_monitor_gives_focus_to_its_desktop_and_holds_it_there() {
     // Three monitors on two displays, viewing 1+2. The user is in w1 (a
     // terminal) on monitor 1; monitor 2 has nothing on this workspace; w2
-    // sits on hidden monitor 3. Cmd+Alt+K slides the view to 2+3, hiding w1.
-    // Focus must land on the empty monitor itself — its display's desktop —
-    // not on w2 across the way just because w2 is visible. And when macOS
+    // sits on hidden monitor 3. Cmd+Alt+Right slides the view to 2+3, hiding
+    // w1. Focus must land on the empty monitor itself — its display's
+    // desktop — not on w2 across the way just because w2 is visible. And when macOS
     // hands focus back to w1's app (it does, on a click in the menu bar),
     // the desktop is re-granted rather than w2 grabbed or the view followed.
     let view = |viewed| VirtualMonitors {
