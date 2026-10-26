@@ -240,6 +240,9 @@ pub struct EmulatedWorkspaces {
     /// a rehost): how long its promise may stand in for it at its park (see
     /// `RESTORE_GRACE`).
     revealed_at: HashMap<WindowId, Instant>,
+    /// Living windows the ledger keeps that scans have stopped listing, and
+    /// since when; see `ParkTraceKind::Returned`.
+    unlisted_since: HashMap<WindowId, Instant>,
     /// Display geometry as of the last enforcement pass. Any change moves the
     /// park corner itself — a systemic event no window should be blamed for.
     last_geometry: Option<Geometry>,
@@ -299,6 +302,7 @@ impl EmulatedWorkspaces {
             park_request: HashMap::new(),
             last_requested: HashMap::new(),
             revealed_at: HashMap::new(),
+            unlisted_since: HashMap::new(),
             pending_repark: HashSet::new(),
             last_geometry: None,
             state_path: None,
@@ -416,6 +420,7 @@ impl EmulatedWorkspaces {
                 self.drop_park_bookkeeping(&dead);
             }
         }
+        self.note_returns(d, windows, &absent);
         // A new window is adopted onto the monitor its display stands for —
         // it is visibly there — and onto the anchor where the display stands
         // for several (collapsed) or none.
@@ -449,6 +454,36 @@ impl EmulatedWorkspaces {
         }
         if dirty {
             self.persist();
+        }
+    }
+
+    fn note_returns(&mut self, d: &dyn Desktop, windows: &HashMap<WindowId, (Pid, Rect)>, absent: &[WindowId]) {
+        let now = d.now();
+        let filed = self.ledger.window_ws();
+        self.unlisted_since.retain(|w, _| filed.contains_key(w));
+        for w in absent {
+            self.unlisted_since.entry(*w).or_insert(now);
+        }
+        let back: Vec<(WindowId, Instant)> = self
+            .unlisted_since
+            .iter()
+            .filter(|(w, _)| windows.contains_key(w))
+            .map(|(w, t)| (*w, *t))
+            .collect();
+        let current = self.ledger.current();
+        for (w, since) in back {
+            self.unlisted_since.remove(&w);
+            let mut t = ParkTrace::new(w, ParkTraceKind::Returned)
+                .observed(windows[&w].1)
+                .detail(format!(
+                    "unlisted for {} ms; promise {:?}",
+                    now.duration_since(since).as_millis(),
+                    self.saved.get(&w)
+                ));
+            if let Some(declared) = filed.get(&w) {
+                t = t.ws(*declared, current);
+            }
+            self.note(t);
         }
     }
 
@@ -986,6 +1021,19 @@ impl EmulatedWorkspaces {
     }
 
     /// The display the window's monitor is projected onto right now.
+    /// Did the app itself lay this parked window out anew, so its promise is
+    /// stale? An app re-showing a window it kept (Outlook's reminder) sizes it
+    /// for what it now holds and places it to fit. A window only MOVED while
+    /// parked keeps its promise: that is AppKit sliding it back in on
+    /// un-hide, or a hand fighting the park, and neither is a new home.
+    fn app_placed(&self, w: WindowId, f: &Rect, g: &Geometry) -> bool {
+        let Some(s) = self.saved.get(&w) else {
+            return false;
+        };
+        let resized = (f.h - s.h).abs() > 1.0 || (f.w - s.w).abs() > 1.0;
+        resized && !self.reads_parked(w, f, g) && !out_of_reach(f, g)
+    }
+
     fn host_rect(&self, window: WindowId, g: &Geometry) -> Option<Rect> {
         let claim = self.ledger.claim(window)?;
         let i = self.ledger.projection().host(claim.monitor)?;
@@ -1094,6 +1142,7 @@ impl EmulatedWorkspaces {
         }
         let mut writes = Vec::new();
         let mut newly_parked = false;
+        let mut promised = false;
         for w in hidden {
             let Some((pid, f)) = frames.get(&w) else {
                 continue;
@@ -1189,10 +1238,24 @@ impl EmulatedWorkspaces {
                 }
             }
             // Re-assert. A bookkept parked window keeps its promise and just
-            // gets the corner write again; one that was never parked (the
-            // blind spot) parks properly, capturing its promise on the way.
+            // gets the corner write again, unless its app placed it anew; one
+            // that was never parked (the blind spot) parks properly, capturing
+            // its promise on the way.
             if self.parked.contains(&w) {
+                let placed = !own_write && !systemic && self.app_placed(w, f, &g);
+                if placed {
+                    self.saved.insert(w, *f);
+                    if self.full_rig(&g) {
+                        self.home.insert(w, *f);
+                    }
+                    promised = true;
+                }
                 let want = park_frame(*f, &g);
+                let seen = if placed {
+                    format!("{seen}; app placed it anew, promise taken from it")
+                } else {
+                    seen
+                };
                 let t = ParkTrace::new(w, ParkTraceKind::Reassert)
                     .observed(*f)
                     .requested(want)
@@ -1259,7 +1322,7 @@ impl EmulatedWorkspaces {
         }
         // A blind-spot park or a restore changed durable promises — and what
         // is on screen, so the Dock follows, as after a switch.
-        if newly_parked || restored {
+        if newly_parked || restored || promised {
             self.persist();
         }
         self.move_windows(d, &writes);
@@ -3032,6 +3095,69 @@ mod tests {
         // the stale height along, so one user resize is all the repair takes.
         b.switch_workspace(&d, ws(1));
         assert_eq!(b.saved[&w(1)], Rect { h: 923.0, ..tall });
+    }
+
+    /// Outlook keeps its reminder window and shows each reminder in it: shrunk
+    /// to a sliver of a window when the last one was dismissed, parked like
+    /// that, then laid out again taller and higher when the next one fires.
+    /// Coming back at the promise made from the shrunk window hung the new
+    /// reminder off the bottom of the display. Where the app laid it out is
+    /// the promise now; AppKit only sliding a parked window back in is not.
+    #[test]
+    fn a_window_its_app_shows_anew_comes_back_where_the_app_put_it() {
+        let dismissed = Rect {
+            x: 1400.0,
+            y: 1000.0,
+            w: 400.0,
+            h: 61.0,
+        };
+        let d = FakeDesktop::new(&[(w(1), Pid(10), dismissed)]);
+        let mut b = EmulatedWorkspaces::new(3);
+        b.note_scan(&d, &d.scan(), &d.screens(), None);
+        b.move_window_to_workspace(&d, w(1), ws(2)).unwrap();
+
+        let reminder = Rect {
+            y: 920.0,
+            h: 141.0,
+            ..dismissed
+        };
+        d.place(w(1), reminder);
+        rescan(&d, &mut b);
+        assert!(in_park_corner(&d.frame(w(1)), &geo()), "still parked off this workspace");
+
+        b.switch_workspace(&d, ws(2));
+        assert_eq!(d.frame(w(1)), reminder);
+
+        // Hidden and hauled back in sideways by AppKit: the promise holds.
+        b.switch_workspace(&d, ws(1));
+        d.yank_on_hide.set(true);
+        d.hide_app(Pid(10));
+        rescan(&d, &mut b);
+        assert_eq!(b.saved[&w(1)], reminder);
+    }
+
+    /// A window its app ordered out, alive but unlisted, keeps its filing;
+    /// when it is listed again the trace says so, and where it is filed.
+    #[test]
+    fn a_window_listed_again_is_traced_with_its_filing() {
+        let d = FakeDesktop::new(&[
+            (w(1), Pid(10), rect(100.0, 100.0)),
+            (w(2), Pid(20), rect(300.0, 200.0)),
+        ]);
+        let mut b = EmulatedWorkspaces::new(3);
+        b.note_scan(&d, &d.scan(), &d.screens(), None);
+        b.assign_window_to_workspace(w(1), ws(2)).unwrap();
+        b.note_scan(&d, &d.scan_only(&[(w(2), Pid(20))]), &d.screens(), None);
+        b.take_trace();
+
+        b.note_scan(&d, &d.scan(), &d.screens(), None);
+        let back: Vec<ParkTrace> = b
+            .take_trace()
+            .into_iter()
+            .filter(|t| t.kind == ParkTraceKind::Returned)
+            .collect();
+        assert_eq!(back.len(), 1);
+        assert_eq!((back[0].window, back[0].declared), (w(1), Some(ws(2))));
     }
 
     #[test]

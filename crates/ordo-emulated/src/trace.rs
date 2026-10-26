@@ -77,6 +77,12 @@ pub enum ParkTraceKind {
     /// began, whether it turned ghost (on screen, unlisted by an app that
     /// answers, for longer than a dropped read lasts), and when it ended.
     Unread,
+    /// A window the ledger kept through a spell out of every scan (its app
+    /// ordered it out but it still exists, like Outlook's reminder between
+    /// reminders) is listed again, still declared where it was filed. A
+    /// floating one then parks for that stale workspace before the core
+    /// carries it to the user's: the flicker this exists to measure.
+    Returned,
 }
 
 /// What holding an app's parked windows through its un-hide cost.
