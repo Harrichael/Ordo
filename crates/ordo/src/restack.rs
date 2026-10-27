@@ -14,6 +14,11 @@
 //! stack is read, the core's frames can be a tick old, and the rebuild costs
 //! microseconds against a read of a quarter millisecond.
 //!
+//! A switch's moves land over hundreds of ms, one app at a time, so a single
+//! restack either waits on the slowest app or plans around windows still on
+//! their way. [`follow`] does neither: it restacks each time the moves go
+//! quiet, and again after every later landing, until they've all landed.
+//!
 //! Raise physics, probed (see `platform/zorder.rs`): a raise lands just below
 //! the key window; a raise of another window of the key window's app (a
 //! sibling) lands above it; raising the key window puts it back on top, with
@@ -23,6 +28,7 @@ use std::time::{Duration, Instant};
 
 use ordo_core::{Rect, WindowId};
 
+use crate::app_queue::{AppQueues, Landing};
 use crate::ports::{RaiseKind, RaiseStat, RestackStats};
 
 /// Overlap, and visibility on a display, both need more than this on each
@@ -41,6 +47,12 @@ const PRESENCE_TIMEOUT: Duration = Duration::from_millis(600);
 /// 400ms), and a timeout is what the second pass exists to absorb.
 const LANDING_TIMEOUT: Duration = Duration::from_millis(1000);
 const SETTLE: Duration = Duration::from_millis(150);
+/// How long no move may land before a pass runs. A first guess: a pass
+/// cancelled by a landing (`aborted` with a later `rerun`) says it's short.
+pub const QUIET: Duration = Duration::from_millis(30);
+/// How long an order keeps following its moves. Past the slowest app's
+/// chain logged (4.1s); an app slower than this is left to the next order.
+pub const FOLLOW: Duration = Duration::from_secs(5);
 
 /// One on-screen, layer-0 window as the window server lists it.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -304,6 +316,46 @@ fn ms(d: Duration) -> u64 {
     d.as_millis() as u64
 }
 
+/// Run `pass` each time the moves go quiet, until `landing` is done and no
+/// move landed during the last pass, `cancel` turns true, or [`FOLLOW`]
+/// runs out. The first pass waits for a move to land unless none is left.
+///
+/// A move landing mid-pass cancels it (the plan read a screen that has since
+/// changed) and the next pass replans once quiet again; past `FOLLOW`, only
+/// `cancel` stops one. Each pass's stats go to `report` as it ends, with
+/// its `rerun` and `landing_wait_ms` filled in.
+pub fn follow(
+    queues: &AppQueues,
+    landing: &Landing,
+    cancel: &dyn Fn() -> bool,
+    pass: &mut dyn FnMut(&dyn Fn() -> bool) -> Option<RestackStats>,
+    report: &mut dyn FnMut(RestackStats),
+) {
+    let until = Instant::now() + FOLLOW;
+    let mut seen = landing.moved_before();
+    for rerun in 0.. {
+        let waited = Instant::now();
+        queues.wait_moved(seen, until, &|| landing.done(), cancel);
+        queues.wait_still(QUIET, until, cancel);
+        if cancel() {
+            return;
+        }
+        let waited_ms = ms(waited.elapsed());
+        let before = queues.moved();
+        let following = Instant::now() < until;
+        let pass_cancel = || cancel() || (following && queues.moved() != before);
+        if let Some(mut stats) = pass(&pass_cancel) {
+            stats.rerun = rerun;
+            stats.landing_wait_ms = waited_ms;
+            report(stats);
+        }
+        if cancel() || !following || (landing.done() && queues.moved() == before) {
+            return;
+        }
+        seen = before;
+    }
+}
+
 /// Impose `desired` (front to back) wherever windows overlap.
 ///
 /// `desired[0]` is the designated top: the window the core wants key, not
@@ -500,6 +552,7 @@ pub fn reassert(
     Some(RestackStats {
         total_ms: ms(ws.now() - t0),
         landing_wait_ms: 0,
+        rerun: 0,
         presence_wait_ms,
         handoff_wait_ms,
         desired: desired.len() as u32,

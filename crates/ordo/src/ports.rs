@@ -170,9 +170,12 @@ pub trait Effector {
 #[derive(Clone, Debug)]
 pub struct RestackStats {
     pub total_ms: u64,
-    /// Waiting for the destination's apps to work through the writes queued
-    /// before this restack: its windows' moves, un-hides and focus.
+    /// Waiting, before this pass, for a move to land and then for the moves
+    /// to go quiet: since the order arrived, or since the pass before.
     pub landing_wait_ms: u64,
+    /// Which pass of its order this was, from 0. An order is restacked again
+    /// each time moves land and go quiet, until its apps' moves are done.
+    pub rerun: u32,
     /// Waiting for un-hidden windows to resurface in the CG list before
     /// ordering could even start. If this dominates, overlapping raises is
     /// optimizing the wrong phase.

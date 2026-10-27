@@ -109,6 +109,17 @@ struct Inner {
     fronting: Mutex<()>,
     /// Signalled whenever a lane runs out of work, for `wait_idle`.
     idle: Condvar,
+    moved: Mutex<Moved>,
+    /// Signalled whenever a job that moves windows returns.
+    landed: Condvar,
+}
+
+/// Jobs that put windows somewhere (moves, frames, un-hides) that have
+/// returned, across every app.
+#[derive(Default)]
+struct Moved {
+    count: u64,
+    last: Option<Instant>,
 }
 
 struct Lane {
@@ -163,6 +174,8 @@ impl AppQueues {
                 chains: Mutex::new(Vec::new()),
                 fronting: Mutex::new(()),
                 idle: Condvar::new(),
+                moved: Mutex::new(Moved::default()),
+                landed: Condvar::new(),
             }),
         }
     }
@@ -277,9 +290,65 @@ impl AppQueues {
         }
     }
 
+    /// How many jobs that put windows somewhere have returned so far, across
+    /// every app: a number to hand to [`AppQueues::wait_moved`].
+    pub fn moved(&self) -> u64 {
+        lock(&self.inner.moved).count
+    }
+
+    /// Wait until more than `since` such jobs have returned, or `done` says
+    /// there's nothing left worth waiting for, or the deadline, or `cancel`.
+    pub fn wait_moved(
+        &self,
+        since: u64,
+        deadline: Instant,
+        done: &dyn Fn() -> bool,
+        cancel: &dyn Fn() -> bool,
+    ) {
+        let mut moved = lock(&self.inner.moved);
+        loop {
+            if moved.count > since || done() {
+                return;
+            }
+            let now = Instant::now();
+            if now >= deadline || cancel() {
+                return;
+            }
+            // Sliced, as `done` and `cancel` signal nothing.
+            let slice = (deadline - now).min(Duration::from_millis(5));
+            moved = self
+                .inner
+                .landed
+                .wait_timeout(moved, slice)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+    }
+
+    /// Wait until no job that puts windows somewhere has returned for
+    /// `quiet`, or the deadline, or `cancel`.
+    pub fn wait_still(&self, quiet: Duration, deadline: Instant, cancel: &dyn Fn() -> bool) {
+        let mut moved = lock(&self.inner.moved);
+        loop {
+            let now = Instant::now();
+            let still_at = moved.last.map_or(now, |t| t + quiet);
+            if now >= still_at || now >= deadline || cancel() {
+                return;
+            }
+            let slice = (still_at.min(deadline) - now).min(Duration::from_millis(5));
+            moved = self
+                .inner
+                .landed
+                .wait_timeout(moved, slice)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+    }
+
     /// Completes once these apps' queues have carried out everything queued
     /// on them before this call.
     pub fn marker(&self, apps: &[Pid]) -> Landing {
+        let moved = self.moved();
         let lanes = lock(&self.inner.lanes);
         let mut waiting: Vec<std::sync::MutexGuard<LaneState>> = lanes
             .iter()
@@ -302,7 +371,7 @@ impl AppQueues {
         for lane in lanes.values() {
             lane.wake.notify_one();
         }
-        Landing(latch)
+        Landing { latch, moved }
     }
 
     /// Whether a write to this window is queued, being made, or returned
@@ -551,6 +620,10 @@ fn run_lane(inner: Arc<Inner>, pid: Pid, lane: Arc<Lane>) {
                 job => Work::One(job),
             }
         };
+        let moves_windows = matches!(
+            work,
+            Work::Moves(_) | Work::One(Job::Frame { .. }) | Work::One(Job::Show { .. })
+        );
         let touched: Vec<(WindowId, u64)> = match &work {
             Work::Moves(moves) => moves.iter().map(|(w, _, seq)| (*w, *seq)).collect(),
             Work::One(Job::Frame { window, seq, .. }) => vec![(*window, *seq)],
@@ -687,6 +760,12 @@ fn run_lane(inner: Arc<Inner>, pid: Pid, lane: Arc<Lane>) {
             drop(record);
             session = (inner.open)(pid);
         }
+        if moves_windows {
+            let mut moved = lock(&inner.moved);
+            moved.count += 1;
+            moved.last = Some(Instant::now());
+            inner.landed.notify_all();
+        }
         let mut state = lock(&lane.state);
         state.busy = false;
         if state.jobs.is_empty() {
@@ -719,21 +798,36 @@ impl Latch {
 }
 
 /// See [`AppQueues::marker`].
-pub struct Landing(Arc<Latch>);
+pub struct Landing {
+    latch: Arc<Latch>,
+    moved: u64,
+}
 
 impl Landing {
+    /// Whether everything has landed.
+    pub fn done(&self) -> bool {
+        *lock(&self.latch.left) == 0
+    }
+
+    /// [`AppQueues::moved`] when the marker was made: a landing past it
+    /// came after the writes the marker follows were queued. A write that
+    /// lands between its queuing and the marker is counted as before.
+    pub fn moved_before(&self) -> u64 {
+        self.moved
+    }
+
     /// Whether everything landed before `deadline`. Gives up early, with
     /// false, once `cancel` says the wait no longer matters.
     pub fn wait(&self, deadline: Instant, cancel: &dyn Fn() -> bool) -> bool {
         let slice = Duration::from_millis(5);
-        let mut left = lock(&self.0.left);
+        let mut left = lock(&self.latch.left);
         while *left > 0 {
             let now = Instant::now();
             if now >= deadline || cancel() {
                 return false;
             }
             left = self
-                .0
+                .latch
                 .done
                 .wait_timeout(left, slice.min(deadline - now))
                 .unwrap_or_else(|e| e.into_inner())

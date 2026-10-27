@@ -24,7 +24,7 @@ Counterfactual on run 29 (99 non-ghost restacks, frames from nearest prior snaps
 
 Per pass, from one CG read: `(wid, pid, bounds)` front-to-back. Index windows by P position (≤64 fast path). `adj[i]` = bitset of overlaps. Edges are implicit: `below(i) = adj[i] & !mask_upto(i)`, `above(i) = adj[i] & mask_below(i)`. Nothing allocated beyond two `[u64; 64]` + a `[Rect; 64]` SoA (x0,y0,x1,y1 as four `[f64;64]`).
 
-Presence: the gate waits, as today, only for windows missing from the CG list (still resurfacing from an un-hide). A window that is listed but "sliver-shaped" (visible width or height on every display ≤ `MIN_OVERLAP`) is left out of the plan, not waited for. Waiting on slivers was the first design, but a window the core believes visible and the ledger has parked would then cost the full 600ms presence timeout on every switch, while an un-park still in flight at restack time is rare: the switch's moves are AX writes that return once the app has applied them, and they run before the restack is submitted.
+Presence: the gate waits, as today, only for windows missing from the CG list (still resurfacing from an un-hide). A window that is listed but "sliver-shaped" (visible width or height on every display ≤ `MIN_OVERLAP`) is left out of the plan, not waited for. Waiting on slivers was the first design, but a window the core believes visible and the ledger has parked would then cost the full 600ms presence timeout on every switch, while an un-park still in flight is caught by the next pass: the worker restacks again each time the switch's moves land and go quiet (`restack::follow`), so a window left out as a sliver is planned once it arrives.
 
 ## 3. Minimal-raise planning
 

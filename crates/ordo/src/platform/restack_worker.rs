@@ -7,6 +7,8 @@
 //! This worker owns all raising instead: `submit` is instant, and only the
 //! LATEST desired order matters — a newer submit bumps the generation, the
 //! in-flight reassert sees it via its cancel hook and yields mid-gate.
+//! One order runs as several passes, one each time the switch's moves land
+//! and go quiet, so a slow app's windows are ordered when they arrive.
 //!
 //! One deliberate overlap: a raise issued for generation N can land while the
 //! engine is already executing generation N+1's focus/park writes. That is
@@ -42,11 +44,6 @@ use crate::engine::Msg;
 /// late) without holding the watch across unrelated activity.
 const GHOST_WATCH_MS: u64 = 1800;
 
-/// The longest a restack waits for its apps to land what was queued before
-/// it. Past this it plans against the screen as it stands, as it did before
-/// writes were queued: an app that slow will be raised around, not waited on.
-const LANDING_WAIT: Duration = Duration::from_millis(600);
-
 struct Shared {
     /// Bumped by every submit; a running reassert compares its own generation
     /// against this to learn it has been superseded.
@@ -62,8 +59,8 @@ struct Job {
     order: Vec<WindowId>,
     attached: Vec<(WindowId, WindowId)>,
     focus_top: bool,
-    /// The switch's writes to the apps of `order`; raises only mean
-    /// something once the windows are where they are going and showing.
+    /// The switch's writes to the apps of `order`, which its passes follow
+    /// (see [`crate::restack::follow`]).
     landing: Landing,
     /// The newest focus when this order was decided: a take-back on its
     /// behalf is dropped once a newer one has been asked for.
@@ -148,34 +145,41 @@ pub fn spawn(tx: Sender<Msg>, signals: Arc<RaiseSignals>, queues: AppQueues) -> 
                         queues.focus_if_current(ordo_core::Pid(pid), w, focus_gen)
                     })
                 };
-                let waited = Instant::now();
-                landing.wait(waited + LANDING_WAIT, &cancel);
-                let landing_wait_ms = waited.elapsed().as_millis() as u64;
-                let mut stats = super::zorder::reassert_stack(
-                    &order,
-                    &attached,
-                    focus_top,
+                // Several passes as the moves land: the watch is owed if any of
+                // them raised, and only the last one says where things ended.
+                let mut issued = false;
+                let mut last: Option<(bool, bool)> = None;
+                let mut sent = true;
+                crate::restack::follow(
+                    &queues,
+                    &landing,
                     &cancel,
-                    Some(&signals),
-                    &focus,
+                    &mut |cancel| {
+                        super::zorder::reassert_stack(
+                            &order,
+                            &attached,
+                            focus_top,
+                            cancel,
+                            Some(&signals),
+                            &focus,
+                        )
+                    },
+                    &mut |stats| {
+                        issued |= !stats.raises.is_empty();
+                        last = Some((stats.converged, stats.aborted));
+                        sent &= tx.send(Msg::RestackStats(stats)).is_ok();
+                    },
                 );
-                if let Some(s) = &mut stats {
-                    s.landing_wait_ms = landing_wait_ms;
+                if !sent {
+                    return false;
                 }
-                let issued = stats.as_ref().is_some_and(|s| !s.raises.is_empty());
-                let watch = stats
-                    .as_ref()
-                    .is_some_and(|s| s.converged && !s.aborted && (issued || owed));
-                owed = match &stats {
+                let watch = last
+                    .is_some_and(|(converged, aborted)| converged && !aborted && (issued || owed));
+                owed = match last {
                     None => owed,
-                    Some(s) if s.aborted => owed || issued,
+                    Some((_, true)) => owed || issued,
                     Some(_) => false,
                 };
-                if let Some(stats) = stats {
-                    if tx.send(Msg::RestackStats(stats)).is_err() {
-                        return false;
-                    }
-                }
                 if !watch {
                     return true;
                 }

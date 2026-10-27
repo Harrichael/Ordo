@@ -33,7 +33,7 @@
 use rusqlite::{Connection, Transaction};
 
 /// The schema version this build writes and understands.
-pub const CURRENT_VERSION: i32 = 12;
+pub const CURRENT_VERSION: i32 = 13;
 
 type Migration = fn(&Transaction) -> rusqlite::Result<()>;
 
@@ -50,6 +50,7 @@ const MIGRATIONS: &[Migration] = &[
     m10_snapshot_phases,
     m11_dropped_looks,
     m12_freeze_diag,
+    m13_restack_rerun,
 ];
 
 /// Read the version of an existing log, refusing one written by a newer Ordo.
@@ -263,6 +264,12 @@ CREATE TABLE freeze_diag (
 );
 "#,
     )
+}
+
+/// Which pass of its order a restack was: one order is restacked again each
+/// time its switch's moves land and go quiet.
+fn m13_restack_rerun(tx: &Transaction) -> rusqlite::Result<()> {
+    tx.execute_batch("ALTER TABLE restacks ADD COLUMN rerun INTEGER NOT NULL DEFAULT 0;")
 }
 
 /// Version 1: the schema as it first shipped. Frozen — see the module rules.

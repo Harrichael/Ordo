@@ -75,14 +75,14 @@ The model asks in two places:
 - `app_queue.rs` and `ax::AxApp`, as above.
 - `AxDesktop`: writes go to the queues.
 - `MacEffector`: `FocusWindow` and `SetWindowFrame` are queued on the owner's queue (the pid comes from the window server), and they report `Ok` at once, or `Failed` if the window has no owner. `RestackWindows` passes a marker.
-- The restack worker waits on the marker; `landing_wait_ms` is logged (schema v8).
+- The restack worker follows the marker: a pass each time the moves land and go quiet for 30 ms, until the marker completes (`restack::follow`). `landing_wait_ms` is each pass's wait (schema v8), `rerun` its number (schema v13).
 - Trace: one `AppChain` row per app per chain, from its first job queued to its queue running empty. The row has the moves (each write's time and when it finished), moves replaced, the un-hide's hold stats, the focus (and whether it was skipped), and when each part finished. It replaces `AppMoved`.
 
 ## 5. Costs and risks, and what shows them
 
 - **Keyboard focus waits for the head app's chain.** Chrome-headed switches that also un-hide Chrome wait its moves plus its un-hide (about 100 ms typical) before the focus lands, and keys typed meanwhile go to the old window. That's the price of call 4. `AppChain.focus.done_ms` measures it. If it hurts, the alternative is to focus first and hold in the model, as before.
 - **Focus confirmation runs closer to the core's 1 s window.** A chain plus the app's own grant can push a switch's `Focused` expectation past 1 s, which re-grants focus. The note `FocusReasserted` counts those.
-- **The restack starts later.** It starts once the destination's apps land, where before it started once everything had landed. `landing_wait_ms` shows the wait.
+- **The restack runs more than once.** Its first pass waits for a move to land and go quiet; later passes follow each later landing. `landing_wait_ms` and `rerun` show it.
 - **Faster engine, more intermediate switches.** The engine takes the next press after the rescan (about 30 ms) rather than after the whole switch, so a fast burst executes more of its presses. Replaced moves cut the cost on the apps; each intermediate un-hide still runs.
 - **The 1a race is fixed for windows, not for the desktop.** The logged case of loose ends 1a is `FocusDesktop` activating Finder, whose parked window nothing holds. This design doesn't touch that path. The fix belongs in the model: add the desktop owner to the shows, with its hold.
 - **Three focus writers**: the queues, the core's re-grants (which go through the queues too), and the restack worker's take-back, which goes straight to the app after its marker.
