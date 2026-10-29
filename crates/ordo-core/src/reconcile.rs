@@ -215,6 +215,11 @@ pub(crate) fn apply_snapshot(s: &mut State, snap: &WorldSnapshot) {
         .virtual_monitors
         .as_ref()
         .map(|w| VirtualMonitors { ..w.view });
+    s.workspace_views = snap
+        .workspaces
+        .virtual_monitors
+        .as_ref()
+        .and_then(|w| w.workspace_views.clone());
     let positions = s.monitors_by_position();
 
     for w in &snap.windows {

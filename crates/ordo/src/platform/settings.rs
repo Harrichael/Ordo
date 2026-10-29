@@ -1,8 +1,8 @@
 //! Ordo's settings: the submenu and the choices that outlast a launch.
 //!
-//! Hiding is kept in the user defaults and sent to the engine at launch and
-//! on every change. Debug mode is not kept: it is off at every launch (see
-//! [`crate::debug`]).
+//! Hiding and whether each workspace keeps its own view are kept in the user
+//! defaults and sent to the engine at launch and on every change. Debug mode
+//! is not kept: it is off at every launch (see [`crate::debug`]).
 
 use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
@@ -26,6 +26,7 @@ use crate::engine::Msg;
 
 const HIDE_WHEN: &str = "HideApps";
 const HIDE_IDLE: &str = "HideAppsWithNothingOn";
+const OWN_VIEWS: &str = "WorkspacesKeepTheirOwnView";
 
 const WHEN: [(HideWhen, &str, &str); 3] = [
     (HideWhen::Never, "Never", "never"),
@@ -55,6 +56,11 @@ pub fn saved_hiding() -> Hiding {
     }
 }
 
+/// Off if never set: the view is global, as it always was.
+pub fn saved_own_views() -> bool {
+    NSUserDefaults::standardUserDefaults().boolForKey(&NSString::from_str(OWN_VIEWS))
+}
+
 fn save_hiding(hiding: Hiding) {
     let defaults = NSUserDefaults::standardUserDefaults();
     let when = WHEN.iter().find(|w| w.0 == hiding.when).map(|w| w.2);
@@ -71,6 +77,7 @@ fn save_hiding(hiding: Hiding) {
 #[derive(Clone, Copy, PartialEq)]
 enum Choice {
     Debug,
+    OwnViews,
     When(HideWhen),
     Idle(Idle),
 }
@@ -79,6 +86,7 @@ enum Choice {
 pub struct Settings {
     tx: Sender<Msg>,
     hiding: Cell<Hiding>,
+    own_views: Cell<bool>,
     rows: RefCell<Vec<Retained<ChoiceRow>>>,
 }
 
@@ -87,6 +95,7 @@ impl Settings {
         Rc::new(Settings {
             tx,
             hiding: Cell::new(saved_hiding()),
+            own_views: Cell::new(saved_own_views()),
             rows: RefCell::new(Vec::new()),
         })
     }
@@ -108,6 +117,9 @@ impl Settings {
 
         add(Choice::Debug, "Debug mode").setToolTip(Some(ns_string!(
             "Logs the stacking order at each step of a switch. Costs a few ms per switch; off at every launch."
+        )));
+        add(Choice::OwnViews, "Each workspace keeps its own monitor").setToolTip(Some(ns_string!(
+            "With more virtual monitors than displays, a switch shows the monitor you last viewed on that workspace."
         )));
         menu.addItem(&NSMenuItem::separatorItem(mtm));
         menu.addItem(&NSMenuItem::sectionHeaderWithTitle(
@@ -145,6 +157,7 @@ impl Settings {
         let hiding = self.hiding.get();
         match choice {
             Choice::Debug => crate::debug::enabled(),
+            Choice::OwnViews => self.own_views.get(),
             Choice::When(when) => when == hiding.when,
             Choice::Idle(idle) => idle == hiding.idle,
         }
@@ -154,6 +167,13 @@ impl Settings {
         let hiding = self.hiding.get();
         match choice {
             Choice::Debug => crate::debug::set(!crate::debug::enabled()),
+            Choice::OwnViews => {
+                let on = !self.own_views.get();
+                self.own_views.set(on);
+                NSUserDefaults::standardUserDefaults()
+                    .setBool_forKey(on, &NSString::from_str(OWN_VIEWS));
+                let _ = self.tx.send(Msg::OwnViews(on));
+            }
             Choice::When(when) => self.change(Hiding { when, ..hiding }),
             Choice::Idle(idle) => self.change(Hiding { idle, ..hiding }),
         }

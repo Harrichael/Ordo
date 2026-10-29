@@ -154,7 +154,7 @@ impl WorkspaceBackend for NativeBackend {
         })
     }
 
-    fn switch_workspace(&mut self, target: WorkspaceId) -> Result<()> {
+    fn switch_workspace(&mut self, target: WorkspaceId, _view: Option<ordo_core::VirtualMonitorId>) -> Result<()> {
         self.drive_all_displays(target)?;
         if self.await_target(target) {
             return Ok(());

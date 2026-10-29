@@ -12,7 +12,7 @@ fn main() {
         .and_then(|a| a.parse().ok())
         .unwrap_or(2);
     let backend = native_backend();
-    let result = backend.borrow_mut().switch_workspace(WorkspaceId(target));
+    let result = backend.borrow_mut().switch_workspace(WorkspaceId(target), None);
     match result {
         Ok(()) => println!("switched all displays to workspace {target} — verified."),
         Err(e) => println!("switch to {target} failed: {e}"),

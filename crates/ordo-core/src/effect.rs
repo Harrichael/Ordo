@@ -11,9 +11,14 @@ use crate::ids::{MonitorId, OpId, Point, Rect, VirtualMonitorId, WindowId, Works
 pub enum Effect {
     /// Bring EVERY display to its `target`-th workspace. Workspaces span all
     /// monitors by definition, so there is no per-monitor switch effect.
+    /// `view`: make it the anchor too, in the same change, so the windows
+    /// the switch reveals on the old anchor's monitor are never shown only
+    /// to be parked again by a view change after it.
     SwitchWorkspace {
         op: OpId,
         target: WorkspaceId,
+        #[serde(default)]
+        view: Option<VirtualMonitorId>,
     },
     /// Move one window to a workspace, including whatever visible change
     /// that implies (the emulated backend parks or restores it). The

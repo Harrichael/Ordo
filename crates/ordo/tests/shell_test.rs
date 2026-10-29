@@ -118,6 +118,7 @@ impl FakeOs {
                 virtual_monitors: Some(VirtualMonitorsWord {
                     view: self.view,
                     assignments: self.monitors.clone(),
+                    workspace_views: None,
                 }),
             },
             monitors,
@@ -161,7 +162,12 @@ impl Effector for FakeEffector {
     fn execute(&mut self, effect: &Effect) -> Option<OpOutcome> {
         let mut os = self.0.borrow_mut();
         match effect {
-            Effect::SwitchWorkspace { target, .. } => os.active = *target,
+            Effect::SwitchWorkspace { target, view, .. } => {
+                os.active = *target;
+                if let Some(vm) = view {
+                    os.view.viewed = *vm;
+                }
+            }
             Effect::MoveWindowToWorkspace { window, target, .. }
             | Effect::AssignWindowToWorkspace { window, target, .. } => {
                 os.assignments.insert(*window, *target);

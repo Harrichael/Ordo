@@ -218,6 +218,10 @@ pub struct State {
     /// the virtual one rather than a second code path.
     #[serde(default)]
     pub virtual_monitors: Option<VirtualMonitors>,
+    /// Mirrored from the backend's word, like `virtual_monitors`; see
+    /// [`crate::VirtualMonitorsWord::workspace_views`].
+    #[serde(default)]
+    pub workspace_views: Option<BTreeMap<WorkspaceId, VirtualMonitorId>>,
     pub windows: BTreeMap<WindowId, WindowRecord>,
     /// OBSERVED key window. Mirrors the world every snapshot, undamped and
     /// uncorrected; its declared twin is `focus_intent`.
@@ -335,6 +339,7 @@ impl State {
             monitor_ws: BTreeMap::new(),
             monitors: BTreeMap::new(),
             virtual_monitors: None,
+            workspace_views: None,
             windows: BTreeMap::new(),
             focused: None,
             focus_intent: FocusIntent::Deferred,
@@ -514,9 +519,15 @@ impl State {
     /// `declared_vmonitor_of`, whose numbering it shares. An add is left
     /// out: it changes nothing on screen (see `anchor_after_add`).
     pub fn declared_projection(&self) -> Projection {
-        let Some(mut v) = self.virtual_monitors else {
-            return self.projection();
-        };
+        match self.declared_view() {
+            Some(v) => project(v.count, v.viewed, v.enabled, self.monitors.len()),
+            None => self.projection(),
+        }
+    }
+
+    /// The layout `declared_projection` projects.
+    pub fn declared_view(&self) -> Option<VirtualMonitors> {
+        let mut v = self.virtual_monitors?;
         for p in &self.pending {
             match p.expect {
                 Expectation::Viewing(t) => v.viewed = t,
@@ -529,7 +540,7 @@ impl State {
                 _ => {}
             }
         }
-        project(v.count, v.viewed, v.enabled, self.monitors.len())
+        Some(v)
     }
 
     /// The monitor the user is "at": the focused window's monitor, falling

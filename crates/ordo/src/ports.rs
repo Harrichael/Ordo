@@ -159,6 +159,10 @@ pub trait Effector {
     /// The user's setting for when apps are hidden; for the workspace
     /// backend. Default no-op.
     fn set_hiding(&mut self, _hiding: Hiding) {}
+
+    /// The user's setting for whether each workspace keeps its own view;
+    /// for the workspace backend. Default no-op.
+    fn set_own_views(&mut self, _on: bool) {}
 }
 
 /// One restack's timing breakdown. The point is the question it exists to

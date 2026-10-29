@@ -274,6 +274,10 @@ pub struct EmulatedWorkspaces {
     hiding: Hiding,
     /// The setting changed since the last pass judged which apps to hide.
     hiding_changed: bool,
+    /// Each workspace keeps its own view: the user's setting. This model
+    /// only reports it with the views; the core is what brings a
+    /// workspace's view along on a switch.
+    own_views: bool,
     /// The apps hidden right now, as far as this model knows: the ones it
     /// hid, and ones found hidden with nothing on screen. Hiding is Ordo's
     /// alone. An app hidden any other way while it has a window on screen is
@@ -314,6 +318,7 @@ impl EmulatedWorkspaces {
             hides_due: None,
             hiding: Hiding::default(),
             hiding_changed: false,
+            own_views: false,
             hidden_apps: None,
             visibility_news: Vec::new(),
             trace: Vec::new(),
@@ -358,6 +363,15 @@ impl EmulatedWorkspaces {
 
     pub fn window_ws(&self) -> BTreeMap<WindowId, WorkspaceId> {
         self.ledger.window_ws()
+    }
+
+    /// The view each workspace was last left with, while each keeps its own.
+    pub fn workspace_views(&self) -> Option<BTreeMap<WorkspaceId, VirtualMonitorId>> {
+        self.own_views.then(|| self.ledger.views())
+    }
+
+    pub fn set_own_views(&mut self, on: bool) {
+        self.own_views = on;
     }
 
     pub fn window_monitors(&self) -> BTreeMap<WindowId, VirtualMonitorId> {
@@ -706,11 +720,19 @@ impl EmulatedWorkspaces {
         );
     }
 
-    pub fn switch_workspace(&mut self, d: &dyn Desktop, target: WorkspaceId) {
+    pub fn switch_workspace(
+        &mut self,
+        d: &dyn Desktop,
+        target: WorkspaceId,
+        view: Option<VirtualMonitorId>,
+    ) {
         // Before the ledger moves: afterwards `current` IS the target.
         let from = self.ledger.current();
-        let plan = self.ledger.switch(target);
-        let boundary = ParkTrace::new(WindowId(0), ParkTraceKind::Switch).ws(from, target);
+        let plan = self.ledger.switch(target, view);
+        let mut boundary = ParkTrace::new(WindowId(0), ParkTraceKind::Switch).ws(from, target);
+        if let Some(vm) = view {
+            boundary = boundary.detail(format!("anchor {}", vm.0));
+        }
         self.apply_plan(d, plan, boundary);
     }
 
@@ -899,6 +921,7 @@ impl EmulatedWorkspaces {
                 self.ledger.monitors(),
                 self.ledger.physical(),
                 BTreeMap::new(),
+                self.ledger.views(),
             );
             self.saved.clear();
             self.home.clear();
@@ -941,6 +964,7 @@ impl EmulatedWorkspaces {
                     self.ledger.monitors(),
                     self.ledger.physical(),
                     merged.assign,
+                    self.ledger.views(),
                 );
                 // Cheap assertion of the parked ⊆ assigned invariant (restore
                 // clamps rather than drops, so this always holds today — a
@@ -1421,7 +1445,14 @@ impl EmulatedWorkspaces {
             viewed: ps.viewed,
             enabled: ps.virtual_monitors_enabled,
         };
-        self.ledger = Ledger::restore(count, ps.current, monitors, self.ledger.physical(), claims);
+        self.ledger = Ledger::restore(
+            count,
+            ps.current,
+            monitors,
+            self.ledger.physical(),
+            claims,
+            ps.workspace_views.clone(),
+        );
         self.learn_monitors = !ps.monitors_assigned;
         self.saved.clear();
         self.home.clear();
@@ -1475,6 +1506,7 @@ impl EmulatedWorkspaces {
                 virtual_monitor_count: m.count,
                 // Once learned (or never in doubt), they are declarations.
                 monitors_assigned: !self.learn_monitors,
+                workspace_views: self.ledger.views(),
                 windows,
             },
         );
@@ -2660,13 +2692,13 @@ mod tests {
         assert!(in_park_corner(&d.frame(w(2)), &geo()));
 
         // …and switching there parks w1 and puts w2 back where it was.
-        b.switch_workspace(&d, ws(2));
+        b.switch_workspace(&d, ws(2), None);
         assert_eq!(b.current(), ws(2));
         assert!(in_park_corner(&d.frame(w(1)), &geo()));
         assert_eq!(d.frame(w(2)), rect(300.0, 200.0));
 
         // Round home: both windows end at their original frames.
-        b.switch_workspace(&d, ws(1));
+        b.switch_workspace(&d, ws(1), None);
         assert_eq!(d.frame(w(1)), rect(100.0, 100.0));
         assert!(in_park_corner(&d.frame(w(2)), &geo()));
     }
@@ -2687,7 +2719,7 @@ mod tests {
         let mut b = EmulatedWorkspaces::new(3);
         b.note_scan(&d, &d.scan(), &d.screens(), None);
         b.assign_window_to_workspace(w(2), ws(2)).unwrap();
-        b.switch_workspace(&d, ws(2));
+        b.switch_workspace(&d, ws(2), None);
         d.yank_on_hide.set(true);
         d.hide_app(Pid(10)); // AppKit's pull, while the app stays hidden
         b.note_app_visibility(Pid(10), true); // as the observer reports it
@@ -2716,7 +2748,7 @@ mod tests {
         b.assign_window_to_workspace(w(2), ws(2)).unwrap();
         b.take_trace();
 
-        b.switch_workspace(&d, ws(2)); // ws1 -> ws2: park w1, restore w2
+        b.switch_workspace(&d, ws(2), None); // ws1 -> ws2: park w1, restore w2
         let trace = b.take_trace();
 
         let sw = trace
@@ -2782,7 +2814,7 @@ mod tests {
         );
         b.take_trace();
 
-        b.switch_workspace(&d, ws(2));
+        b.switch_workspace(&d, ws(2), None);
 
         assert_eq!(
             d.frame(w(1)),
@@ -2859,7 +2891,7 @@ mod tests {
         // physically a sliver. The promise must keep substituting, which is
         // exactly why `saved` outlives the parked flag.
         d.freeze();
-        b.switch_workspace(&d, ws(2));
+        b.switch_workspace(&d, ws(2), None);
         let frames = d.scan();
         let believed = b.believed_frames(&frames, &d.screens(), d.now());
         assert_eq!(believed.get(&w(1)), Some(&rect(100.0, 100.0)));
@@ -2931,9 +2963,9 @@ mod tests {
             let d = FakeDesktop::new(&[(w(1), Pid(10), rect(100.0, 100.0)), (w(4), Pid(40), spot)]);
             let mut b = EmulatedWorkspaces::new(3);
             rescan(&d, &mut b);
-            b.switch_workspace(&d, ws(2));
+            b.switch_workspace(&d, ws(2), None);
             assert!(in_park_corner(&d.frame(w(4)), &geo()));
-            b.switch_workspace(&d, ws(1));
+            b.switch_workspace(&d, ws(1), None);
             assert_eq!(d.frame(w(4)), spot);
         }
     }
@@ -3006,9 +3038,9 @@ mod tests {
                 "the park shrank the window (round {round})"
             );
             assert_eq!(b.saved[&w(1)], tall, "the promise shrank (round {round})");
-            b.switch_workspace(&d, ws(2)); // restore
+            b.switch_workspace(&d, ws(2), None); // restore
             assert_eq!(d.frame(w(1)), tall, "came back short (round {round})");
-            b.switch_workspace(&d, ws(1)); // park again
+            b.switch_workspace(&d, ws(1), None); // park again
         }
         assert_eq!(d.frame(w(1)).h, tall.h);
     }
@@ -3083,7 +3115,7 @@ mod tests {
         };
         d.place(w(1), shrunk);
 
-        b.switch_workspace(&d, ws(2));
+        b.switch_workspace(&d, ws(2), None);
         assert_eq!(
             d.frame(w(1)),
             Rect { h: 923.0, ..tall },
@@ -3093,7 +3125,7 @@ mod tests {
 
         // Parking again captures the window as it is — nothing keeps dragging
         // the stale height along, so one user resize is all the repair takes.
-        b.switch_workspace(&d, ws(1));
+        b.switch_workspace(&d, ws(1), None);
         assert_eq!(b.saved[&w(1)], Rect { h: 923.0, ..tall });
     }
 
@@ -3125,11 +3157,11 @@ mod tests {
         rescan(&d, &mut b);
         assert!(in_park_corner(&d.frame(w(1)), &geo()), "still parked off this workspace");
 
-        b.switch_workspace(&d, ws(2));
+        b.switch_workspace(&d, ws(2), None);
         assert_eq!(d.frame(w(1)), reminder);
 
         // Hidden and hauled back in sideways by AppKit: the promise holds.
-        b.switch_workspace(&d, ws(1));
+        b.switch_workspace(&d, ws(1), None);
         d.yank_on_hide.set(true);
         d.hide_app(Pid(10));
         rescan(&d, &mut b);
@@ -3231,8 +3263,8 @@ mod tests {
         // carry must respect where the user put it — honoring the stale
         // promise teleported carried windows back to their old frame.
         b.move_window_to_workspace(&d, w(2), ws(2)).unwrap();
-        b.switch_workspace(&d, ws(2));
-        b.switch_workspace(&d, ws(1)); // w1 parked and restored; promise lingers
+        b.switch_workspace(&d, ws(2), None);
+        b.switch_workspace(&d, ws(1), None); // w1 parked and restored; promise lingers
         let placed = rect(700.0, 400.0);
         d.place(w(1), placed);
 
@@ -3243,11 +3275,11 @@ mod tests {
         assert!(!b.parked.contains(&w(1)));
 
         // …then the switch finds it already a resident: nothing moves it.
-        b.switch_workspace(&d, ws(2));
+        b.switch_workspace(&d, ws(2), None);
         assert_eq!(d.frame(w(1)), placed, "still where the user put it");
 
         // And leaving again parks it with a FRESH promise.
-        b.switch_workspace(&d, ws(1));
+        b.switch_workspace(&d, ws(1), None);
         assert!(in_park_corner(&d.frame(w(1)), &geo()));
         assert_eq!(b.saved[&w(1)], placed);
     }
@@ -3360,7 +3392,7 @@ mod tests {
         assert_eq!(standoffs[0].window, w(1));
 
         // The kept declaration is what makes the user's next switch heal it.
-        b.switch_workspace(&d, ws(2));
+        b.switch_workspace(&d, ws(2), None);
         assert_eq!(d.frame(w(1)), rect(100.0, 100.0), "restored to its promise");
     }
 
@@ -3413,7 +3445,7 @@ mod tests {
 
             // The promise stayed the window's real frame, so it comes back
             // whole.
-            b.switch_workspace(&d, ws(2));
+            b.switch_workspace(&d, ws(2), None);
             assert_eq!(d.frame(w(1)), rect(100.0, 100.0));
         }
     }
@@ -3437,7 +3469,7 @@ mod tests {
         b.move_window_to_workspace(&d, w(1), ws(2)).unwrap(); // sliver guard: no promise
         assert!(!b.saved.contains_key(&w(1)));
 
-        b.switch_workspace(&d, ws(2)); // restore re-homes it to main's origin
+        b.switch_workspace(&d, ws(2), None); // restore re-homes it to main's origin
         let rehomed = d.frame(w(1));
         assert!(!in_park_corner(&rehomed, &geo()));
 
@@ -3537,7 +3569,7 @@ mod tests {
         };
         b.saved.insert(w(1), poisoned);
 
-        b.switch_workspace(&d, ws(2));
+        b.switch_workspace(&d, ws(2), None);
         let restored = d.frame(w(1));
         assert!(
             !in_park_corner(&restored, &geo()),
@@ -3580,7 +3612,7 @@ mod tests {
             // A docked frame outranks the promise; only the promise is at issue.
             b.home.remove(&w(1));
 
-            b.switch_workspace(&d, ws(2));
+            b.switch_workspace(&d, ws(2), None);
             let restored = d.frame(w(1));
             if rehomes {
                 assert!(
@@ -3614,6 +3646,7 @@ mod tests {
             virtual_monitors_enabled: true,
             virtual_monitor_count: 2,
             monitors_assigned: true,
+            workspace_views: BTreeMap::new(),
             windows: vec![
                 // Parked pre-R, never seen by the fresh session.
                 pw(10, 3, Some(rect(10.0, 20.0))),
@@ -3703,12 +3736,12 @@ mod tests {
         let mut b = EmulatedWorkspaces::new(3);
         rescan(&d, &mut b);
         b.assign_window_to_workspace(w(2), ws(2)).unwrap();
-        b.switch_workspace(&d, ws(2));
+        b.switch_workspace(&d, ws(2), None);
         rescan(&d, &mut b);
 
         d.queueing.set(true);
-        b.switch_workspace(&d, ws(1));
-        b.switch_workspace(&d, ws(2));
+        b.switch_workspace(&d, ws(1), None);
+        b.switch_workspace(&d, ws(2), None);
         d.land_queued();
 
         assert!(in_park_corner(&d.frame(w(1)), &geo()), "{:?}", d.frame(w(1)));
@@ -3729,13 +3762,13 @@ mod tests {
         let mut b = EmulatedWorkspaces::new(3);
         rescan(&d, &mut b);
         b.assign_window_to_workspace(w(2), ws(2)).unwrap();
-        b.switch_workspace(&d, ws(2));
-        b.switch_workspace(&d, ws(1));
+        b.switch_workspace(&d, ws(2), None);
+        b.switch_workspace(&d, ws(1), None);
         rescan(&d, &mut b);
 
         d.queueing.set(true);
-        b.switch_workspace(&d, ws(2));
-        b.switch_workspace(&d, ws(1));
+        b.switch_workspace(&d, ws(2), None);
+        b.switch_workspace(&d, ws(1), None);
         d.land_queued();
         rescan(&d, &mut b);
 
@@ -3757,14 +3790,14 @@ mod tests {
         rescan(&d, &mut b);
         b.assign_window_to_workspace(w(2), ws(2)).unwrap();
         b.assign_window_to_workspace(w(3), ws(3)).unwrap();
-        b.switch_workspace(&d, ws(2));
-        b.switch_workspace(&d, ws(1));
+        b.switch_workspace(&d, ws(2), None);
+        b.switch_workspace(&d, ws(1), None);
         rescan(&d, &mut b);
 
         d.queueing.set(true);
-        b.switch_workspace(&d, ws(2));
-        b.switch_workspace(&d, ws(3));
-        b.switch_workspace(&d, ws(2));
+        b.switch_workspace(&d, ws(2), None);
+        b.switch_workspace(&d, ws(3), None);
+        b.switch_workspace(&d, ws(2), None);
         d.land_queued();
         rescan(&d, &mut b);
 
@@ -3784,7 +3817,7 @@ mod tests {
         let mut b = EmulatedWorkspaces::new(3);
         rescan(&d, &mut b);
         b.assign_window_to_workspace(w(2), ws(2)).unwrap();
-        b.switch_workspace(&d, ws(2));
+        b.switch_workspace(&d, ws(2), None);
         d.settle(&mut b);
         assert!(d.is_hidden(Pid(10)));
 
@@ -3805,11 +3838,11 @@ mod tests {
         let mut b = EmulatedWorkspaces::new(3);
         rescan(&d, &mut b);
         b.assign_window_to_workspace(w(2), ws(2)).unwrap();
-        b.switch_workspace(&d, ws(2));
+        b.switch_workspace(&d, ws(2), None);
         rescan(&d, &mut b);
 
         d.queueing.set(true);
-        b.switch_workspace(&d, ws(1));
+        b.switch_workspace(&d, ws(1), None);
         let parks: Vec<(WindowId, bool)> =
             d.queue.borrow().iter().map(|m| (m.window, m.parks)).collect();
         assert!(parks.contains(&(w(2), true)), "{parks:?}");
@@ -3926,7 +3959,7 @@ mod tests {
         assert!(in_park_corner(&d.frame(w(2)), &geo()));
         assert!(!d.is_hidden(Pid(20)));
 
-        b.switch_workspace(&d, ws(2));
+        b.switch_workspace(&d, ws(2), None);
         d.settle(&mut b);
         assert!(d.is_hidden(Pid(10)));
         assert!(d.is_hidden(Pid(20)));
@@ -3943,7 +3976,7 @@ mod tests {
         let mut b = EmulatedWorkspaces::new(3);
         rescan(&d, &mut b);
         b.assign_window_to_workspace(w(2), ws(2)).unwrap();
-        b.switch_workspace(&d, ws(2));
+        b.switch_workspace(&d, ws(2), None);
         d.settle(&mut b);
         assert!(d.is_hidden(Pid(10)));
 
@@ -3952,7 +3985,7 @@ mod tests {
         assert!(!d.is_hidden(Pid(10)));
         assert!(in_park_corner(&d.frame(w(1)), &geo()), "held where it was parked");
 
-        b.switch_workspace(&d, ws(1));
+        b.switch_workspace(&d, ws(1), None);
         d.settle(&mut b);
         assert!(!d.is_hidden(Pid(20)));
         assert!(in_park_corner(&d.frame(w(2)), &geo()));
@@ -3970,7 +4003,7 @@ mod tests {
         rescan(&d, &mut b);
         b.set_hiding(Hiding { when: HideWhen::Delayed, ..Hiding::default() });
         b.assign_window_to_workspace(w(2), ws(2)).unwrap();
-        b.switch_workspace(&d, ws(2));
+        b.switch_workspace(&d, ws(2), None);
         d.settle(&mut b);
         assert!(!d.is_hidden(Pid(10)));
 
@@ -3992,7 +4025,7 @@ mod tests {
         let mut b = EmulatedWorkspaces::new(3);
         rescan(&d, &mut b);
         d.front.set(Some(Pid(30)));
-        b.switch_workspace(&d, ws(2));
+        b.switch_workspace(&d, ws(2), None);
         d.settle(&mut b);
         assert!(d.is_hidden(Pid(10)));
         assert!(!d.is_hidden(Pid(30)), "the front app is spared");
@@ -4010,14 +4043,14 @@ mod tests {
         d.unhideable.borrow_mut().insert(Pid(40));
         let mut b = EmulatedWorkspaces::new(3);
         rescan(&d, &mut b);
-        b.switch_workspace(&d, ws(2));
+        b.switch_workspace(&d, ws(2), None);
         d.settle(&mut b);
         assert!(in_park_corner(&d.frame(w(4)), &geo()));
         assert!(d.is_hidden(Pid(10)));
         assert!(!d.is_hidden(Pid(40)));
         b.take_trace();
 
-        b.switch_workspace(&d, ws(1));
+        b.switch_workspace(&d, ws(1), None);
         assert_eq!(d.frame(w(4)), rect(300.0, 300.0));
         let unhid_40 = b.take_trace().iter().any(|t| {
             t.kind == ParkTraceKind::AppShown
@@ -4043,8 +4076,8 @@ mod tests {
         rescan(&d, &mut b);
         b.assign_window_to_workspace(w(2), ws(2)).unwrap();
         b.assign_window_to_workspace(w(3), ws(3)).unwrap();
-        b.switch_workspace(&d, ws(2));
-        b.switch_workspace(&d, ws(3));
+        b.switch_workspace(&d, ws(2), None);
+        b.switch_workspace(&d, ws(3), None);
         d.settle(&mut b);
         assert!(d.is_hidden(Pid(10)));
 
@@ -4053,7 +4086,7 @@ mod tests {
         d.place(w(2), rect(0.0, 200.0));
         b.take_trace();
 
-        b.switch_workspace(&d, ws(1));
+        b.switch_workspace(&d, ws(1), None);
 
         assert_eq!(d.frame(w(1)), rect(100.0, 100.0));
         assert!(in_park_corner(&d.frame(w(2)), &geo()), "{:?}", d.frame(w(2)));
@@ -4101,7 +4134,7 @@ mod tests {
         rescan(&d, &mut b);
         assert!(d.is_hidden(Pid(20)));
 
-        b.switch_workspace(&d, ws(2));
+        b.switch_workspace(&d, ws(2), None);
         assert!(!d.is_hidden(Pid(20)));
         assert_eq!(d.frame(w(2)), rect(300.0, 200.0));
     }
@@ -4121,8 +4154,8 @@ mod tests {
         rescan(&d, &mut b);
         d.hidden.borrow_mut().insert(Pid(10));
 
-        b.switch_workspace(&d, ws(2));
-        b.switch_workspace(&d, ws(1));
+        b.switch_workspace(&d, ws(2), None);
+        b.switch_workspace(&d, ws(1), None);
 
         assert!(!d.is_hidden(Pid(10)));
     }
@@ -4140,13 +4173,13 @@ mod tests {
         rescan(&d, &mut b);
         b.assign_window_to_workspace(w(2), ws(2)).unwrap();
         b.assign_window_to_workspace(w(3), ws(2)).unwrap();
-        b.switch_workspace(&d, ws(2));
-        b.switch_workspace(&d, ws(1));
+        b.switch_workspace(&d, ws(2), None);
+        b.switch_workspace(&d, ws(1), None);
         d.settle(&mut b);
         assert!(d.is_hidden(Pid(20)));
         d.asked.set(0);
 
-        b.switch_workspace(&d, ws(2));
+        b.switch_workspace(&d, ws(2), None);
 
         assert_eq!(d.asked.get(), 1, "Pid(20), which Ordo hid; not Pid(10)");
         assert!(!d.is_hidden(Pid(20)));
@@ -4165,10 +4198,10 @@ mod tests {
         rescan(&d, &mut b);
         b.assign_window_to_workspace(w(2), ws(2)).unwrap();
 
-        b.switch_workspace(&d, ws(2));
+        b.switch_workspace(&d, ws(2), None);
         rescan(&d, &mut b);
         assert!(!d.is_hidden(Pid(10)), "not yet: the user may be passing through");
-        b.switch_workspace(&d, ws(1));
+        b.switch_workspace(&d, ws(1), None);
         d.settle(&mut b);
         assert!(!d.is_hidden(Pid(10)));
         assert!(d.is_hidden(Pid(20)), "the app left behind once settled is");
@@ -4274,8 +4307,8 @@ mod tests {
     /// user switched away and back).
     fn restored_then_found_at_its_park() -> (FakeDesktop, EmulatedWorkspaces) {
         let (d, mut b) = rig();
-        b.switch_workspace(&d, ws(2));
-        b.switch_workspace(&d, ws(1));
+        b.switch_workspace(&d, ws(2), None);
+        b.switch_workspace(&d, ws(1), None);
         assert_eq!(d.frame(w(1)), rect(100.0, 100.0), "the restore landed");
         d.place(w(1), park_frame(d.frame(w(1)), &geo()));
         b.take_trace();
@@ -4440,6 +4473,7 @@ mod tests {
                 virtual_monitors_enabled: true,
                 virtual_monitor_count: 2,
                 monitors_assigned: false,
+                workspace_views: BTreeMap::new(),
                 windows: vec![
                     pw(1, 1, None),
                     pw(2, 1, None),
@@ -4486,6 +4520,7 @@ mod tests {
             virtual_monitors_enabled: true,
             virtual_monitor_count: 2,
             monitors_assigned: true,
+            workspace_views: BTreeMap::new(),
             windows: vec![PersistedWindow {
                 id: w(7),
                 workspace: ws(2),

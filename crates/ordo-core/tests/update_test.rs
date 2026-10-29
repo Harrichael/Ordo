@@ -2,6 +2,8 @@
 //! the emitted effects and resulting state. Internals (diffing, pendings) are
 //! exercised only through that surface, so they stay free to change.
 
+use std::collections::BTreeMap;
+
 use ordo_core::*;
 
 // --- fixtures -------------------------------------------------------------
@@ -201,6 +203,7 @@ fn world_view(
             assignments: windows.iter().map(|w| (w.snap.id, w.workspace)).collect(),
             virtual_monitors: Some(VirtualMonitorsWord {
                 view,
+                workspace_views: None,
                 assignments: windows
                     .iter()
                     .map(|w| {
@@ -5862,4 +5865,46 @@ fn a_rehome_ahead_of_the_display_removal_is_never_adopted() {
     assert_eq!(later.windows[&wid(2)].vmonitor, vm(2));
     let view = update(&later, &hotkey(HotkeyAction::ViewMonitorNext));
     assert_eq!(focus_targets(&view.effects), vec![wid(2)], "Slack comes up on monitor 2");
+}
+
+/// A laptop with two virtual monitors, each workspace worked on its own:
+/// ws 1's window on monitor 1, ws 2's on monitor 2, and the user on ws 1.
+/// Where each workspace keeps its own view, the switch to 2 views monitor 2
+/// as part of the switch, and ws 2's window takes focus. Where the view is
+/// global, the switch leaves it on monitor 1, so ws 2 shows nothing there
+/// and its desktop takes focus.
+#[test]
+fn a_switch_views_the_destinations_own_monitor_where_each_workspace_keeps_one() {
+    let windows = vec![
+        win(1, 100, 1, rect(100.0, 100.0)),
+        on_monitor(win(2, 200, 2, rect(600.0, 100.0)), 2),
+    ];
+    let on_ws1 = |views: Option<BTreeMap<WorkspaceId, VirtualMonitorId>>| {
+        let mut snap = world_view(laptop(1, true), &[mon_a(1)], &windows, Some(1));
+        snap.workspaces.virtual_monitors.as_mut().unwrap().workspace_views = views;
+        let seen = Event::WorldObserved {
+            at: ts(),
+            trigger: RescanTrigger::Startup,
+            snap,
+        };
+        update(&State::new(), &seen).state
+    };
+    let to_2 = hotkey(HotkeyAction::WorkspaceSwitchTo(ws(2)));
+    let switch_views = |step: &Step| {
+        step.effects
+            .iter()
+            .find_map(|e| match e {
+                Effect::SwitchWorkspace { target, view, .. } if *target == ws(2) => Some(*view),
+                _ => None,
+            })
+            .expect("a switch to ws 2")
+    };
+
+    let own = update(&on_ws1(Some(BTreeMap::from([(ws(1), vm(1)), (ws(2), vm(2))]))), &to_2);
+    assert_eq!(switch_views(&own), Some(vm(2)));
+    assert_eq!(own.state.focus_intent(), FocusIntent::Window(wid(2)));
+
+    let global = update(&on_ws1(None), &to_2);
+    assert_eq!(switch_views(&global), None);
+    assert_eq!(global.state.focus_intent(), FocusIntent::Desktop);
 }

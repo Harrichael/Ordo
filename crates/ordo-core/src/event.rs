@@ -397,6 +397,11 @@ pub struct WorkspaceSnap {
 pub struct VirtualMonitorsWord {
     pub view: VirtualMonitors,
     pub assignments: std::collections::BTreeMap<WindowId, VirtualMonitorId>,
+    /// `Some` while each workspace keeps its own view (a setting): the
+    /// monitor last viewed on each workspace that has been visited. `None`
+    /// while the view is global.
+    #[serde(default)]
+    pub workspace_views: Option<std::collections::BTreeMap<WorkspaceId, VirtualMonitorId>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]

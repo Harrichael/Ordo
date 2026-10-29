@@ -89,10 +89,11 @@ pub trait WorkspaceBackend {
         user_monitor: Option<VirtualMonitorId>,
     ) -> Result<BackendTopology>;
 
-    /// Bring every display to its `target`-th workspace. Blocking and
-    /// self-verifying: the implementation re-reads and retries once before
-    /// returning an honest result.
-    fn switch_workspace(&mut self, target: WorkspaceId) -> Result<()>;
+    /// Bring every display to its `target`-th workspace, anchored on `view`
+    /// if given (only a backend with a virtual layer is ever given one).
+    /// Blocking and self-verifying: the implementation re-reads and retries
+    /// once before returning an honest result.
+    fn switch_workspace(&mut self, target: WorkspaceId, view: Option<VirtualMonitorId>) -> Result<()>;
 
     /// Move one window to a workspace, including whatever visible change that
     /// implies (emulated: park/restore writes).
@@ -176,6 +177,10 @@ pub trait WorkspaceBackend {
     /// The user's setting for when apps are hidden. Native hides nothing;
     /// default no-op.
     fn set_hiding(&mut self, _hiding: Hiding) {}
+
+    /// The user's setting for whether each workspace keeps its own view.
+    /// Native has no virtual monitors; default no-op.
+    fn set_own_views(&mut self, _on: bool) {}
 
     /// About to bring this app to the front, which un-hides it: if this
     /// backend hid it, the windows it has parked and where, to hold through

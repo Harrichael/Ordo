@@ -66,6 +66,10 @@ impl Effector for MacEffector {
         self.backend.borrow_mut().set_hiding(hiding);
     }
 
+    fn set_own_views(&mut self, on: bool) {
+        self.backend.borrow_mut().set_own_views(on);
+    }
+
     fn execute(&mut self, effect: &Effect) -> Option<OpOutcome> {
         // These change what is on screen, so the order in flight is stale
         // before the new one is submitted after them: left running, its
@@ -115,8 +119,8 @@ impl Effector for MacEffector {
                 }
                 Some(found_outcome(owner.is_some(), "set_frame: window not found"))
             }
-            Effect::SwitchWorkspace { target, .. } => Some(result_outcome(
-                self.backend.borrow_mut().switch_workspace(*target),
+            Effect::SwitchWorkspace { target, view, .. } => Some(result_outcome(
+                self.backend.borrow_mut().switch_workspace(*target, *view),
             )),
             Effect::MoveWindowToWorkspace { window, target, .. } => Some(result_outcome(
                 self.backend

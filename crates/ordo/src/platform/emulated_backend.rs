@@ -157,12 +157,13 @@ impl WorkspaceBackend for EmulatedBackend {
             virtual_monitors: Some(VirtualMonitorsWord {
                 view: self.model.monitors(),
                 assignments: self.model.window_monitors(),
+                workspace_views: self.model.workspace_views(),
             }),
         })
     }
 
-    fn switch_workspace(&mut self, target: WorkspaceId) -> Result<()> {
-        self.model.switch_workspace(&self.desktop, target);
+    fn switch_workspace(&mut self, target: WorkspaceId, view: Option<VirtualMonitorId>) -> Result<()> {
+        self.model.switch_workspace(&self.desktop, target, view);
         Ok(())
     }
 
@@ -238,6 +239,10 @@ impl WorkspaceBackend for EmulatedBackend {
 
     fn set_hiding(&mut self, hiding: ordo_emulated::Hiding) {
         self.model.set_hiding(hiding);
+    }
+
+    fn set_own_views(&mut self, on: bool) {
+        self.model.set_own_views(on);
     }
 
     fn reveal_for_focus(&mut self, pid: Pid) -> Option<Vec<(WindowId, ordo_core::Point)>> {

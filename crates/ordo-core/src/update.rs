@@ -217,7 +217,10 @@ pub fn update(state: &State, event: &Event) -> Step {
 /// reads belief, not declarations, on purpose: a window handed focus must be
 /// on screen now. `desired_stack` reads declarations.
 fn mru_stack(s: &State, ws: WorkspaceId) -> Vec<WindowId> {
-    let proj = s.projection();
+    mru_stack_in(s, ws, &s.projection())
+}
+
+fn mru_stack_in(s: &State, ws: WorkspaceId, proj: &Projection) -> Vec<WindowId> {
     s.focus_order()
         .filter(|w| {
             s.windows
@@ -399,9 +402,10 @@ fn is_focus_grant(e: &Expectation) -> bool {
     matches!(e, Expectation::Focused(_) | Expectation::DesktopFocused)
 }
 
-/// Switch every monitor to `target`. The single emitter, because a switch is
-/// also Ordo's word on where the user is going: it replaces the workspace
-/// intent, and the switch it overtakes can never be confirmed now.
+/// Switch every monitor to `target`, and view `view` with it. The single
+/// emitter, because a switch is also Ordo's word on where the user is going:
+/// it replaces the workspace intent, and the switch it overtakes can never be
+/// confirmed now.
 ///
 /// Floating windows go along: each is declared onto the destination first,
 /// as a carry declares its window, so the switch finds it already a resident
@@ -409,6 +413,7 @@ fn is_focus_grant(e: &Expectation) -> bool {
 fn push_switch(
     s: &mut State,
     target: WorkspaceId,
+    view: Option<VirtualMonitorId>,
     now_ns: u64,
     fx: &mut Vec<Effect>,
     notes: &mut Vec<Note>,
@@ -429,7 +434,7 @@ fn push_switch(
         expect(s, op, on, now_ns, notes);
     }
     let op = s.mint_op();
-    fx.push(Effect::SwitchWorkspace { op, target });
+    fx.push(Effect::SwitchWorkspace { op, target, view });
     supersede(
         s,
         op,
@@ -441,8 +446,23 @@ fn push_switch(
         expect: Expectation::AllMonitorsOn(target),
         issued_ns: now_ns,
     });
+    if let Some(vm) = view.filter(|vm| s.virtual_monitors.is_some_and(|v| v.viewed != *vm)) {
+        s.pending.push(PendingOp {
+            op,
+            expect: Expectation::Viewing(vm),
+            issued_ns: now_ns,
+        });
+    }
     s.workspace_intent = Some((op, target));
     op
+}
+
+/// The monitor a switch to `target` views, when workspaces keep their own
+/// views and `target`'s is not already the one Ordo has declared.
+fn view_on_arrival(s: &State, target: WorkspaceId) -> Option<VirtualMonitorId> {
+    let vm = *s.workspace_views.as_ref()?.get(&target)?;
+    let declared = s.declared_view()?.viewed;
+    (vm != declared).then_some(vm)
 }
 
 /// Wait to see `expect` come true. A window's older move to a workspace is
@@ -972,11 +992,15 @@ fn execute(
             // it never left: the restack puts that head on top, and the top of
             // a restack must be the key window.
             //
-            // Monitor selection is global, so a switch never moves the view —
-            // not even onto a destination whose windows all sit on hidden
-            // monitors. The user chose the monitor they are on; that
-            // destination is empty here, and is treated as any empty one.
-            let head = mru_stack(s, target).first().copied();
+            // The view comes along only where workspaces keep their own (see
+            // `view_on_arrival`). Otherwise monitor selection is global, so a
+            // switch never moves the view — not even onto a destination whose
+            // windows all sit on hidden monitors. The user chose the monitor
+            // they are on; that destination is empty here, and is treated as
+            // any empty one.
+            let view = view_on_arrival(s, target);
+            let proj = s.projection_with(view, None);
+            let head = mru_stack_in(s, target, &proj).first().copied();
             // An empty workspace (here) is still a place to be: the desktop
             // takes focus, as on an empty monitor — the anchor's display, the one
             // a desktop declaration holds and new windows are corralled onto.
@@ -987,10 +1011,10 @@ fn execute(
                 Some(_) => None,
                 None => s
                     .virtual_monitors
-                    .and_then(|v| s.host_of(v.viewed))
+                    .and_then(|v| s.host_in(view.unwrap_or(v.viewed), &proj))
                     .or_else(|| s.focused_monitor()),
             };
-            let op = push_switch(s, target, now_ns, fx, notes);
+            let op = push_switch(s, target, view, now_ns, fx, notes);
             if let Some(fw) = head {
                 // Re-asserting focus the belief already holds produces no
                 // delta, so there is nothing to attribute to an expectation.
@@ -1033,7 +1057,7 @@ fn execute(
                 now_ns,
                 notes,
             );
-            let switch_op = push_switch(s, target, now_ns, fx, notes);
+            let switch_op = push_switch(s, target, None, now_ns, fx, notes);
             (FocusIntent::Window(window), switch_op)
         }
 
@@ -1650,7 +1674,7 @@ fn handle_snapshot(
                 .current_workspace()
                 .filter(|t| t.0 >= 1 && t.0 <= s.workspace_count);
             if let Some(target) = reachable {
-                let op = push_switch(s, target, now_ns, fx, notes);
+                let op = push_switch(s, target, None, now_ns, fx, notes);
                 notes.push(Note::TearDetected { target });
                 s.tear_corrections += 1;
                 last_op = Some(op);
@@ -2271,7 +2295,7 @@ fn enforce_focus(
             let target = rec.workspace;
             let mut op = None;
             if target != here {
-                op = Some(push_switch(s, target, now_ns, fx, notes));
+                op = Some(push_switch(s, target, None, now_ns, fx, notes));
             }
             let mut monitor = None;
             if !s.projection().is_hosted(rec.vmonitor) {
@@ -2445,9 +2469,7 @@ fn handle_effect_result(s: &mut State, op: OpId, outcome: &OpOutcome, notes: &mu
         OpOutcome::Failed { detail } => detail.clone(),
         OpOutcome::Timeout => "timeout".to_string(),
     };
-    if let Some(i) = s.pending.iter().position(|p| p.op == op) {
-        s.pending.remove(i);
-    }
+    s.pending.retain(|p| p.op != op);
     op_ended(s, op);
     notes.push(Note::OpFailed { op, detail });
 }

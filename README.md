@@ -59,7 +59,8 @@ The two rules that make it work:
   after the last tile adds an empty monitor; nothing on screen moves.
   Settings (the gear, last) opens a submenu: Debug mode, which logs the
   stacking order at each step of a switch, for a few ms per switch, and is
-  off at every launch; and when, and for lack of what, apps are hidden.
+  off at every launch; whether each workspace keeps its own monitor; and
+  when, and for lack of what, apps are hidden.
   Dimmed while Ordo is paused. Not shown with
   `--observe`. Preview the design without the daemon:
   `cargo run --example menubar_preview`.
@@ -81,8 +82,10 @@ The two rules that make it work:
 - **Virtual monitors** (emulated backend): every window is declared onto a
   virtual monitor — a position, left to right, not a piece of hardware. With a
   display per monitor they map one to one. With fewer displays (the laptop
-  unplugged), `Cmd+Alt+Left/Right` view the previous/next monitor (no wrap; global,
-  not per workspace), showing its windows and hiding the current one's —
+  unplugged), `Cmd+Alt+Left/Right` view the previous/next monitor (no wrap;
+  global, unless Settings has each workspace keep its own monitor, when a
+  switch comes back to the one last viewed there), showing its windows and
+  hiding the current one's —
   a monitor with nothing on it gets its display's desktop as focus, as a
   click on empty desktop would, so an empty monitor is still a place to be — and
   `Ctrl+Alt+Cmd+V` toggles virtualization: off collapses every monitor onto the

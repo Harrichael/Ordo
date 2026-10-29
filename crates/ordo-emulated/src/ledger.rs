@@ -67,6 +67,10 @@ pub struct Ledger {
     /// planned like any other change.
     physical: usize,
     assign: BTreeMap<WindowId, Claim>,
+    /// The anchor each workspace was last left with: the view it comes back
+    /// to where workspaces keep their own (see [`Ledger::views`]). Kept
+    /// whether or not they do, so turning that on finds them remembered.
+    views: BTreeMap<WorkspaceId, VirtualMonitorId>,
 }
 
 impl Ledger {
@@ -81,6 +85,7 @@ impl Ledger {
             },
             physical: 0,
             assign: BTreeMap::new(),
+            views: BTreeMap::new(),
         }
     }
 
@@ -88,12 +93,15 @@ impl Ledger {
     /// workspaces and monitors are CLAMPED into range rather than dropped: a
     /// config that shrank the workspace count must not silently delete
     /// declarations — the windows land on the nearest surviving one instead.
+    /// A view is only a memory, so one for a workspace that no longer exists
+    /// is dropped.
     pub fn restore(
         count: u8,
         current: WorkspaceId,
         monitors: VirtualMonitors,
         physical: usize,
         assign: BTreeMap<WindowId, Claim>,
+        views: BTreeMap<WorkspaceId, VirtualMonitorId>,
     ) -> Self {
         let count = count.max(1);
         let mcount = monitors.count.max(1);
@@ -109,6 +117,11 @@ impl Ledger {
             },
             physical,
             assign,
+            views: views
+                .into_iter()
+                .filter(|(ws, _)| (1..=count).contains(&ws.0))
+                .map(|(ws, m)| (ws, clamp_m(m)))
+                .collect(),
         };
         for claim in l.assign.values_mut() {
             claim.ws = clamp(claim.ws);
@@ -131,6 +144,14 @@ impl Ledger {
 
     pub fn physical(&self) -> usize {
         self.physical
+    }
+
+    /// The anchor of every workspace visited: the current one's live, the
+    /// others' as they were left.
+    pub fn views(&self) -> BTreeMap<WorkspaceId, VirtualMonitorId> {
+        let mut views = self.views.clone();
+        views.insert(self.current, self.monitors.viewed);
+        views
     }
 
     pub fn window_ws(&self) -> BTreeMap<WindowId, WorkspaceId> {
@@ -256,13 +277,20 @@ impl Ledger {
         }
     }
 
-    /// Plan a switch to `target`. Empty (and a no-op) if target is the current
-    /// workspace or out of range.
-    pub fn switch(&mut self, target: WorkspaceId) -> SwitchPlan {
+    /// Plan a switch to `target`, anchored on `view` if given, in one change.
+    /// Empty (and a no-op) if target is the current workspace or out of
+    /// range; an out-of-range view is ignored.
+    pub fn switch(&mut self, target: WorkspaceId, view: Option<VirtualMonitorId>) -> SwitchPlan {
         if target == self.current || target.0 < 1 || target.0 > self.count {
             return SwitchPlan::default();
         }
-        self.retarget(|l| l.current = target)
+        self.retarget(|l| {
+            l.views.insert(l.current, l.monitors.viewed);
+            l.current = target;
+            if let Some(vm) = view.filter(|vm| (1..=l.monitors.count).contains(&vm.0)) {
+                l.monitors.viewed = vm;
+            }
+        })
     }
 
     /// Plan moving the anchor to `target`. `None` if out of range.
@@ -324,6 +352,9 @@ impl Ledger {
                 c.monitor = after_merge(c.monitor, from, into);
             }
             l.monitors.viewed = after_merge(l.monitors.viewed, from, into);
+            for m in l.views.values_mut() {
+                *m = after_merge(*m, from, into);
+            }
             l.monitors.count = n - 1;
         }))
     }
@@ -356,6 +387,7 @@ impl Ledger {
                 c.ws = moved(c.ws);
             }
             l.current = moved(l.current);
+            l.views = l.views.iter().map(|(ws, m)| (moved(*ws), *m)).collect();
         }))
     }
 
@@ -377,6 +409,9 @@ impl Ledger {
                 c.monitor = moved(c.monitor);
             }
             l.monitors.viewed = moved(l.monitors.viewed);
+            for m in l.views.values_mut() {
+                *m = moved(*m);
+            }
         }))
     }
 
@@ -444,7 +479,7 @@ mod tests {
         l.note_seen(&seen(&[(1, 10), (2, 10)]), first); // both on ws 1
         l.assign_window(w(2), ws(2)); // move w2 to ws 2 (now parked)
 
-        let plan = l.switch(ws(2));
+        let plan = l.switch(ws(2), None);
         assert_eq!(l.current(), ws(2));
         assert_eq!(plan.park, vec![w(1)]); // ws1's window hides
         assert_eq!(plan.restore, vec![w(2)]); // ws2's window reveals
@@ -454,8 +489,8 @@ mod tests {
     fn switching_to_current_or_out_of_range_is_a_noop() {
         let mut l = rig(1);
         l.note_seen(&seen(&[(1, 10)]), first);
-        assert_eq!(l.switch(ws(1)), SwitchPlan::default());
-        assert_eq!(l.switch(ws(9)), SwitchPlan::default());
+        assert_eq!(l.switch(ws(1), None), SwitchPlan::default());
+        assert_eq!(l.switch(ws(9), None), SwitchPlan::default());
         assert_eq!(l.current(), ws(1));
     }
 
@@ -501,6 +536,29 @@ mod tests {
         assert_eq!((replug.park, replug.restore), (vec![], vec![w(1)]));
     }
 
+    /// One display, two monitors, a window on each on both workspaces. A
+    /// switch that brings its own view along is one change: only the
+    /// destination's window on that monitor comes on screen, never its
+    /// window on the monitor being left. The view each workspace was left
+    /// with is remembered, through a renumbering of the workspaces.
+    #[test]
+    fn a_switch_with_a_view_is_one_change_and_each_workspace_keeps_the_view_it_left() {
+        let mut l = rig(2);
+        let on_2 = |id| if id == w(2) || id == w(4) { vm(2) } else { vm(1) };
+        l.note_seen(&seen(&[(1, 10), (2, 10), (3, 10), (4, 10)]), on_2);
+        l.assign_window(w(3), ws(2));
+        l.assign_window(w(4), ws(2));
+        l.note_displays(1);
+
+        let plan = l.switch(ws(2), Some(vm(2)));
+        assert_eq!((plan.park, plan.restore), (vec![w(1)], vec![w(4)]));
+        assert_eq!(l.monitors().viewed, vm(2));
+        assert_eq!(l.views(), BTreeMap::from([(ws(1), vm(1)), (ws(2), vm(2))]));
+
+        l.move_workspace(ws(1), ws(3));
+        assert_eq!(l.views(), BTreeMap::from([(ws(1), vm(2)), (ws(3), vm(1))]));
+    }
+
     #[test]
     fn a_monitor_assignment_plans_like_a_workspace_one() {
         let mut l = rig(1);
@@ -534,7 +592,7 @@ mod tests {
         let mut l = rig(1);
         l.note_seen(&seen(&[(1, 10)]), first);
         l.assign_window(w(1), ws(3));
-        l.switch(ws(2));
+        l.switch(ws(2), None);
         // The id comes back under a different app: adopt here, don't inherit.
         let recycled = l.note_seen(&seen(&[(1, 99)]), first);
         assert_eq!(recycled, vec![w(1)]);
@@ -557,7 +615,7 @@ mod tests {
             viewed: vm(5),
             enabled: false,
         };
-        let l = Ledger::restore(3, ws(7), monitors, 1, claims);
+        let l = Ledger::restore(3, ws(7), monitors, 1, claims, BTreeMap::new());
         assert_eq!(l.current(), ws(3));
         assert_eq!(l.monitors().viewed, vm(2), "anchor clamped");
         assert!(!l.monitors().enabled, "switch kept");
@@ -579,7 +637,7 @@ mod tests {
             },
         )]
         .into();
-        let mut l = Ledger::restore(3, ws(1), Ledger::new(1).monitors(), 1, claims);
+        let mut l = Ledger::restore(3, ws(1), Ledger::new(1).monitors(), 1, claims, BTreeMap::new());
         assert!(l.note_seen(&seen(&[(1, 42)]), first).is_empty());
         assert_eq!(l.window_ws()[&w(1)], ws(2));
         assert_eq!(l.window_claims()[&w(1)].owner, Pid(42));

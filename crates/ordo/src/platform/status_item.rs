@@ -43,7 +43,7 @@ use ordo_core::{Gesture, HotkeyAction};
 use crate::engine::Msg;
 use crate::menubar::{MenuBarView, MonitorsView};
 use crate::platform::monitor_map::MonitorMap;
-use crate::platform::settings::{saved_hiding, Settings};
+use crate::platform::settings::{saved_hiding, saved_own_views, Settings};
 use crate::platform::workspace_list::{Row, WorkspaceList};
 
 /// Image height; the status bar centers it vertically.
@@ -134,6 +134,7 @@ impl MenuBar {
 /// guess before the first snapshot would be the menu bar lying.
 pub fn install(tx: Sender<Msg>, own_menu: OwnMenu) -> MenuBar {
     let _ = tx.send(Msg::Hiding(saved_hiding()));
+    let _ = tx.send(Msg::OwnViews(saved_own_views()));
     MenuBar {
         mailbox: Arc::new(Mailbox {
             latest: Mutex::new(None),

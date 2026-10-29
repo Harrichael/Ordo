@@ -27,6 +27,7 @@
 //! current promises. At reconciler R3 these become Desired's placement
 //! slice — the schema is that data, not backend internals.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -64,6 +65,9 @@ pub struct PersistedState {
     /// from the count.
     #[serde(default)]
     pub monitors_assigned: bool,
+    /// The anchor each workspace was last left with (see the ledger's).
+    #[serde(default)]
+    pub workspace_views: BTreeMap<WorkspaceId, VirtualMonitorId>,
     pub windows: Vec<PersistedWindow>,
 }
 
@@ -183,6 +187,7 @@ mod tests {
             virtual_monitors_enabled: false,
             virtual_monitor_count: 2,
             monitors_assigned: true,
+            workspace_views: BTreeMap::from([(WorkspaceId(1), VirtualMonitorId(1)), (WorkspaceId(2), VirtualMonitorId(2))]),
             windows: vec![
                 PersistedWindow {
                     id: WindowId(7),

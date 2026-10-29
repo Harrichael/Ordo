@@ -89,6 +89,9 @@ pub enum Msg {
     /// The user's setting for when apps are hidden, from the menu's settings
     /// (and once at launch, as saved). Never becomes a core event.
     Hiding(Hiding),
+    /// The user's setting for whether each workspace keeps its own view,
+    /// delivered like `Hiding`. The core reads it from the backend's word.
+    OwnViews(bool),
     /// Stop the loop and close the run. Needed because producer threads (the
     /// event tap) hold sender clones that outlive shutdown, so channel-close
     /// alone can't end the loop.
@@ -128,6 +131,7 @@ fn collapse_rescans(batch: Vec<Msg>) -> Vec<Msg> {
             // on it.
             Msg::AppVisibility(..)
             | Msg::Hiding(_)
+            | Msg::OwnViews(_)
             | Msg::Gesture(Gesture::Key)
             | Msg::Folded(_) => out.push(m),
             fence => {
@@ -430,6 +434,7 @@ impl Engine {
                     self.effector.note_app_visibility(pid, hidden);
                 }
                 Msg::Hiding(hiding) => self.effector.set_hiding(hiding),
+                Msg::OwnViews(on) => self.effector.set_own_views(on),
                 // Nor a key press, which may overtake presses queued in
                 // the same batch: a command after it only clears what it
                 // would have explained. Its look is held like any other,
@@ -482,7 +487,8 @@ impl Engine {
                         | Msg::FreezeDiag(_)
                         | Msg::Folded(_)
                         | Msg::AppVisibility(..)
-                        | Msg::Hiding(_) => {
+                        | Msg::Hiding(_)
+                        | Msg::OwnViews(_) => {
                             unreachable!("handled above")
                         }
                     }
