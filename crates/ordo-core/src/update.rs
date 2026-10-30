@@ -1358,6 +1358,9 @@ fn handle_snapshot(
 
     let deltas = reconcile::diff(pre, snap);
     reconcile::apply_snapshot(s, snap);
+    // And only a landing in it: a hidden window keyed before the gesture
+    // (while a menu tracked, say) is not where the gesture went.
+    let navigation_gesture = navigation_gesture && s.focused != pre.focused;
     keep_vanished_places(pre, s, now_ns);
 
     // Whatever the app keys in the look that closed the focused window is

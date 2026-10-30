@@ -1949,6 +1949,32 @@ fn an_open_menu_is_left_alone_and_the_app_its_item_opens_is_followed() {
     assert_eq!(focus_targets(&fling.effects), vec![wid(1)]);
 }
 
+/// The front app may key its hidden window the moment a menu opens (Chrome
+/// does, for a click on the other display's menu bar). The click that ends
+/// the menu, on a Control Center slider say, did not go there: the window was
+/// keyed before it. Focus comes back to this workspace instead.
+#[test]
+fn a_hidden_window_keyed_while_a_menu_tracked_is_not_followed_after_it() {
+    let mut wins = std_windows();
+    wins[1].workspace = ws(2);
+    let obs = |focused: u32| {
+        observed(
+            vec![mon_a(1), mon_b(1)],
+            wins.clone(),
+            Some(focused),
+            RescanTrigger::Periodic,
+        )
+    };
+    let s = update(&booted(&[1]), &obs(1)).state;
+    let open = update(&s, &gesture(Gesture::MenuBar { at: Point { x: 20.0, y: 10.0 } })).state;
+    let tracking = update(&open, &obs(2)).state;
+
+    let item = update(&tracking, &click(200.0, 200.0)).state;
+    let after = update(&item, &obs(2));
+    assert_eq!(count_switches(&after.effects), 0);
+    assert_eq!(focus_targets(&after.effects), vec![wid(1)]);
+}
+
 #[test]
 fn a_click_into_a_visible_window_does_not_license_a_follow_but_a_click_elsewhere_does() {
     // Same world: w2 parked on workspace 2, w1 (100,100 400x300) visible.
