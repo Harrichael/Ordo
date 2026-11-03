@@ -1107,6 +1107,7 @@ fn the_menu_bar_shows_every_workspace_and_follows_a_pick_from_its_menu() {
                 engaged: true,
                 monitors: Some(on_1),
                 unreachable: Vec::new(),
+                silent: Vec::new(),
                 needs_accessibility: false,
             },
             MenuBarView {
@@ -1115,6 +1116,7 @@ fn the_menu_bar_shows_every_workspace_and_follows_a_pick_from_its_menu() {
                 engaged: true,
                 monitors: Some(on_2.clone()),
                 unreachable: Vec::new(),
+                silent: Vec::new(),
                 needs_accessibility: false,
             },
             MenuBarView {
@@ -1123,6 +1125,7 @@ fn the_menu_bar_shows_every_workspace_and_follows_a_pick_from_its_menu() {
                 engaged: false,
                 monitors: Some(on_2),
                 unreachable: Vec::new(),
+                silent: Vec::new(),
                 needs_accessibility: false,
             },
         ]

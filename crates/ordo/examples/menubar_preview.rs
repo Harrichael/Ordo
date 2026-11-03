@@ -55,6 +55,7 @@ fn main() {
         engaged: !paused,
         monitors: Some(monitors(enabled)),
         unreachable: Vec::new(),
+        silent: Vec::new(),
         needs_accessibility,
     };
 

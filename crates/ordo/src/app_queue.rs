@@ -14,7 +14,10 @@
 //! never rewritten: what the screen showed stays what the screen showed.
 //!
 //! A job still on the queue can be dropped, which is the only cancelling
-//! there is: a message that has reached an app is past recall. A newer move
+//! there is: a message that has reached an app is past recall. That holds
+//! for a write the app didn't answer in time, too: the app still has it, and
+//! carries it out whenever it gets to it, so it stays on its way until the
+//! app is next heard from ([`AppQueues::heard_from`]). A newer move
 //! for a window replaces its unsent older one, and a newer focus anywhere
 //! turns an unsent older one into a no-op. An unsent un-hide follows the
 //! newest decisions too: a park adds its window to the hold, a restore takes
@@ -56,18 +59,29 @@ pub const LAND_WINDOW: Duration = Duration::from_millis(500);
 /// only grow.
 const IDLE_EXIT: Duration = Duration::from_secs(60);
 
+/// How an app answered one write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Wrote {
+    Took,
+    /// The window is gone, or the app turned the write down.
+    Refused,
+    /// No answer in time. The app still has the write, and may carry it out
+    /// long after.
+    Unanswered,
+}
+
 /// What one app's thread does to that app. Made on the app's own thread and
 /// kept there, so it may hold per-app handles that can't cross threads.
 pub trait AppSession {
     /// Position writes, in order, stopping early once `cancel` says so. Per
-    /// write made: whether the app took it, and how long the call took, in ms.
+    /// write made: how the app answered, and how long the call took, in ms.
     fn move_windows(
         &mut self,
         moves: &[(WindowId, Point)],
         cancel: &dyn Fn() -> bool,
-    ) -> Vec<(WindowId, bool, f64)>;
-    /// A move that may also resize; whether the window was found.
-    fn set_frame(&mut self, window: WindowId, to: Rect) -> bool;
+    ) -> Vec<(WindowId, Wrote, f64)>;
+    /// A move that may also resize.
+    fn set_frame(&mut self, window: WindowId, to: Rect) -> Wrote;
     /// Un-hide the app, holding the listed windows at their spots until the
     /// window server shows them there, or until `cancel` says to stop.
     fn show(&mut self, hold: &[(WindowId, Point)], cancel: &dyn Fn() -> bool) -> HoldStat;
@@ -374,11 +388,18 @@ impl AppQueues {
         Landing { latch, moved }
     }
 
-    /// Whether a write to this window is queued, being made, or returned
-    /// less than [`LAND_WINDOW`] ago. An observation of the window made now
-    /// may not show that write yet.
+    /// Whether a write to this window is queued, being made, unanswered, or
+    /// returned less than [`LAND_WINDOW`] ago. An observation of the window
+    /// made now may not show that write yet.
     pub fn in_flight(&self, window: WindowId, now: Instant) -> bool {
         lock(&self.inner.record).in_flight(window, now)
+    }
+
+    /// Every app but `silent` answered a read asked at `asked`. An app works
+    /// through its messages in order, so a write it left unanswered before
+    /// then has been carried out, and gets [`LAND_WINDOW`] from now to show.
+    pub fn heard_from(&self, silent: &[Pid], asked: Instant) {
+        lock(&self.inner.record).heard_from(silent, asked, Instant::now());
     }
 
     /// Drop every job not yet started, stop a running batch of moves at its
@@ -652,15 +673,14 @@ fn run_lane(inner: Arc<Inner>, pid: Pid, lane: Arc<Lane>) {
                 let now = Instant::now();
                 let mut record = lock(&inner.record);
                 let mut state = lock(&lane.state);
-                for (w, took, ax_ms) in results {
+                for (w, wrote, ax_ms) in results {
                     let Some((_, to, seq)) = moves.iter().find(|(m, _, _)| *m == w) else {
                         continue;
                     };
-                    if took {
-                        record.written(w, *seq, now);
+                    record.answered(w, *seq, pid, wrote, now);
+                    if wrote == Wrote::Took {
                         state.landed.insert(w, *to);
                     } else {
-                        record.refused(w, *seq);
                         state.landed.remove(&w);
                     }
                     stat.moves += 1;
@@ -676,14 +696,13 @@ fn run_lane(inner: Arc<Inner>, pid: Pid, lane: Arc<Lane>) {
             }
             Work::One(Job::Frame { window, to, seq }) => {
                 lock(&inner.record).sent(window, seq);
-                let found = session.set_frame(window, to);
+                let wrote = session.set_frame(window, to);
                 let mut record = lock(&inner.record);
                 let mut state = lock(&lane.state);
-                if found {
-                    record.written(window, seq, Instant::now());
+                record.answered(window, seq, pid, wrote, Instant::now());
+                if wrote == Wrote::Took {
                     state.landed.insert(window, Point { x: to.x, y: to.y });
                 } else {
-                    record.refused(window, seq);
                     state.landed.remove(&window);
                 }
             }
@@ -848,11 +867,18 @@ struct InFlight {
     /// entry, and reports about the older one must not touch it.
     seq: u64,
     stage: Stage,
+    /// An older write the app never answered, outliving this one's fate
+    /// unless the app answers this one: a newer write refused, or an
+    /// un-hide's hold that couldn't reach the window, says nothing of
+    /// whether the app will yet carry out the older.
+    older: Option<(Pid, Instant)>,
 }
 
 enum Stage {
     Queued,
     Sent,
+    /// Sent to this app, which didn't answer by this time.
+    Unanswered(Pid, Instant),
     Written(Instant),
 }
 
@@ -866,11 +892,16 @@ impl Record {
         });
         self.next_seq += 1;
         let seq = self.next_seq;
+        let older = self.windows.get(&window).and_then(|f| match f.stage {
+            Stage::Unanswered(pid, at) => Some((pid, at)),
+            _ => f.older,
+        });
         self.windows.insert(
             window,
             InFlight {
                 seq,
                 stage: Stage::Queued,
+                older,
             },
         );
         seq
@@ -885,12 +916,46 @@ impl Record {
     fn written(&mut self, window: WindowId, seq: u64, at: Instant) {
         if let Some(f) = self.windows.get_mut(&window).filter(|f| f.seq == seq) {
             f.stage = Stage::Written(at);
+            f.older = None;
         }
     }
 
     fn refused(&mut self, window: WindowId, seq: u64) {
-        if self.windows.get(&window).is_some_and(|f| f.seq == seq) {
-            self.windows.remove(&window);
+        let Some(f) = self.windows.get_mut(&window).filter(|f| f.seq == seq) else {
+            return;
+        };
+        match f.older.take() {
+            Some((pid, at)) => f.stage = Stage::Unanswered(pid, at),
+            None => {
+                self.windows.remove(&window);
+            }
+        }
+    }
+
+    fn answered(&mut self, window: WindowId, seq: u64, pid: Pid, wrote: Wrote, now: Instant) {
+        match wrote {
+            Wrote::Took => self.written(window, seq, now),
+            Wrote::Refused => self.refused(window, seq),
+            Wrote::Unanswered => {
+                if let Some(f) = self.windows.get_mut(&window).filter(|f| f.seq == seq) {
+                    f.stage = Stage::Unanswered(pid, now);
+                    f.older = None;
+                }
+            }
+        }
+    }
+
+    fn heard_from(&mut self, silent: &[Pid], asked: Instant, now: Instant) {
+        let heard = |(pid, at): (Pid, Instant)| at <= asked && !silent.contains(&pid);
+        for f in self.windows.values_mut() {
+            if f.older.is_some_and(heard) {
+                f.older = None;
+            }
+            if let Stage::Unanswered(pid, at) = f.stage {
+                if heard((pid, at)) {
+                    f.stage = Stage::Written(now);
+                }
+            }
         }
     }
 
@@ -898,10 +963,11 @@ impl Record {
         let Some(f) = self.windows.get(&window) else {
             return false;
         };
-        let on_its_way = match f.stage {
-            Stage::Queued | Stage::Sent => true,
-            Stage::Written(at) => now.saturating_duration_since(at) < LAND_WINDOW,
-        };
+        let on_its_way = f.older.is_some()
+            || match f.stage {
+                Stage::Queued | Stage::Sent | Stage::Unanswered(..) => true,
+                Stage::Written(at) => now.saturating_duration_since(at) < LAND_WINDOW,
+            };
         if !on_its_way {
             self.windows.remove(&window);
         }

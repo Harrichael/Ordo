@@ -7,7 +7,7 @@
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use ordo::app_queue::{AppQueues, AppSession, LAND_WINDOW};
+use ordo::app_queue::{AppQueues, AppSession, Wrote, LAND_WINDOW};
 use ordo_core::{Pid, Point, Rect, WindowId};
 use ordo_emulated::{HoldStat, Move};
 
@@ -50,6 +50,8 @@ struct World {
     opened: Condvar,
     /// Windows whose writes the app refuses, as for a window that is gone.
     gone: Mutex<Vec<WindowId>>,
+    /// Apps that don't answer writes in time, though they take them.
+    silent: Mutex<Vec<Pid>>,
     /// Each write to this app takes this long.
     slow: Mutex<Vec<(Pid, Duration)>>,
     /// A write to this window panics, as a bug in a session would.
@@ -137,7 +139,7 @@ impl AppSession for FakeApp {
         &mut self,
         moves: &[(WindowId, Point)],
         cancel: &dyn Fn() -> bool,
-    ) -> Vec<(WindowId, bool, f64)> {
+    ) -> Vec<(WindowId, Wrote, f64)> {
         let mut out = Vec::new();
         for (window, to) in moves {
             if cancel() {
@@ -147,15 +149,21 @@ impl AppSession for FakeApp {
             if *self.world.panics_on.lock().unwrap() == Some(*window) {
                 panic!("a session bug");
             }
-            let took = !self.world.gone.lock().unwrap().contains(window);
-            out.push((*window, took, 0.0));
+            let wrote = if self.world.gone.lock().unwrap().contains(window) {
+                Wrote::Refused
+            } else if self.world.silent.lock().unwrap().contains(&self.pid) {
+                Wrote::Unanswered
+            } else {
+                Wrote::Took
+            };
+            out.push((*window, wrote, 0.0));
         }
         out
     }
 
-    fn set_frame(&mut self, window: WindowId, to: Rect) -> bool {
+    fn set_frame(&mut self, window: WindowId, to: Rect) -> Wrote {
         self.arrive(format!("frame {} to {}", window.0, to.x));
-        true
+        Wrote::Took
     }
 
     fn show(&mut self, hold: &[(WindowId, Point)], _cancel: &dyn Fn() -> bool) -> HoldStat {
@@ -308,6 +316,52 @@ fn a_write_is_in_flight_until_it_has_had_time_to_land() {
     assert!(!q.in_flight(w(2), now), "refused");
     assert!(!q.in_flight(w(1), now + LAND_WINDOW), "had its chance");
     assert!(!q.in_flight(w(3), now), "never written");
+}
+
+/// A write its app didn't answer in time is still with the app, which may
+/// carry it out whenever it comes to, putting a window back on screen
+/// workspaces after it was asked to. It stays on its way until the app
+/// answers something asked after it.
+#[test]
+fn an_unanswered_write_is_in_flight_until_its_app_is_heard_from() {
+    let (q, world) = queues();
+    world.silent.lock().unwrap().push(A);
+    let before = Instant::now();
+    q.move_windows(&restores(&[(A, w(1), at(1.0)), (B, w(2), at(2.0))]));
+    landed(&q, &[A, B]);
+    let later = Instant::now() + LAND_WINDOW * 4;
+    assert!(q.in_flight(w(1), later), "unanswered");
+    assert!(!q.in_flight(w(2), later), "B answered");
+
+    q.heard_from(&[], before);
+    assert!(q.in_flight(w(1), Instant::now()), "asked before the write went unanswered");
+    q.heard_from(&[A], Instant::now());
+    assert!(q.in_flight(w(1), later), "still silent");
+
+    q.heard_from(&[], Instant::now());
+    let now = Instant::now();
+    assert!(q.in_flight(w(1), now), "carried out, maybe not yet shown");
+    assert!(!q.in_flight(w(1), now + LAND_WINDOW), "had its chance");
+}
+
+/// A newer write to the window that the app refuses, as a hung app's
+/// un-hide hold does when it can't reach the window, doesn't take back the
+/// older one the app still has.
+#[test]
+fn a_refused_write_leaves_an_older_unanswered_one_in_flight() {
+    let (q, world) = queues();
+    world.silent.lock().unwrap().push(A);
+    q.move_windows(&restores(&[(A, w(1), at(1.0))]));
+    landed(&q, &[A]);
+    world.silent.lock().unwrap().clear();
+    world.gone.lock().unwrap().push(w(1));
+    q.move_windows(&[park(A, w(1), -100.0)]);
+    landed(&q, &[A]);
+    let later = Instant::now() + LAND_WINDOW * 4;
+    assert!(q.in_flight(w(1), later), "the restore may still land");
+
+    q.heard_from(&[], Instant::now());
+    assert!(!q.in_flight(w(1), Instant::now() + LAND_WINDOW), "carried out, and shown");
 }
 
 /// A write already being made can't be replaced; the newer one follows it.

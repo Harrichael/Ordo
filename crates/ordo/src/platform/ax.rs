@@ -27,6 +27,8 @@ use ordo_core::{Pid, Point, Rect, WindowId};
 use ordo_emulated::HoldStat;
 use ordo_skylight_sys as sys;
 
+use crate::app_queue::Wrote;
+
 /// A quarter second: long enough for a healthy app to answer, short enough that
 /// a wedged one doesn't wedge us.
 const MESSAGING_TIMEOUT_SECS: f32 = 0.2;
@@ -1032,21 +1034,28 @@ impl AxApp {
     /// Run `write` through the window's element, re-reading the elements and
     /// trying once more if it fails: the element may be stale while the
     /// window lives on. Never a second re-read: against a hung app each one
-    /// costs a messaging timeout.
-    fn through(&mut self, w: WindowId, write: impl Fn(&AXUIElement) -> bool) -> bool {
+    /// costs a messaging timeout. Nor a re-read after no answer, for the same
+    /// reason.
+    fn through(&mut self, w: WindowId, write: impl Fn(&AXUIElement) -> AXError) -> Wrote {
+        let wrote = |e: AXError| match e {
+            AXError::Success => Wrote::Took,
+            AXError::CannotComplete => Wrote::Unanswered,
+            _ => Wrote::Refused,
+        };
         let (win, fresh) = self.element(w);
         if let Some(win) = win {
-            if write(unsafe { &*win }) {
-                return true;
+            match wrote(write(unsafe { &*win })) {
+                Wrote::Refused => {}
+                done => return done,
             }
         }
         if fresh {
-            return false;
+            return Wrote::Refused;
         }
         self.reread();
         self.by_id
             .get(&w)
-            .is_some_and(|win| write(unsafe { &**win }))
+            .map_or(Wrote::Refused, |win| wrote(write(unsafe { &**win })))
     }
 }
 
@@ -1063,7 +1072,7 @@ impl crate::app_queue::AppSession for AxApp {
         &mut self,
         moves: &[(WindowId, Point)],
         cancel: &dyn Fn() -> bool,
-    ) -> Vec<(WindowId, bool, f64)> {
+    ) -> Vec<(WindowId, Wrote, f64)> {
         // One enhanced-UI bracket around the whole batch, not one per window:
         // without it Chromium/Electron windows move slowly and land wrong.
         let restore_eui = unsafe { disable_enhanced_ui(&self.el) };
@@ -1073,10 +1082,8 @@ impl crate::app_queue::AppSession for AxApp {
                 break;
             }
             let t = Instant::now();
-            let took = self.through(*w, |win| unsafe {
-                set_point(win, "AXPosition", to.x, to.y) == AXError::Success
-            });
-            out.push((*w, took, t.elapsed().as_secs_f64() * 1000.0));
+            let wrote = self.through(*w, |win| unsafe { set_point(win, "AXPosition", to.x, to.y) });
+            out.push((*w, wrote, t.elapsed().as_secs_f64() * 1000.0));
         }
         if restore_eui {
             unsafe { set_bool(&self.el, "AXEnhancedUserInterface", true) };
@@ -1087,10 +1094,10 @@ impl crate::app_queue::AppSession for AxApp {
     /// The position -> size -> position idiom of [`set_frame`], for the same
     /// reason: apps clamp a size to the current screen before a cross-display
     /// move lands.
-    fn set_frame(&mut self, window: WindowId, to: Rect) -> bool {
+    fn set_frame(&mut self, window: WindowId, to: Rect) -> Wrote {
         let restore_eui = unsafe { disable_enhanced_ui(&self.el) };
-        let found = self.through(window, |win| unsafe {
-            let first = set_point(win, "AXPosition", to.x, to.y) == AXError::Success;
+        let wrote = self.through(window, |win| unsafe {
+            let first = set_point(win, "AXPosition", to.x, to.y);
             set_size_attr(win, to.w, to.h);
             let _ = set_point(win, "AXPosition", to.x, to.y);
             first
@@ -1098,7 +1105,7 @@ impl crate::app_queue::AppSession for AxApp {
         if restore_eui {
             unsafe { set_bool(&self.el, "AXEnhancedUserInterface", true) };
         }
-        found
+        wrote
     }
 
     fn show(&mut self, hold: &[(WindowId, Point)], cancel: &dyn Fn() -> bool) -> HoldStat {

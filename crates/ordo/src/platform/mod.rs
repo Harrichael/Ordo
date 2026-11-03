@@ -63,9 +63,22 @@ use crate::ports::{Blind, SnapshotStats, WorldSource};
 
 pub type SharedBackend = Rc<RefCell<dyn WorkspaceBackend>>;
 
-/// The apps the last scan found refusing Ordo ([`ax::Walk::refused`]), for
-/// the menu bar, which draws on another thread.
-pub type Unreachable = Arc<std::sync::Mutex<Vec<Pid>>>;
+/// The apps the last scan found Ordo can't reach, for the menu bar, which
+/// draws on another thread.
+pub type Unreachable = Arc<std::sync::Mutex<Reach>>;
+
+#[derive(Clone, Debug, Default)]
+pub struct Reach {
+    /// Refusing Ordo outright ([`ax::Walk::refused`]).
+    pub refused: Vec<Pid>,
+    /// Not answering for [`SILENT_AFTER`] or more: Ordo's writes to them wait
+    /// in their queues, so their windows stay put, wherever that is.
+    pub silent: Vec<Pid>,
+}
+
+/// Unanswered in every scan for this long: longer than one dropped read,
+/// which an app that is merely busy has now and then.
+const SILENT_AFTER: Duration = Duration::from_secs(2);
 
 pub fn native_backend() -> SharedBackend {
     Rc::new(RefCell::new(native_backend::NativeBackend::new()))
@@ -139,6 +152,8 @@ pub struct MacWorldSource {
     /// The windows now kept as `unread`: since when, and whether they've
     /// been called ghosts yet.
     unread_since: HashMap<WindowId, Unread>,
+    /// Apps unanswered in every scan since then.
+    silent_since: HashMap<Pid, Instant>,
     own_menu: status_item::OwnMenu,
     /// What the focus read stood on at the last scan with Ordo's menu open,
     /// logged on change: opening that menu has moved focus onto a hidden
@@ -201,6 +216,7 @@ impl MacWorldSource {
             last_windows: HashMap::new(),
             blind: false,
             unread_since: HashMap::new(),
+            silent_since: HashMap::new(),
             own_menu,
             menu_focus: None,
         }
@@ -208,6 +224,47 @@ impl MacWorldSource {
 }
 
 impl MacWorldSource {
+    /// Publishes the apps silent for [`SILENT_AFTER`], and says when one
+    /// starts and stops being so. Before a blind scan is thrown away: a
+    /// silent app is no less silent for the scan being blind. Only apps with
+    /// windows Ordo manages count: one with none has nothing to be stuck on.
+    fn note_silent(&mut self, unanswered: &[Pid]) {
+        let now = Instant::now();
+        let unanswered: Vec<Pid> = unanswered
+            .iter()
+            .filter(|p| self.last_windows.values().any(|a| a == *p))
+            .copied()
+            .collect();
+        let mut unreachable = self.unreachable.lock().unwrap();
+        for (pid, since) in &self.silent_since {
+            if !unanswered.contains(pid) && unreachable.silent.contains(pid) {
+                eprintln!(
+                    "ordo: app {} answers again, or is gone, after {} ms",
+                    pid.0,
+                    now.duration_since(*since).as_millis()
+                );
+            }
+        }
+        self.silent_since.retain(|pid, _| unanswered.contains(pid));
+        for pid in &unanswered {
+            self.silent_since.entry(*pid).or_insert(now);
+        }
+        let mut silent: Vec<Pid> = self
+            .silent_since
+            .iter()
+            .filter(|(_, since)| now.duration_since(**since) >= SILENT_AFTER)
+            .map(|(pid, _)| *pid)
+            .collect();
+        silent.sort();
+        for pid in silent.iter().filter(|p| !unreachable.silent.contains(p)) {
+            eprintln!(
+                "ordo: app {} isn't answering; its windows stay where they are until it does",
+                pid.0
+            );
+        }
+        unreachable.silent = silent;
+    }
+
     fn record_stats(&mut self, started: Instant, stats: SnapshotStats) {
         self.stats = Some(SnapshotStats {
             total: started.elapsed(),
@@ -310,6 +367,8 @@ impl WorldSource for MacWorldSource {
             .collect();
 
         let mut scan = ax::scan();
+        self.queues.heard_from(&scan.walk.unanswered, started);
+        self.note_silent(&scan.walk.unanswered);
         // Facts first: a window's layer decides whether Ordo manages it.
         let unseen: Vec<WindowId> = scan
             .windows
@@ -512,13 +571,13 @@ impl WorldSource for MacWorldSource {
         };
 
         let mut unreachable = self.unreachable.lock().unwrap();
-        for pid in scan.walk.refused.iter().filter(|p| !unreachable.contains(p)) {
+        for pid in scan.walk.refused.iter().filter(|p| !unreachable.refused.contains(p)) {
             eprintln!(
                 "ordo: app {} refuses Accessibility (API disabled); its windows can't be seen or parked until it is reopened",
                 pid.0
             );
         }
-        *unreachable = scan.walk.refused.clone();
+        unreachable.refused = scan.walk.refused.clone();
         drop(unreachable);
 
         self.record_stats(started, stats);

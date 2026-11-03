@@ -8,7 +8,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use ordo::app_queue::{AppQueues, AppSession};
+use ordo::app_queue::{AppQueues, AppSession, Wrote};
 use ordo::ports::RestackStats;
 use ordo::restack::{follow, QUIET};
 use ordo_core::{Pid, Point, Rect, WindowId};
@@ -30,16 +30,16 @@ impl AppSession for App {
         &mut self,
         moves: &[(WindowId, Point)],
         _cancel: &dyn Fn() -> bool,
-    ) -> Vec<(WindowId, bool, f64)> {
+    ) -> Vec<(WindowId, Wrote, f64)> {
         std::thread::sleep(self.each_move * moves.len() as u32);
         self.landed
             .lock()
             .unwrap()
             .extend(moves.iter().map(|(w, _)| *w));
-        moves.iter().map(|(w, _)| (*w, true, 0.0)).collect()
+        moves.iter().map(|(w, _)| (*w, Wrote::Took, 0.0)).collect()
     }
-    fn set_frame(&mut self, _: WindowId, _: Rect) -> bool {
-        true
+    fn set_frame(&mut self, _: WindowId, _: Rect) -> Wrote {
+        Wrote::Took
     }
     fn show(&mut self, _: &[(WindowId, Point)], _: &dyn Fn() -> bool) -> HoldStat {
         unreachable!("no un-hides here")

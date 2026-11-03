@@ -293,6 +293,9 @@ fn summary(view: &MenuBarView) -> String {
     if !view.engaged {
         s.push_str(" (paused)");
     }
+    for pid in &view.silent {
+        s.push_str(&format!(" — {} isn't answering", app_label(*pid)));
+    }
     s
 }
 
@@ -443,7 +446,7 @@ impl Strip {
 }
 
 /// A disc with "!" punched out of it, as the pill's digit is: something is
-/// missing before Ordo can work.
+/// keeping Ordo from working.
 fn draw_badge(x: f64) {
     NSColor::labelColor().setFill();
     let disc = NSRect::new(NSPoint::new(x, (HEIGHT - BADGE) / 2.0), NSSize::new(BADGE, BADGE));
@@ -513,7 +516,7 @@ fn icon(view: &MenuBarView, strip: Option<Strip>) -> Retained<NSImage> {
     let marks_w =
         marks.iter().map(Mark::width).sum::<f64>() + GAP * marks.len().saturating_sub(1) as f64;
     let strip_w = strip.map_or(0.0, |s| GROUP_GAP + s.width());
-    let badge = view.needs_accessibility;
+    let badge = view.needs_accessibility || !view.silent.is_empty();
     let width = marks_w + strip_w + if badge { GROUP_GAP + BADGE } else { 0.0 };
     let draw = RcBlock::new(move |_: NSRect| -> Bool {
         let mut x = 0.0;
@@ -678,12 +681,17 @@ impl Controller {
             menu.addItem(&NSMenuItem::separatorItem(mtm));
             menu.addItem(&info_item("Paused — press ⌃⌥⌘O to resume", mtm));
         }
-        if !view.unreachable.is_empty() {
+        if !view.unreachable.is_empty() || !view.silent.is_empty() {
             menu.addItem(&NSMenuItem::separatorItem(mtm));
             for pid in &view.unreachable {
-                let name = app_name(*pid).unwrap_or_else(|| format!("pid {}", pid.0));
                 menu.addItem(&info_item(
-                    &format!("Can't reach {name}: quit and reopen it"),
+                    &format!("Can't reach {}: quit and reopen it", app_label(*pid)),
+                    mtm,
+                ));
+            }
+            for pid in &view.silent {
+                menu.addItem(&info_item(
+                    &format!("{} isn't answering: Ordo can't move its windows", app_label(*pid)),
                     mtm,
                 ));
             }
@@ -744,6 +752,10 @@ fn app_name(pid: ordo_core::Pid) -> Option<String> {
     NSRunningApplication::runningApplicationWithProcessIdentifier(pid.0)
         .and_then(|a| a.localizedName())
         .map(|n| n.to_string())
+}
+
+fn app_label(pid: ordo_core::Pid) -> String {
+    app_name(pid).unwrap_or_else(|| format!("pid {}", pid.0))
 }
 
 fn rows(view: &MenuBarView) -> Vec<Row> {

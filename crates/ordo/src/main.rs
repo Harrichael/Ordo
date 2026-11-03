@@ -291,7 +291,9 @@ fn run(
                 // not reopening each one.
                 view.needs_accessibility = needs_access.load(Ordering::Relaxed);
                 if !view.needs_accessibility {
-                    view.unreachable = unreachable.lock().unwrap().clone();
+                    let reach = unreachable.lock().unwrap().clone();
+                    view.unreachable = reach.refused;
+                    view.silent = reach.silent;
                 }
                 menubar.show(view);
             });

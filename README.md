@@ -61,7 +61,10 @@ The two rules that make it work:
   stacking order at each step of a switch, for a few ms per switch, and is
   off at every launch; whether each workspace keeps its own monitor; and
   when, and for lack of what, apps are hidden.
-  Dimmed while Ordo is paused. Not shown with
+  Dimmed while Ordo is paused. An app that hasn't answered Ordo for a
+  couple of seconds puts a "!" on the item and a line in the menu: its
+  windows go nowhere until it answers, and it is the app that is stuck,
+  not Ordo. Not shown with
   `--observe`. Preview the design without the daemon:
   `cargo run --example menubar_preview`.
 - **MRU window focus**: `Alt+Tab` (in workspace), `Alt+Shift+Tab` (+ monitor),
