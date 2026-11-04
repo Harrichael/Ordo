@@ -335,6 +335,10 @@ pub struct MonitorSnap {
     pub id: MonitorId,
     pub frame: Rect,
     pub is_main: bool,
+    /// Where windows may go: `frame` less the menu bar, and the Dock where
+    /// it shows. None in logs from before it was read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usable: Option<Rect>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

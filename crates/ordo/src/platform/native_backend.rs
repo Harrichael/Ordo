@@ -125,11 +125,11 @@ impl WorkspaceBackend for NativeBackend {
     fn topology(
         &mut self,
         windows: &HashMap<WindowId, (Pid, Rect)>,
-        monitors: &[(MonitorId, Rect, bool)],
+        monitors: &[ordo_core::MonitorSnap],
         _user_monitor: Option<ordo_core::VirtualMonitorId>,
     ) -> Result<BackendTopology> {
         let displays = skylight::managed_display_spaces(self.cid);
-        let known: Vec<(MonitorId, bool)> = monitors.iter().map(|(id, _, m)| (*id, *m)).collect();
+        let known: Vec<(MonitorId, bool)> = monitors.iter().map(|m| (m.id, m.is_main)).collect();
         let folded = skylight::fold_topology(&displays, &known);
         // SkyLight keys purely on window ids; the pid half of identity is the
         // emulated ledger's concern.

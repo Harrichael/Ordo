@@ -110,6 +110,7 @@ fn mon_a(active: u8) -> Mon {
                 h: 1080.0,
             },
             is_main: true,
+            usable: None,
         },
         active: ws(active),
         count: 3,
@@ -127,6 +128,7 @@ fn mon_b(active: u8) -> Mon {
                 h: 1080.0,
             },
             is_main: false,
+            usable: None,
         },
         active: ws(active),
         count: 3,
@@ -3305,6 +3307,37 @@ fn move_focused_window_to_other_monitor_brings_the_mouse() {
         .any(|e| matches!(e, Effect::WarpMouse { to } if *to == center)));
 }
 
+/// A window moved to a display of another size takes the same share of its
+/// usable area, size and all: one filling the big display fills the laptop.
+#[test]
+fn a_window_moved_to_a_display_of_another_size_keeps_its_share() {
+    let display = |id: u8, frame: Rect, usable: Rect| Mon {
+        snap: MonitorSnap {
+            id: mid(id),
+            frame,
+            is_main: id == 1,
+            usable: Some(usable),
+        },
+        active: ws(1),
+        count: 3,
+    };
+    let laptop_usable = Rect { x: 0.0, y: 33.0, w: 1470.0, h: 923.0 };
+    let big_usable = Rect { x: 1470.0, y: 30.0, w: 1920.0, h: 1050.0 };
+    let monitors = vec![
+        display(1, Rect { x: 0.0, y: 0.0, w: 1470.0, h: 956.0 }, laptop_usable),
+        display(2, Rect { x: 1470.0, y: 0.0, w: 1920.0, h: 1080.0 }, big_usable),
+    ];
+    let windows = vec![win(1, 100, 1, big_usable)];
+    let s = update(
+        &State::new(),
+        &observed(monitors.clone(), windows.clone(), None, RescanTrigger::Startup),
+    )
+    .state;
+    let s = used(&s, 1, monitors, windows);
+    let step = update(&s, &hotkey(HotkeyAction::MoveFocusedToMonitorPrev));
+    assert_eq!(set_frame_for(&step.effects, 1), Some(laptop_usable));
+}
+
 #[test]
 fn clamped_landing_on_the_target_monitor_confirms_the_move() {
     // macOS clamps frames into a display's visible area (the requested y at
@@ -5454,6 +5487,7 @@ fn a_window_left_at_the_park_is_never_adopted_or_carried() {
                 h: 1080.0,
             },
             is_main: false,
+            usable: None,
         },
         active: ws(1),
         count: 3,

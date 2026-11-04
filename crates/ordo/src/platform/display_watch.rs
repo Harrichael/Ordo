@@ -12,8 +12,10 @@
 //! So the callback records nothing but the time. While fewer than `SETTLE`
 //! have passed since the last one, the world source reports the world as
 //! unobservable (as it does while the displays sleep), and
-//! once it has, one rescan is posted and everything re-projects at once onto
-//! the rig as it actually is. One second is the judgment call: long enough
+//! once it has, AppKit's usable areas are read on the main thread, one rescan
+//! is posted, and everything re-projects at once onto the rig as it actually
+//! is. The world stays unobservable until those areas are read: every window
+//! is laid out by its share of them. One second is the judgment call: long enough
 //! for the re-homing and Dock dance measured on plug events, short enough
 //! that monitor memory still reads as immediate.
 
@@ -31,9 +33,11 @@ use objc2_core_graphics::{
 use ordo_core::RescanTrigger;
 
 use crate::engine::Msg;
-use crate::platform::display::MenuBars;
+use crate::platform::display::{self, MenuBars};
 
 const SETTLE: Duration = Duration::from_millis(1000);
+
+const UNREAD: u64 = u64::MAX;
 
 /// How often the poster checks whether the settle window has closed. Bounds
 /// the latency added on top of `SETTLE`.
@@ -45,6 +49,11 @@ const POLL: Duration = Duration::from_millis(100);
 pub struct DisplaySettle {
     /// Milliseconds since process start of the last reconfiguration; 0 = never.
     last_ms: Arc<AtomicU64>,
+    /// The reconfiguration AppKit's usable areas were last read after;
+    /// `UNREAD` before the first read. Until they are read for the last one,
+    /// windows would be laid out against the old displays', or against whole
+    /// frames.
+    read_for: Arc<AtomicU64>,
 }
 
 fn epoch() -> Instant {
@@ -62,6 +71,7 @@ impl DisplaySettle {
         epoch();
         DisplaySettle {
             last_ms: Arc::new(AtomicU64::new(0)),
+            read_for: Arc::new(AtomicU64::new(UNREAD)),
         }
     }
 
@@ -75,7 +85,9 @@ impl DisplaySettle {
 
     pub fn settling(&self) -> bool {
         let last = self.last();
-        last != 0 && now_ms().saturating_sub(last) < SETTLE.as_millis() as u64
+        let read_for = self.read_for.load(Ordering::Acquire);
+        read_for != last
+            || (last != 0 && now_ms().saturating_sub(last) < SETTLE.as_millis() as u64)
     }
 }
 
@@ -101,8 +113,13 @@ pub fn install(tx: Sender<Msg>, menu_bars: MenuBars) -> DisplaySettle {
     }
 
     let bars = menu_bars.clone();
+    let first = settle.clone();
     DispatchQueue::main().exec_async(move || {
-        bars.refresh(MainThreadMarker::new().expect("main queue"));
+        let mtm = MainThreadMarker::new().expect("main queue");
+        bars.refresh(mtm);
+        display::refresh_usable(mtm);
+        // A reconfiguration since is the poster's to read for.
+        let _ = first.read_for.compare_exchange(UNREAD, 0, Ordering::AcqRel, Ordering::Acquire);
     });
 
     let poster = settle.clone();
@@ -111,23 +128,27 @@ pub fn install(tx: Sender<Msg>, menu_bars: MenuBars) -> DisplaySettle {
         loop {
             std::thread::sleep(POLL);
             let last = poster.last();
-            if last == 0 || last == posted_for || poster.settling() {
+            let quiet = now_ms().saturating_sub(last) >= SETTLE.as_millis() as u64;
+            if last == 0 || last == posted_for || !quiet {
                 continue;
             }
             posted_for = last;
-            // The menu bars moved with the displays; only AppKit knows where.
+            // The menu bars and usable areas moved with the displays; only
+            // AppKit knows where. The rescan waits on them: it re-places
+            // every window by its share of its display's usable area.
             let bars = menu_bars.clone();
+            let tx = tx.clone();
+            let read_for = poster.read_for.clone();
             DispatchQueue::main().exec_async(move || {
-                bars.refresh(MainThreadMarker::new().expect("main queue"));
-            });
-            if tx
-                .send(Msg::Rescan(RescanTrigger::BackendHint {
+                let mtm = MainThreadMarker::new().expect("main queue");
+                bars.refresh(mtm);
+                display::refresh_usable(mtm);
+                read_for.store(last, Ordering::Release);
+                // An engine gone is the daemon shutting down; nothing to do.
+                let _ = tx.send(Msg::Rescan(RescanTrigger::BackendHint {
                     kind: "display_reconfigured".into(),
-                }))
-                .is_err()
-            {
-                return; // engine gone; the daemon is shutting down
-            }
+                }));
+            });
         }
     });
     settle

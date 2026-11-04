@@ -24,6 +24,48 @@ pub struct DisplayInfo {
     pub id: MonitorId,
     pub frame: Rect,
     pub is_main: bool,
+    /// Where windows may go (see [`refresh_usable`]); the whole frame until
+    /// AppKit has said.
+    pub usable: Rect,
+}
+
+/// Each display's usable area, in CG coordinates. Only AppKit knows it, and
+/// only on the main thread, so the main thread keeps this and the engine reads
+/// it with the displays.
+static USABLE: std::sync::RwLock<Vec<Rect>> = std::sync::RwLock::new(Vec::new());
+
+/// Record every display's visible frame: all of it but the menu bar, and the
+/// Dock while it shows.
+pub fn refresh_usable(mtm: objc2::MainThreadMarker) {
+    use objc2_app_kit::NSScreen;
+
+    let screens = NSScreen::screens(mtm);
+    let Some(primary_h) = screens.iter().next().map(|s| s.frame().size.height) else {
+        return;
+    };
+    let areas = screens
+        .iter()
+        .map(|s| {
+            let v = s.visibleFrame();
+            Rect {
+                x: v.origin.x,
+                y: primary_h - (v.origin.y + v.size.height),
+                w: v.size.width,
+                h: v.size.height,
+            }
+        })
+        .collect();
+    *USABLE.write().unwrap() = areas;
+}
+
+fn usable_in(frame: &Rect) -> Rect {
+    USABLE
+        .read()
+        .unwrap()
+        .iter()
+        .copied()
+        .find(|u| frame.contains(u.center()) && u.w <= frame.w && u.h <= frame.h)
+        .unwrap_or(*frame)
 }
 
 pub fn active_displays() -> Vec<DisplayInfo> {
@@ -54,6 +96,7 @@ fn read_displays() -> Vec<DisplayInfo> {
         }
         out.push(DisplayInfo {
             id: uuid,
+            usable: usable_in(&frame),
             frame,
             is_main,
         });

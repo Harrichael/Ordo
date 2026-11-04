@@ -23,6 +23,18 @@ pub struct MonitorRecord {
     /// Global CG coordinates (top-left origin, y-down).
     pub frame: Rect,
     pub is_main: bool,
+    /// The part of `frame` windows may use, which a window's share of the
+    /// display is measured against. None in checkpoints from before it was
+    /// read.
+    #[serde(default)]
+    pub usable: Option<Rect>,
+}
+
+impl MonitorRecord {
+    /// Where windows may go: the usable area, else the whole display.
+    pub fn area(&self) -> Rect {
+        self.usable.unwrap_or(self.frame)
+    }
 }
 
 /// The virtual-monitor layout declarations, as the backend's word has them:
@@ -704,9 +716,9 @@ impl State {
     }
 
     /// Where the window belongs on screen under `proj`: its own frame when
-    /// that already sits on its monitor's host, else that frame carried over
-    /// proportionally from the display it is on. Pure geometry; the write is
-    /// the caller's.
+    /// that already sits on its monitor's host, else that frame scaled from
+    /// the display it is on to its host. Pure geometry; the write is the
+    /// caller's.
     pub fn projected_frame_in(&self, r: &WindowRecord, proj: &Projection) -> Rect {
         let Some(host) = self.host_in(r.vmonitor, proj).and_then(|h| self.monitors.get(&h)) else {
             return r.frame;
@@ -717,9 +729,9 @@ impl State {
         let from = self
             .monitors
             .get(&r.monitor)
-            .map(|m| m.frame)
-            .unwrap_or(host.frame);
-        r.frame.translate_between(&from, &host.frame)
+            .map(|m| m.area())
+            .unwrap_or(host.area());
+        r.frame.scale_between(&from, &host.area())
     }
 
     pub fn projected_frame(&self, r: &WindowRecord) -> Rect {

@@ -29,7 +29,7 @@ use ordo_core::{
 };
 
 use crate::ledger::{Claim, Ledger, SwitchPlan};
-use crate::statefile::{self, PersistedState, PersistedWindow};
+use crate::statefile::{self, PersistedState, PersistedWindow, Placed};
 use crate::trace::{ParkTrace, ParkTraceKind, SwitchCost};
 use crate::{Desktop, HideWhen, Hiding, Idle, Move, Screens, Unhide};
 
@@ -66,6 +66,16 @@ const ENFORCE_LIMIT: u8 = 3;
 /// log see a restore that didn't land.
 const RESTORE_GRACE: Duration = Duration::from_secs(2);
 
+/// A size Ordo wrote to a window (see `EmulatedWorkspaces::laid`).
+#[derive(Clone, Copy)]
+struct Laid {
+    /// The display the size is that display's share of.
+    display: Rect,
+    asked: Rect,
+    /// What the app made of it, once seen.
+    landed: Option<Rect>,
+}
+
 /// Each app's windows that are off screen, with where each is parked.
 type ParkedByApp = HashMap<Pid, Vec<(WindowId, Point)>>;
 
@@ -99,6 +109,8 @@ struct Geometry {
     /// Every display, left to right — the order the projection indexes. Must
     /// sort exactly as the core's `State::monitors_by_position`.
     displays: Vec<Rect>,
+    /// The part of each display windows may use, as [`Screens::usable`].
+    usable: Vec<Rect>,
 }
 
 impl Geometry {
@@ -108,8 +120,13 @@ impl Geometry {
 
     fn of(screens: &Screens) -> Self {
         let main = screens.main;
-        let mut displays = screens.all.clone();
-        displays.sort_by(|a, b| a.x.total_cmp(&b.x).then(a.y.total_cmp(&b.y)));
+        let mut paired: Vec<(Rect, Rect)> = if screens.usable.len() == screens.all.len() {
+            screens.all.iter().copied().zip(screens.usable.iter().copied()).collect()
+        } else {
+            screens.all.iter().map(|d| (*d, *d)).collect()
+        };
+        paired.sort_by(|(a, _), (b, _)| a.x.total_cmp(&b.x).then(a.y.total_cmp(&b.y)));
+        let (displays, usable): (Vec<Rect>, Vec<Rect>) = paired.into_iter().unzip();
         let park_host = displays.first().copied().unwrap_or(main);
         let legacy_host = displays
             .iter()
@@ -125,7 +142,34 @@ impl Geometry {
             park_host,
             legacy_host,
             displays,
+            usable,
         }
+    }
+
+    /// The part of `display` windows may use: what a window's share of it is
+    /// measured against.
+    fn area(&self, display: &Rect) -> Rect {
+        self.displays
+            .iter()
+            .position(|d| d == display)
+            .and_then(|i| self.usable.get(i).copied())
+            .unwrap_or(*display)
+    }
+
+    /// Where `f` stands, as a layout: on the display holding most of it.
+    fn placed(&self, f: &Rect) -> Option<Placed> {
+        let d = self.display_of(f)?;
+        Some(Placed {
+            frame: *f,
+            display: d,
+            area: self.area(&d),
+        })
+    }
+
+    /// The same displays, where they were. Usable areas move without them
+    /// (the Dock), and that is no change of rig.
+    fn same_rig(&self, other: &Geometry) -> bool {
+        self.displays == other.displays && self.main == other.main
     }
 
     fn physical(&self) -> usize {
@@ -200,14 +244,24 @@ pub struct EmulatedWorkspaces {
     /// because it is what the core is told the window's frame IS while the
     /// window is really a sliver; only its origin is written back on restore.
     saved: HashMap<WindowId, Rect>,
-    /// The frame each window last held with the FULL rig present — every
-    /// virtual monitor on a display of its own. Refreshed from observation in
-    /// that state only, never while collapsed or viewed on a shared display,
-    /// so neither a toggle nor an undocked session can overwrite the docked
-    /// layout. This is what lets a replug put a window back exactly where it
-    /// was: macOS re-homes a vanished display's windows onto the laptop before
-    /// Ordo sees anything, so `saved` alone can only remember the laptop frame.
-    home: HashMap<WindowId, Rect>,
+    /// Each window's layout: where it last stood on screen, and the usable
+    /// area of the display it stood on, so that on any display it takes the
+    /// same share, size included. One layout across every rig: a window moved
+    /// on the laptop is carried, scaled, onto the docked display. Refreshed
+    /// from every pass that sees it on screen, and at its park, except right
+    /// after the display set changes: macOS re-homes a vanished display's
+    /// windows onto what is left before Ordo sees anything, and that pile is
+    /// nobody's layout.
+    placed: HashMap<WindowId, Placed>,
+    /// Windows Ordo itself sized to their layout's share of a new display.
+    /// An app snaps or clamps such a write (whole terminal cells, a minimum
+    /// size), and taking what it made of it as the layout would shrink or
+    /// grow the window a little more with every dock and undock. The layout
+    /// stays until the window stands somewhere else.
+    laid: HashMap<WindowId, Laid>,
+    /// This pass learned of a display change: what windows stand on is
+    /// macOS's pile, not anyone's layout.
+    replugging: bool,
     /// Windows currently parked off-screen. Tracked so re-parking an
     /// already-parked window (a hidden->hidden move) doesn't overwrite its real
     /// saved frame with the sliver position.
@@ -258,10 +312,10 @@ pub struct EmulatedWorkspaces {
     /// `PersistedState::monitors_assigned`); the next sighted scan learns
     /// them from where the windows stand, once.
     learn_monitors: bool,
-    /// Docked frames written on the pass the full rig came back, stood in for
-    /// in belief for that pass only: its snapshot was read before the writes,
-    /// and the core, seeing the windows where the laptop had them, would
-    /// carry them over proportionally itself.
+    /// Frames written on the pass the display set changed, from each window's
+    /// layout, stood in for in belief for that pass only: its snapshot was
+    /// read before the writes, and the core, seeing the windows where macOS
+    /// piled them, would carry them over itself.
     homecoming: HashMap<WindowId, Rect>,
     /// The display set changed during a scan that saw no windows (a locked
     /// screen): the next scan that does see them is still the replug's pass.
@@ -300,7 +354,9 @@ impl EmulatedWorkspaces {
         EmulatedWorkspaces {
             ledger: Ledger::new(count),
             saved: HashMap::new(),
-            home: HashMap::new(),
+            placed: HashMap::new(),
+            laid: HashMap::new(),
+            replugging: false,
             parked: HashSet::new(),
             enforce_attempts: HashMap::new(),
             park_request: HashMap::new(),
@@ -415,6 +471,7 @@ impl EmulatedWorkspaces {
             return;
         }
         let replugged = replugged || std::mem::take(&mut self.replug_unseen);
+        self.replugging = replugged;
         let before = self.ledger.window_claims();
         let absent: Vec<WindowId> = self
             .ledger
@@ -461,10 +518,10 @@ impl EmulatedWorkspaces {
         }
         dirty |= self.ledger.window_claims() != before;
         // Right after the display set changes, windows stand wherever macOS
-        // re-homed them, which is nobody's placement: recorded as home, it
-        // replaced the very frames the full rig is about to need.
+        // re-homed them, which is nobody's placement: recorded as layout, it
+        // replaced the very frames the new rig is about to be laid out from.
         if !replugged {
-            dirty |= self.refresh_home(frames, &g);
+            dirty |= self.refresh_placed(d, frames, &g);
         }
         if dirty {
             self.persist();
@@ -574,42 +631,72 @@ impl EmulatedWorkspaces {
         }
     }
 
-    /// Whether every virtual monitor has a display of its own right now.
-    fn full_rig(&self, g: &Geometry) -> bool {
-        g.physical() >= self.ledger.monitors().count as usize
-    }
-
-    /// Remember where each on-screen window sits while the full rig is
-    /// present. Returns whether anything durable changed.
-    fn refresh_home(&mut self, frames: &HashMap<WindowId, (Pid, Rect)>, g: &Geometry) -> bool {
-        if !self.full_rig(g) {
-            return false;
-        }
+    /// Take each on-screen window's layout from where it stands. A window
+    /// with a write of Ordo's on its way may not stand there yet. Returns
+    /// whether anything durable changed.
+    fn refresh_placed(
+        &mut self,
+        d: &dyn Desktop,
+        frames: &HashMap<WindowId, (Pid, Rect)>,
+        g: &Geometry,
+    ) -> bool {
         let proj = self.ledger.projection();
         let mut changed = false;
         for (w, (_, f)) in frames {
             if !self.ledger.visible(*w, &proj)
                 || self.parked.contains(w)
                 || self.reads_parked(*w, f, g)
+                || d.in_flight(*w)
             {
                 continue;
             }
-            if self
-                .home
-                .get(w)
-                .is_none_or(|h| !h.approx_eq(f, FRAME_EPSILON))
-            {
-                self.home.insert(*w, *f);
-                changed = true;
-            }
+            changed |= self.note_layout(*w, f, g);
         }
         changed
+    }
+
+    /// The display the window's size was had on: the one Ordo last sized it
+    /// for, else the one its layout was taken on. Not read off where it
+    /// stands: the laptop and the main display share an origin, so a window
+    /// left at its laptop size stands on the main display once docked.
+    fn sized_on(&self, w: WindowId) -> Option<Rect> {
+        self.laid
+            .get(&w)
+            .map(|l| l.display)
+            .or_else(|| self.placed.get(&w).map(|p| p.display))
+    }
+
+    /// Take a window's layout from a frame it truly stands at, unless that
+    /// is where Ordo's own sizing of it landed. Whether it changed.
+    fn note_layout(&mut self, w: WindowId, f: &Rect, g: &Geometry) -> bool {
+        match self.laid.get_mut(&w) {
+            Some(l) if l.landed.is_none() && near_own_request(f, &l.asked) => {
+                l.landed = Some(*f);
+                return false;
+            }
+            Some(l) if l.landed.is_some_and(|landed| landed.approx_eq(f, FRAME_EPSILON)) => {
+                return false;
+            }
+            Some(_) => {
+                self.laid.remove(&w);
+            }
+            None => {}
+        }
+        let Some(p) = g.placed(f) else { return false };
+        let same = self.placed.get(&w).is_some_and(|old| {
+            old.frame.approx_eq(&p.frame, FRAME_EPSILON) && old.display == p.display
+        });
+        if !same {
+            self.placed.insert(w, p);
+        }
+        !same
     }
 
     fn drop_park_bookkeeping(&mut self, ids: &[WindowId]) {
         for id in ids {
             self.saved.remove(id);
-            self.home.remove(id);
+            self.placed.remove(id);
+            self.laid.remove(id);
             self.parked.remove(id);
             self.enforce_attempts.remove(id);
             self.park_request.remove(id);
@@ -624,9 +711,17 @@ impl EmulatedWorkspaces {
     /// fighting back".
     ///
     /// Callers compute a whole target `Rect` because that is what the promise
-    /// and the trace are about, but only its ORIGIN is sent: this model moves
-    /// windows, it never resizes them ([`Desktop::move_windows`]).
-    fn move_windows(&mut self, d: &dyn Desktop, writes: &[(Pid, WindowId, Rect)]) {
+    /// and the trace are about, and mostly only its ORIGIN is sent
+    /// ([`Desktop::move_windows`]). A target of another size than the window
+    /// now has (`frames`) is one carried onto a display of another size, and
+    /// is written whole ([`Desktop::frame_windows`]); a park never is.
+    fn move_windows(
+        &mut self,
+        d: &dyn Desktop,
+        writes: &[(Pid, WindowId, Rect)],
+        frames: &HashMap<WindowId, (Pid, Rect)>,
+        g: &Geometry,
+    ) {
         let now = d.now();
         for (_, w, f) in writes {
             self.last_requested.insert(*w, *f);
@@ -636,17 +731,36 @@ impl EmulatedWorkspaces {
         }
         // Decided before this is called, so `parked` already says which way
         // each write goes.
-        let moves: Vec<Move> = writes
-            .iter()
+        let (sized, moves): (Vec<_>, Vec<_>) = writes.iter().copied().partition(|(_, w, f)| {
+            !self.parked.contains(w)
+                && frames
+                    .get(w)
+                    .is_some_and(|(_, now)| (now.w - f.w).abs() > 1.0 || (now.h - f.h).abs() > 1.0)
+        });
+        let moves: Vec<Move> = moves
+            .into_iter()
             .map(|(pid, w, f)| Move {
-                pid: *pid,
-                window: *w,
+                pid,
+                window: w,
                 to: Point { x: f.x, y: f.y },
-                parks: self.parked.contains(w),
+                parks: self.parked.contains(&w),
             })
             .collect();
         if !moves.is_empty() {
             d.move_windows(&moves);
+        }
+        if !sized.is_empty() {
+            for (_, w, f) in &sized {
+                if let Some(display) = g.display_of(f) {
+                    let laid = Laid {
+                        display,
+                        asked: *f,
+                        landed: None,
+                    };
+                    self.laid.insert(*w, laid);
+                }
+            }
+            d.frame_windows(&sized);
         }
     }
 
@@ -690,7 +804,7 @@ impl EmulatedWorkspaces {
         let persist_began = d.now();
         self.persist();
         let queue_began = d.now();
-        self.move_windows(d, &writes);
+        self.move_windows(d, &writes, &frames, &g);
         self.apply_app_visibility(d, &frames, &g);
         let ms = |a: std::time::Instant, b: std::time::Instant| (b - a).as_secs_f64() * 1000.0;
         if let Some(t) = self.trace.get_mut(boundary_at) {
@@ -924,7 +1038,8 @@ impl EmulatedWorkspaces {
                 self.ledger.views(),
             );
             self.saved.clear();
-            self.home.clear();
+            self.placed.clear();
+            self.laid.clear();
             self.parked.clear();
             self.enforce_attempts.clear();
             self.park_request.clear();
@@ -977,9 +1092,9 @@ impl EmulatedWorkspaces {
                         self.parked.insert(id);
                     }
                 }
-                for (id, f) in merged.home {
+                for (id, p) in merged.placed {
                     if assigned.contains_key(&id) {
-                        self.home.insert(id, f);
+                        self.placed.insert(id, p);
                     }
                 }
             }
@@ -1120,14 +1235,12 @@ impl EmulatedWorkspaces {
         if g.displays.is_empty() || frames.is_empty() {
             return;
         }
-        let systemic = self.last_geometry.as_ref().is_some_and(|prev| *prev != g);
+        let systemic = self.last_geometry.as_ref().is_some_and(|prev| !prev.same_rig(&g));
         self.last_geometry = Some(g.clone());
         if systemic {
             self.enforce_attempts.clear();
-            if self.full_rig(&g) {
-                let writes = self.come_home(frames, &g);
-                self.move_windows(d, &writes);
-            }
+            let writes = self.re_place(frames, &g);
+            self.move_windows(d, &writes, frames, &g);
         }
         self.reconcile_visibility(d, frames, &g);
         if std::mem::take(&mut self.hiding_changed) {
@@ -1269,9 +1382,8 @@ impl EmulatedWorkspaces {
                 let placed = !own_write && !systemic && self.app_placed(w, f, &g);
                 if placed {
                     self.saved.insert(w, *f);
-                    if self.full_rig(&g) {
-                        self.home.insert(w, *f);
-                    }
+                    self.laid.remove(&w);
+                    self.note_layout(w, f, &g);
                     promised = true;
                 }
                 let want = park_frame(*f, &g);
@@ -1349,16 +1461,17 @@ impl EmulatedWorkspaces {
         if newly_parked || restored || promised {
             self.persist();
         }
-        self.move_windows(d, &writes);
+        self.move_windows(d, &writes, frames, &g);
         if newly_parked || restored {
             self.apply_app_visibility(d, frames, &g);
         }
     }
 
-    /// The full rig is back: every window on screen returns to its docked
-    /// frame. macOS piled them onto the laptop, and what is left of that pile
-    /// is not anyone's placement.
-    fn come_home(
+    /// The display set changed: every window on screen takes its layout's
+    /// share of the display its monitor now stands on. macOS piled the
+    /// vanished display's windows onto what is left, keeping their size, and
+    /// what is left of that pile is not anyone's placement.
+    fn re_place(
         &mut self,
         frames: &HashMap<WindowId, (Pid, Rect)>,
         g: &Geometry,
@@ -1372,21 +1485,18 @@ impl EmulatedWorkspaces {
             if !on_screen {
                 continue;
             }
-            let Some(host) = self.host_rect(*w, g) else {
+            let (Some(host), Some(p)) = (self.host_rect(*w, g), self.placed.get(w).copied()) else {
                 continue;
             };
-            let Some(hm) = self.home.get(w).copied().filter(|hm| g.display_of(hm) == Some(host)) else {
-                continue;
-            };
-            if same_position(f, &hm) {
+            let want = p.on(&host, &g.area(&host), f, self.sized_on(*w));
+            if want.approx_eq(f, 1.0) {
                 continue;
             }
-            let want = Rect { x: hm.x, y: hm.y, ..*f };
             self.note(
                 ParkTrace::new(*w, ParkTraceKind::Rehost)
                     .observed(*f)
                     .requested(want)
-                    .detail("the full rig is back; to its docked frame"),
+                    .detail("the display set changed; to its share of its display"),
             );
             self.homecoming.insert(*w, want);
             writes.push((*pid, *w, want));
@@ -1407,9 +1517,10 @@ impl EmulatedWorkspaces {
             pid: frames.get(&window).map(|(p, _)| *p).unwrap_or(Pid(0)),
             hold: Vec::new(),
         }]);
-        let write = self.restore(window, &frames, &Geometry::read(d));
+        let g = Geometry::read(d);
+        let write = self.restore(window, &frames, &g);
         self.persist();
-        self.move_windows(d, write.as_slice());
+        self.move_windows(d, write.as_slice(), &frames, &g);
     }
 
     /// Replace the in-memory model with the state file's, when it validates.
@@ -1455,7 +1566,7 @@ impl EmulatedWorkspaces {
         );
         self.learn_monitors = !ps.monitors_assigned;
         self.saved.clear();
-        self.home.clear();
+        self.placed.clear();
         self.parked.clear();
         self.enforce_attempts.clear();
         self.park_request.clear();
@@ -1466,8 +1577,8 @@ impl EmulatedWorkspaces {
                 self.saved.insert(w.id, f);
                 self.parked.insert(w.id);
             }
-            if let Some(f) = w.home {
-                self.home.insert(w.id, f);
+            if let Some(p) = w.placed {
+                self.placed.insert(w.id, p);
             }
         }
     }
@@ -1491,7 +1602,7 @@ impl EmulatedWorkspaces {
                     .contains(&id)
                     .then(|| self.saved.get(&id).copied())
                     .flatten(),
-                home: self.home.get(&id).copied(),
+                placed: self.placed.get(&id).copied(),
             })
             .collect();
         let m = self.ledger.monitors();
@@ -1566,8 +1677,8 @@ impl EmulatedWorkspaces {
         let (pid, f) = (*pid, *f);
         if !stale {
             self.saved.insert(window, f);
-            if self.full_rig(g) {
-                self.home.insert(window, f);
+            if !self.replugging {
+                self.note_layout(window, &f, g);
             }
         }
         self.parked.insert(window);
@@ -1606,10 +1717,11 @@ impl EmulatedWorkspaces {
     /// benefit; the window keeps its own size, and the next park records what
     /// the window really is.
     ///
-    /// The display gap is the rig changing while the window was hidden. With
-    /// the full rig present, the window's `home` frame on its host comes first
-    /// — land exactly where it was docked, whatever the laptop made of the
-    /// promise. Otherwise: the promise itself, when it already lies on the
+    /// The display gap is the rig changing while the window was hidden. The
+    /// window's layout comes first, whatever the laptop made of the promise:
+    /// on the display it was made on, its position; on one of another size,
+    /// its share of it, size and all, the one case a size is written.
+    /// Without a layout: the promise itself, when it already lies on the
     /// host; then [`Self::carry_over`].
     fn restore(
         &mut self,
@@ -1646,30 +1758,24 @@ impl EmulatedWorkspaces {
                 ParkTraceKind::PoisonedPromise,
                 rehome_into(&s, host.unwrap_or(g.main)),
             ),
-            Some(s) => match host {
-                // With the full rig present the docked frame is where the user
-                // put the window. A promise made on the laptop is only what
-                // macOS left of it, and it can fit the host too: the laptop
-                // and the main display share an origin.
-                Some(h) if self.full_rig(g) => {
-                    let home = self
-                        .home
-                        .get(&window)
-                        .copied()
-                        .filter(|hm| g.display_of(hm) == Some(h) && !same_position(hm, &s));
-                    match home {
-                        Some(hm) => {
-                            let want = Rect { x: hm.x, y: hm.y, ..s };
-                            self.saved.insert(window, want);
-                            (ParkTraceKind::Rehost, want)
-                        }
-                        None if g.display_of(&s) == Some(h) => (ParkTraceKind::Restore, s),
-                        None => self.carry_over(window, s, h, g),
+            // A promise made on the laptop is only what macOS left of the
+            // window, and it can fit the host too: the laptop and the main
+            // display share an origin. The layout is where the user put it.
+            Some(s) => match (host, self.placed.get(&window).copied()) {
+                (Some(h), Some(p)) => {
+                    let want = p.on(&h, &g.area(&h), &f, self.sized_on(window));
+                    if same_position(&want, &s) && want.w == f.w && want.h == f.h {
+                        (ParkTraceKind::Restore, want)
+                    } else {
+                        self.saved.insert(window, want);
+                        (ParkTraceKind::Rehost, want)
                     }
                 }
-                Some(h) if g.display_of(&s) == Some(h) => (ParkTraceKind::Restore, s),
-                Some(h) => self.carry_over(window, s, h, g),
-                None => (ParkTraceKind::Restore, s),
+                (Some(h), None) if g.display_of(&s) == Some(h) => {
+                    (ParkTraceKind::Restore, Rect { x: s.x, y: s.y, ..f })
+                }
+                (Some(h), None) => self.carry_over(window, s, h, g),
+                (None, _) => (ParkTraceKind::Restore, Rect { x: s.x, y: s.y, ..f }),
             },
             // Parked with no promise (its real frame was never trustworthily
             // seen — see park()'s sliver guard): don't leave it a 1px sliver
@@ -1690,8 +1796,7 @@ impl EmulatedWorkspaces {
     }
 
     /// Carry a window that stays on screen onto the display its monitor now
-    /// stands on: its `home` frame when that is on the new host, else its
-    /// frame carried over proportionally from the display it stands on —
+    /// stands on: by its layout, else scaled from the display it stands on —
     /// `restore`'s rule, for a window that was never parked.
     fn rehost(
         &mut self,
@@ -1704,24 +1809,20 @@ impl EmulatedWorkspaces {
         if g.display_of(&f) == Some(host) {
             return None;
         }
-        let home = self.home.get(&window).filter(|hm| g.display_of(hm) == Some(host));
-        let want = match (home, g.display_of(&f)) {
-            (Some(hm), _) => Rect { x: hm.x, y: hm.y, ..f },
-            (None, Some(from)) => {
-                let t = f.translate_between(&from, &host);
-                Rect { x: t.x, y: t.y, ..f }
-            }
-            (None, None) => clamp_into(&f, &host),
+        let area = g.area(&host);
+        let want = match (self.placed.get(&window), g.display_of(&f)) {
+            (Some(p), _) => p.on(&host, &area, &f, self.sized_on(window)),
+            (None, Some(from)) => f.scale_between(&g.area(&from), &area),
+            (None, None) => clamp_into(&f, &area),
         };
         self.note(ParkTrace::new(window, ParkTraceKind::Rehost).observed(f).requested(want));
         Some((pid, window, want))
     }
 
-    /// A promise made on another display than its host: to the window's
-    /// `home` when that is on the host, else carried over proportionally from
-    /// the display it was made on, else clamped in. The target replaces the
-    /// promise, so what the core is told and what the write asks for stay one
-    /// frame.
+    /// A promise made on another display than its host, with no layout to go
+    /// by: scaled from the display it was made on, else clamped in. The
+    /// target replaces the promise, so what the core is told and what the
+    /// write asks for stay one frame.
     fn carry_over(
         &mut self,
         window: WindowId,
@@ -1729,14 +1830,10 @@ impl EmulatedWorkspaces {
         host: Rect,
         g: &Geometry,
     ) -> (ParkTraceKind, Rect) {
-        let home = self.home.get(&window).filter(|hm| g.display_of(hm) == Some(host));
-        let want = match (home, g.display_of(&s)) {
-            (Some(hm), _) => Rect { x: hm.x, y: hm.y, ..s },
-            (None, Some(from)) => {
-                let t = s.translate_between(&from, &host);
-                Rect { x: t.x, y: t.y, ..s }
-            }
-            (None, None) => clamp_into(&s, &host),
+        let area = g.area(&host);
+        let want = match g.display_of(&s) {
+            Some(from) => s.scale_between(&g.area(&from), &area),
+            None => clamp_into(&s, &area),
         };
         self.saved.insert(window, want);
         (ParkTraceKind::Rehost, want)
@@ -2170,13 +2267,31 @@ fn clamp_into(f: &Rect, area: &Rect) -> Rect {
     }
 }
 
+impl Placed {
+    /// Where this layout puts a window on `display`, whose usable area is
+    /// `area`, when the window is `now` this size, had on `sized_on`. On
+    /// another display: its share of it, size and all. On its own: its
+    /// position, keeping the window's size if it was had there, since a size
+    /// that differs there is an app's, the user's, or one already refused.
+    fn on(&self, display: &Rect, area: &Rect, now: &Rect, sized_on: Option<Rect>) -> Rect {
+        if self.display != *display || sized_on.is_some_and(|d| d != *display) {
+            return self.frame.scale_between(&self.area, area);
+        }
+        Rect {
+            x: self.frame.x,
+            y: self.frame.y,
+            ..*now
+        }
+    }
+}
+
 /// The merged model an S-after-R resume adopts.
 struct FreshMerge {
     assign: BTreeMap<WindowId, Claim>,
     /// Restore promises revived from the file (window is parked again).
     saved: Vec<(WindowId, Rect)>,
-    /// Docked frames revived from the file.
-    home: Vec<(WindowId, Rect)>,
+    /// Layouts revived from the file.
+    placed: Vec<(WindowId, Placed)>,
 }
 
 /// Merge a fresh (R-mode) session's model with the pre-R state file. The file
@@ -2196,7 +2311,7 @@ fn merge_fresh_session(
 ) -> FreshMerge {
     let mut assign = model.clone();
     let mut saved = Vec::new();
-    let mut home = Vec::new();
+    let mut placed = Vec::new();
     for w in &file.windows {
         let model_knows = model.contains_key(&w.id);
         let noise_sliver =
@@ -2213,15 +2328,15 @@ fn merge_fresh_session(
             if let Some(f) = w.saved {
                 saved.push((w.id, f));
             }
-            if let Some(f) = w.home {
-                home.push((w.id, f));
+            if let Some(p) = w.placed {
+                placed.push((w.id, p));
             }
         }
     }
     FreshMerge {
         assign,
         saved,
-        home,
+        placed,
     }
 }
 
@@ -2267,6 +2382,7 @@ mod tests {
             park_host: MAIN,
             legacy_host: SECOND,
             displays: vec![MAIN, SECOND],
+            usable: vec![usable(MAIN), usable(SECOND)],
         }
     }
 
@@ -2283,6 +2399,16 @@ mod tests {
             30.0
         } else {
             33.0
+        }
+    }
+
+    /// The display less what it keeps for itself: where windows may go.
+    fn usable(d: Rect) -> Rect {
+        let inset = usable_inset(d);
+        Rect {
+            y: d.y + inset,
+            h: d.h - inset,
+            ..d
         }
     }
 
@@ -2356,6 +2482,10 @@ mod tests {
         /// flight.
         queueing: std::cell::Cell<bool>,
         queue: std::cell::RefCell<Vec<Move>>,
+        /// Whole-frame writes waiting with the moves.
+        framing: std::cell::RefCell<Vec<(Pid, WindowId, Rect)>>,
+        /// The narrowest an app lets a written size make its windows.
+        min_w: std::cell::Cell<f64>,
     }
 
     impl FakeDesktop {
@@ -2377,13 +2507,16 @@ mod tests {
                 unhideable: std::cell::RefCell::new(HashSet::new()),
                 queueing: std::cell::Cell::new(false),
                 queue: std::cell::RefCell::new(Vec::new()),
+                framing: std::cell::RefCell::new(Vec::new()),
+                min_w: std::cell::Cell::new(0.0),
             }
         }
 
         /// The display set changes. macOS moves every window whose display
         /// vanished onto the remaining one before anybody is told, keeping its
         /// offset from the display's origin — the fact that makes `saved`
-        /// useless for coming home, and `home` necessary.
+        /// useless for coming home, and a layout kept apart from it
+        /// necessary.
         fn set_displays(&self, ds: &[Rect]) {
             let old = self.displays.replace(ds.to_vec());
             let main = ds.first().copied().unwrap_or(MAIN);
@@ -2403,13 +2536,12 @@ mod tests {
             }
         }
 
-        /// A write that DOES carry AXSize, as `ax::set_frame` still issues for
-        /// a cross-display move. Not reachable through the `Desktop` port any
-        /// more — it is modelled so the tests can still show what the port's
-        /// position-only write buys: the WindowServer caps the height to what
+        /// A write that DOES carry AXSize, as `frame_windows` and the core's
+        /// cross-display move issue: the WindowServer caps the height to what
         /// the display owning the ORIGIN can hold (an origin off to the left of
         /// every display is main's), and a request that does not fit also loses
-        /// its y to that display's top inset.
+        /// its y to that display's top inset. What a park's position-only
+        /// write is spared.
         fn write_whole_frame(&self, pid: Pid, w: WindowId, f: Rect) {
             let owner = self
                 .displays
@@ -2473,6 +2605,8 @@ mod tests {
             self.queueing.set(false);
             let queued = std::mem::take(&mut *self.queue.borrow_mut());
             self.move_windows(&queued);
+            let framed = std::mem::take(&mut *self.framing.borrow_mut());
+            self.frame_windows(&framed);
         }
 
         /// The window really closes: gone from the window server too.
@@ -2533,6 +2667,11 @@ mod tests {
                 return;
             }
             if self.queueing.get() {
+                // As the real queues: the newest write to a window replaces
+                // its unsent older one.
+                self.framing
+                    .borrow_mut()
+                    .retain(|(_, w, _)| !moves.iter().any(|m| m.window == *w));
                 self.queue.borrow_mut().extend_from_slice(moves);
                 return;
             }
@@ -2550,12 +2689,35 @@ mod tests {
             }
         }
 
+        /// Through the capped write the port's moves avoid: a frame that fits
+        /// its display's usable area is what keeps the cap from cutting it.
+        fn frame_windows(&self, frames: &[(Pid, WindowId, Rect)]) {
+            if self.frozen.get() {
+                return;
+            }
+            if self.queueing.get() {
+                self.queue
+                    .borrow_mut()
+                    .retain(|m| !frames.iter().any(|(_, w, _)| m.window == *w));
+                self.framing.borrow_mut().extend_from_slice(frames);
+                return;
+            }
+            for (pid, w, f) in frames {
+                let clamped = Rect {
+                    w: f.w.max(self.min_w.get()),
+                    ..*f
+                };
+                self.write_whole_frame(*pid, *w, clamped);
+            }
+        }
+
         fn in_flight(&self, window: WindowId) -> bool {
             self.queue.borrow().iter().any(|m| m.window == window)
+                || self.framing.borrow().iter().any(|(_, w, _)| *w == window)
         }
 
         fn busy(&self) -> bool {
-            !self.queue.borrow().is_empty()
+            !self.queue.borrow().is_empty() || !self.framing.borrow().is_empty()
         }
 
         fn hide_app(&self, pid: Pid) {
@@ -2660,7 +2822,8 @@ mod tests {
         fn screens(&self) -> Screens {
             let all = self.displays.borrow().clone();
             let main = all.first().copied().unwrap_or(MAIN);
-            Screens { all, main }
+            let usable = all.iter().copied().map(usable).collect();
+            Screens { all, usable, main }
         }
 
         fn existing_windows(&self, ids: &[WindowId]) -> Option<HashSet<WindowId>> {
@@ -3609,8 +3772,8 @@ mod tests {
             b.note_scan(&d, &d.scan(), &d.screens(), None);
             b.move_window_to_workspace(&d, w(1), ws(2)).unwrap();
             b.saved.insert(w(1), saved);
-            // A docked frame outranks the promise; only the promise is at issue.
-            b.home.remove(&w(1));
+            // A layout outranks the promise; only the promise is at issue.
+            b.placed.remove(&w(1));
 
             b.switch_workspace(&d, ws(2), None);
             let restored = d.frame(w(1));
@@ -3636,7 +3799,7 @@ mod tests {
             monitor: vm(1),
             owner: Pid(10),
             saved,
-            home: None,
+            placed: None,
         };
         let file = PersistedState {
             version: statefile::VERSION,
@@ -3891,7 +4054,9 @@ mod tests {
 
         // J/K: the other monitor's windows come up, this one's go down.
         b.view_monitor(&d, vm(2)).unwrap();
-        assert_eq!(d.frame(w(2)), rehomed, "back where the laptop had it");
+        assert_ne!(d.frame(w(2)), rehomed, "not where macOS piled it");
+        assert!(same_share(share(d.frame(w(2)), MAIN), share(rect(2000.0, 100.0), SECOND), MAIN));
+        let rehomed = d.frame(w(2));
         assert!(in_park_corner(&d.frame(w(1)), &geo()));
         assert!(!d.is_hidden(Pid(20)));
         assert_eq!(b.view_monitor(&d, vm(3)), Err(MonitorOutOfRange(vm(3))));
@@ -3914,27 +4079,159 @@ mod tests {
         assert!(b.enforce_attempts.is_empty());
     }
 
-    /// Monitor memory. The frame macOS re-homed the window to is what `saved`
-    /// can know; `home` is the docked frame, and it is what the window comes
-    /// back to when its display returns.
+    /// A window's share of a display's usable area: where it sits and how
+    /// much it covers, each as a fraction.
+    fn share(f: Rect, display: Rect) -> [f64; 4] {
+        let a = usable(display);
+        [(f.x - a.x) / a.w, (f.y - a.y) / a.h, f.w / a.w, f.h / a.h]
+    }
+
+    /// Two shares that agree to within a point on `display`.
+    fn same_share(a: [f64; 4], b: [f64; 4], display: Rect) -> bool {
+        let a_ = usable(display);
+        let scale = [a_.w, a_.h, a_.w, a_.h];
+        (0..4).all(|i| ((a[i] - b[i]) * scale[i]).abs() <= 1.0)
+    }
+
+    /// The laptop alone, as it is when the dock's displays are gone.
+    const LAPTOP: Rect = Rect {
+        x: 0.0,
+        y: 0.0,
+        w: 1470.0,
+        h: 956.0,
+    };
+
+    /// The complaint this layout answers. Undocked, a window that filled its
+    /// display was left at its docked size and wherever macOS piled it; back
+    /// on the dock it stayed at whatever size the laptop had squeezed it to.
+    /// A window takes its share of whatever display its monitor is on, size
+    /// and all, both ways.
     #[test]
-    fn replugging_brings_a_window_home_to_its_docked_frame() {
-        let (d, mut b) = rig();
-        assert_eq!(b.home[&w(2)], rect(2000.0, 100.0), "docked frame remembered");
+    fn a_full_size_window_stays_full_size_through_an_undock_and_a_redock() {
+        let d = FakeDesktop::new(&[
+            (w(1), Pid(10), usable(MAIN)),
+            (w(2), Pid(20), rect(2000.0, 100.0)),
+        ]);
+        let mut b = EmulatedWorkspaces::new(3);
+        rescan(&d, &mut b);
+
+        d.set_displays(&[LAPTOP]);
+        rescan(&d, &mut b);
+        assert_eq!(d.frame(w(1)), usable(LAPTOP), "fills the laptop");
+        rescan(&d, &mut b);
+
+        d.set_displays(&[MAIN, SECOND]);
+        rescan(&d, &mut b);
+        assert_eq!(d.frame(w(1)), usable(MAIN), "fills its display again");
+        assert!(on(SECOND, d.frame(w(2))));
+    }
+
+    /// Undock and re-dock, over and over: a window comes back exactly, not a
+    /// point off for each trip.
+    #[test]
+    fn a_window_comes_back_exactly_however_often_it_is_undocked() {
+        let d = FakeDesktop::new(&[(w(1), Pid(10), rect(100.0, 100.0))]);
+        let mut b = EmulatedWorkspaces::new(3);
+        rescan(&d, &mut b);
+        for trip in 0..3 {
+            d.set_displays(&[LAPTOP]);
+            rescan(&d, &mut b);
+            rescan(&d, &mut b);
+            d.set_displays(&[MAIN]);
+            rescan(&d, &mut b);
+            rescan(&d, &mut b);
+            assert_eq!(d.frame(w(1)), rect(100.0, 100.0), "trip {trip}");
+        }
+    }
+
+    /// An app won't let a window narrower than its minimum, so on the laptop
+    /// it takes more of the screen than its share. Taken as the layout, that
+    /// would carry back to the dock as a wider window than the user left.
+    #[test]
+    fn an_app_that_clamps_ordos_size_keeps_its_layout() {
+        let d = FakeDesktop::new(&[(w(1), Pid(10), rect(100.0, 100.0))]);
+        d.min_w.set(700.0);
+        let mut b = EmulatedWorkspaces::new(3);
+        rescan(&d, &mut b);
+        d.set_displays(&[LAPTOP]);
+        rescan(&d, &mut b);
+        rescan(&d, &mut b);
+        assert_eq!(d.frame(w(1)).w, 700.0, "as narrow as the app allows");
         d.set_displays(&[MAIN]);
         rescan(&d, &mut b);
-        // Undocked, the user views monitor 2 and moves w2 around on the laptop:
-        // the docked frame must survive all of it.
-        b.view_monitor(&d, vm(2)).unwrap();
-        d.place(w(2), rect(300.0, 300.0));
+        assert_eq!(d.frame(w(1)), rect(100.0, 100.0));
+    }
+
+    /// A window moved and sent to another workspace before Ordo looked again
+    /// comes back where it was moved to: the park is a look at it too.
+    #[test]
+    fn a_move_made_just_before_a_park_is_kept() {
+        let (d, mut b) = rig();
+        d.place(w(1), rect(500.0, 500.0));
+        b.move_window_to_workspace(&d, w(1), ws(2)).unwrap();
+        b.switch_workspace(&d, ws(2), None);
+        assert_eq!(d.frame(w(1)), rect(500.0, 500.0));
+    }
+
+    /// A restart while undocked: the parked monitor 2 window's layout comes
+    /// back from the state file, so re-docking puts it exactly where it was.
+    #[test]
+    fn a_restart_keeps_a_parked_windows_layout() {
+        let dir = std::env::temp_dir().join(format!("ordo-layout-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        let d = FakeDesktop::new(&[
+            (w(1), Pid(10), rect(100.0, 100.0)),
+            (w(2), Pid(20), rect(2000.0, 100.0)),
+        ]);
+        let mut b = EmulatedWorkspaces::with_persistence(3, path.clone());
         rescan(&d, &mut b);
-        assert_eq!(b.home[&w(2)], rect(2000.0, 100.0), "not overwritten undocked");
+        d.set_displays(&[MAIN]);
+        rescan(&d, &mut b);
+        assert!(in_park_corner(&d.frame(w(2)), &geo()));
+
+        let mut again = EmulatedWorkspaces::with_persistence(3, path);
+        rescan(&d, &mut again);
+        d.set_displays(&[MAIN, SECOND]);
+        rescan(&d, &mut again);
+        assert_eq!(d.frame(w(2)), rect(2000.0, 100.0));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// One layout across every rig. Undocked, the monitor 2 window viewed on
+    /// the laptop takes the same share of it it had of its own display; moved
+    /// there, the move is its layout, and back on the dock it takes that
+    /// share of its display.
+    #[test]
+    fn a_window_keeps_one_layout_scaled_to_every_display() {
+        let (d, mut b) = rig();
+        d.set_displays(&[MAIN]);
+        rescan(&d, &mut b);
+        b.view_monitor(&d, vm(2)).unwrap();
+        assert!(
+            same_share(share(d.frame(w(2)), MAIN), share(rect(2000.0, 100.0), SECOND), MAIN),
+            "its share of the second display, on the laptop: {:?}",
+            d.frame(w(2))
+        );
+
+        let moved = Rect {
+            x: 960.0,
+            y: 30.0,
+            w: 960.0,
+            h: 1050.0,
+        };
+        d.place(w(2), moved);
+        rescan(&d, &mut b);
         b.view_monitor(&d, vm(1)).unwrap();
         b.take_trace();
 
         d.set_displays(&[MAIN, SECOND]);
         rescan(&d, &mut b);
-        assert_eq!(d.frame(w(2)), rect(2000.0, 100.0), "exactly where it was");
+        assert!(
+            same_share(share(d.frame(w(2)), SECOND), share(moved, MAIN), SECOND),
+            "the right half of the second display: {:?}",
+            d.frame(w(2))
+        );
         assert_eq!(d.frame(w(1)), rect(100.0, 100.0));
         assert!(!d.is_hidden(Pid(20)));
         assert!(b
@@ -4231,21 +4528,19 @@ mod tests {
         d.place(w(1), pile);
         d.place(w(3), pile);
         rescan(&d, &mut b);
+        assert_eq!(d.frame(w(1)), rect(100.0, 100.0), "unpiled at the unplug");
         b.move_window_to_workspace(&d, w(3), ws(2)).unwrap();
 
         d.set_displays(&[MAIN, SECOND]);
         let stale = frames_of(&d);
         b.note_scan(&d, &d.scan(), &d.screens(), None);
         b.enforce_placement(&d, &stale, &d.screens(), d.front());
-        assert_eq!(d.frame(w(1)), rect(100.0, 100.0), "left on screen, back home");
-        assert_eq!(b.believed_frames(&stale, &d.screens(), d.now())[&w(1)], rect(100.0, 100.0));
+        assert_eq!(d.frame(w(1)), rect(100.0, 100.0), "left on screen, still home");
         assert_eq!(d.frame(w(2)), rect(2000.0, 100.0));
 
         rescan(&d, &mut b);
         b.move_window_to_workspace(&d, w(3), ws(1)).unwrap();
         assert_eq!(d.frame(w(3)), rect(300.0, 300.0), "hidden while undocked, back home");
-        assert_eq!(b.home[&w(1)], rect(100.0, 100.0));
-        assert_eq!(b.home[&w(3)], rect(300.0, 300.0));
     }
 
     /// Undocked while viewing monitor 2, so the laptop shows monitor 2 and
@@ -4282,8 +4577,8 @@ mod tests {
         let (d, mut b) = rig();
         d.set_displays(&[MAIN]);
         rescan(&d, &mut b);
-        // A different panel stands in the second position: too small to hold
-        // the old docked frame, so the laptop frame is carried over instead.
+        // A different panel stands in the second position: the window takes
+        // the same share of it.
         let small = Rect {
             x: 1920.0,
             y: 0.0,
@@ -4297,7 +4592,10 @@ mod tests {
             small.contains(f.center()),
             "landed on the new display: {f:?}"
         );
-        assert_eq!((f.w, f.h), (800.0, 600.0), "size is the window's own");
+        assert!(
+            same_share(share(f, small), share(rect(2000.0, 100.0), SECOND), small),
+            "its share of the display it had: {f:?}"
+        );
     }
 
     /// A window on screen whose last restore landed, then found back at its
@@ -4415,7 +4713,7 @@ mod tests {
     }
 
     #[test]
-    fn the_state_file_carries_the_layout_and_the_docked_frames() {
+    fn the_state_file_carries_the_monitors_and_each_windows_layout() {
         let dir = std::env::temp_dir().join(format!("ordo-vm-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("state.json");
@@ -4431,14 +4729,13 @@ mod tests {
         b.view_monitor(&d, vm(2)).unwrap();
         b.set_virtual_monitors(&d, false);
 
-        // A restart: the layout, the declarations and the docked frames are
-        // all back before the first scan.
+        // A restart: the monitors, the declarations and each window's layout
+        // are all back before the first scan.
         let again = EmulatedWorkspaces::with_persistence(3, path);
         assert_eq!(again.monitors().count, 2);
         assert_eq!(again.monitors().viewed, vm(2));
         assert!(!again.monitors().enabled);
         assert_eq!(again.window_monitors()[&w(2)], vm(2));
-        assert_eq!(again.home[&w(2)], rect(2000.0, 100.0));
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -4461,7 +4758,7 @@ mod tests {
             monitor: vm(1), // the placeholder every old window carries
             owner: Pid(10),
             saved,
-            home: None,
+            placed: None,
         };
         statefile::save(
             &path,
@@ -4527,7 +4824,7 @@ mod tests {
                 monitor: vm(1),
                 owner: Pid(10),
                 saved: Some(rect(100.0, 100.0)),
-                home: None,
+                placed: None,
             }],
         };
         statefile::save(&path, &stale);

@@ -191,6 +191,7 @@ pub(crate) fn apply_snapshot(s: &mut State, snap: &WorldSnapshot) {
                 id: m.id,
                 frame: m.frame,
                 is_main: m.is_main,
+                usable: m.usable,
             },
         );
     }

@@ -64,6 +64,9 @@ pub struct Screens {
     /// and it has to clear the display at the end of the arrangement —
     /// escaping past an interior edge just lands the window on the neighbour.
     pub all: Vec<Rect>,
+    /// The part of each of `all` windows may use, in the same order; empty
+    /// when unknown, and each display is then usable whole.
+    pub usable: Vec<Rect>,
     /// The main display's frame — where a re-homed window must land, because
     /// that is where the user is looking.
     pub main: Rect,
@@ -98,15 +101,21 @@ pub trait Desktop {
     /// recorded the shortened frame as the window's real one — a ratchet that
     /// shaved a few points off tall windows every switch, permanently. Writing
     /// the position alone was measured never to resize a window, at any origin,
-    /// so a move that cannot express a size cannot ratchet. Nothing this model
-    /// does is a resize; the one caller that genuinely resizes (the core's
-    /// cross-display `SetWindowFrame`) does not come through this port.
+    /// so a move that cannot express a size cannot ratchet. A park or a
+    /// restore onto the display a window came from is never a resize; the one
+    /// resize this model makes goes through [`Desktop::frame_windows`].
     ///
     /// Batched because a switch parks the outgoing workspace and restores the
     /// incoming one in a single breath.
     ///
     /// The moves may land after this returns; see [`Desktop::in_flight`].
     fn move_windows(&self, moves: &[Move]);
+
+    /// Move each window and size it: for a window carried onto a display of
+    /// another size, which takes the same share of it. The frame fits that
+    /// display's usable area, so the cap `move_windows` steers clear of has
+    /// nothing to cut. In flight like a move.
+    fn frame_windows(&self, frames: &[(Pid, WindowId, Rect)]);
 
     /// Whether a write to this window may not show yet in what the desktop
     /// reports: asked for and not yet seen through. What this port reports

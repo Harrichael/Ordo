@@ -133,25 +133,17 @@ impl Rect {
             && (self.h - other.h).abs() <= eps
     }
 
-    /// Re-home a window frame from one monitor to another, preserving the
-    /// window's *relative* position (proportional center mapping) so monitors
-    /// of different resolutions still feel symmetric. Size is kept, clamped to
-    /// fit; the result always lies fully inside `to`.
-    pub fn translate_between(&self, from: &Rect, to: &Rect) -> Rect {
-        let w = self.w.min(to.w);
-        let h = self.h.min(to.h);
-        let rel_x = if from.w > 0.0 {
-            (self.center().x - from.x) / from.w
-        } else {
-            0.5
-        };
-        let rel_y = if from.h > 0.0 {
-            (self.center().y - from.y) / from.h
-        } else {
-            0.5
-        };
-        let x = (to.x + rel_x * to.w - w / 2.0).clamp(to.x, to.x + to.w - w);
-        let y = (to.y + rel_y * to.h - h / 2.0).clamp(to.y, to.y + to.h - h);
+    /// Carry a window frame from one display's usable area to another's,
+    /// keeping its share of each, both where it sits and how much it covers:
+    /// a window filling one display fills the next, one on the left half
+    /// stays on the left half. Whole points, as windows land, and inside `to`.
+    pub fn scale_between(&self, from: &Rect, to: &Rect) -> Rect {
+        let sx = if from.w > 0.0 { to.w / from.w } else { 1.0 };
+        let sy = if from.h > 0.0 { to.h / from.h } else { 1.0 };
+        let w = (self.w * sx).round().min(to.w);
+        let h = (self.h * sy).round().min(to.h);
+        let x = (to.x + (self.x - from.x) * sx).round().clamp(to.x, to.x + to.w - w);
+        let y = (to.y + (self.y - from.y) * sy).round().clamp(to.y, to.y + to.h - h);
         Rect { x, y, w, h }
     }
 }

@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use ordo_core::{
-    MonitorId, Pid, Rect, VirtualMonitorId, VirtualMonitorsWord, WindowId, WorkspaceId,
+    MonitorSnap, Pid, Rect, VirtualMonitorId, VirtualMonitorsWord, WindowId, WorkspaceId,
 };
 use ordo_emulated::{
     Desktop, EmulatedWorkspaces, Move, ParkTrace, Screens, Unhide,
@@ -72,6 +72,12 @@ impl Desktop for AxDesktop {
         std::time::Instant::now()
     }
 
+    fn frame_windows(&self, frames: &[(Pid, WindowId, Rect)]) {
+        for (pid, w, f) in frames {
+            self.queues.set_frame(*pid, *w, *f);
+        }
+    }
+
     fn show_apps(&self, apps: &[Unhide]) {
         for u in apps {
             self.queues.show(u.pid, u.hold.clone());
@@ -81,7 +87,12 @@ impl Desktop for AxDesktop {
     fn screens(&self) -> Screens {
         let displays: Vec<_> = display::active_displays()
             .into_iter()
-            .map(|d| (d.id, d.frame, d.is_main))
+            .map(|d| MonitorSnap {
+                id: d.id,
+                frame: d.frame,
+                is_main: d.is_main,
+                usable: Some(d.usable),
+            })
             .collect();
         screens(&displays)
     }
@@ -95,12 +106,12 @@ impl Desktop for AxDesktop {
 
 /// A look's display read in the model's terms. With no displays (asleep),
 /// a stand-in main display, so a frame computed against it stays sane.
-fn screens(monitors: &[(MonitorId, Rect, bool)]) -> Screens {
+fn screens(monitors: &[MonitorSnap]) -> Screens {
     let main = monitors
         .iter()
-        .find(|(_, _, main)| *main)
+        .find(|m| m.is_main)
         .or_else(|| monitors.first())
-        .map(|(_, f, _)| *f)
+        .map(|m| m.frame)
         .unwrap_or(Rect {
             x: 0.0,
             y: 0.0,
@@ -108,7 +119,8 @@ fn screens(monitors: &[(MonitorId, Rect, bool)]) -> Screens {
             h: 1080.0,
         });
     Screens {
-        all: monitors.iter().map(|(_, f, _)| *f).collect(),
+        all: monitors.iter().map(|m| m.frame).collect(),
+        usable: monitors.iter().map(|m| m.usable.unwrap_or(m.frame)).collect(),
         main,
     }
 }
@@ -138,15 +150,15 @@ impl WorkspaceBackend for EmulatedBackend {
     fn topology(
         &mut self,
         windows: &HashMap<WindowId, (Pid, Rect)>,
-        monitors: &[(MonitorId, Rect, bool)],
+        monitors: &[MonitorSnap],
         user_monitor: Option<VirtualMonitorId>,
     ) -> Result<BackendTopology> {
         self.model
             .note_scan(&self.desktop, windows, &screens(monitors), user_monitor);
         let mons = monitors
             .iter()
-            .map(|(id, _, _)| MonitorWorkspace {
-                monitor: *id,
+            .map(|m| MonitorWorkspace {
+                monitor: m.id,
                 active: self.model.current(),
                 count: self.model.count(),
             })
@@ -252,7 +264,7 @@ impl WorkspaceBackend for EmulatedBackend {
     fn enforce_placement(
         &mut self,
         frames: &HashMap<WindowId, (Pid, Rect)>,
-        monitors: &[(MonitorId, Rect, bool)],
+        monitors: &[MonitorSnap],
         front: Option<Pid>,
     ) {
         self.model
@@ -262,7 +274,7 @@ impl WorkspaceBackend for EmulatedBackend {
     fn believed_frames(
         &self,
         frames: &HashMap<WindowId, (Pid, Rect)>,
-        monitors: &[(MonitorId, Rect, bool)],
+        monitors: &[MonitorSnap],
     ) -> HashMap<WindowId, Rect> {
         self.model
             .believed_frames(frames, &screens(monitors), self.desktop.now())

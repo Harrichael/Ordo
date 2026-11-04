@@ -101,12 +101,22 @@ pub struct PersistedWindow {
     /// self-heals on its next trustworthy sighting, whereas a recorded lie
     /// would strand it at 1px forever.
     pub saved: Option<Rect>,
-    /// The frame the window last held with the FULL rig present — where it
-    /// goes back to when its display returns. Distinct from `saved`, which is
-    /// the frame at park time and, after an unplug, can only ever be the
-    /// laptop frame macOS re-homed the window to.
+    /// Where the window last stood on screen, and on what: its layout.
+    /// Distinct from `saved`, the frame at park time, which after an unplug
+    /// can only ever be the laptop frame macOS re-homed the window to. Files
+    /// from before it kept an absolute docked `home` instead, which is
+    /// dropped: without the display it was on, it can't be scaled.
     #[serde(default)]
-    pub home: Option<Rect>,
+    pub placed: Option<Placed>,
+}
+
+/// A window's frame, the display it stood on, and that display's usable
+/// area, which is what lets it take the same share of any other display.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Placed {
+    pub frame: Rect,
+    pub display: Rect,
+    pub area: Rect,
 }
 
 fn unknown_owner() -> Pid {
@@ -195,7 +205,7 @@ mod tests {
                     monitor: VirtualMonitorId(1),
                     owner: Pid(100),
                     saved: None,
-                    home: None,
+                    placed: None,
                 },
                 PersistedWindow {
                     id: WindowId(9),
@@ -208,11 +218,25 @@ mod tests {
                         w: 800.0,
                         h: 600.0,
                     }),
-                    home: Some(Rect {
-                        x: 2000.0,
-                        y: 20.0,
-                        w: 800.0,
-                        h: 600.0,
+                    placed: Some(Placed {
+                        frame: Rect {
+                            x: 2000.0,
+                            y: 20.0,
+                            w: 800.0,
+                            h: 600.0,
+                        },
+                        display: Rect {
+                            x: 1920.0,
+                            y: 0.0,
+                            w: 1920.0,
+                            h: 1080.0,
+                        },
+                        area: Rect {
+                            x: 1920.0,
+                            y: 25.0,
+                            w: 1920.0,
+                            h: 1055.0,
+                        },
                     }),
                 },
             ],
@@ -254,7 +278,7 @@ mod tests {
         assert_eq!(state.windows[0].owner, Pid(0));
         assert_eq!(state.windows[0].workspace, WorkspaceId(3));
         assert_eq!(state.windows[0].monitor, VirtualMonitorId(1));
-        assert_eq!(state.windows[0].home, None);
+        assert_eq!(state.windows[0].placed, None);
         assert_eq!(state.viewed, VirtualMonitorId(1));
         assert!(state.virtual_monitors_enabled, "virtualization defaults ON");
         assert_eq!(state.virtual_monitor_count, 0, "unknown until displays are seen");

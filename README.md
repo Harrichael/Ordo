@@ -81,7 +81,8 @@ The two rules that make it work:
 - **New-window placement**: a newly created window is corralled onto the focused
   workspace and monitor.
 - **Move window to the adjacent monitor**: `Cmd+Shift+Left/Right` — focus and
-  mouse travel with the window. If that monitor is hidden, the view follows.
+  mouse travel with the window, which keeps its share of the display. If that
+  monitor is hidden, the view follows.
 - **Virtual monitors** (emulated backend): every window is declared onto a
   virtual monitor — a position, left to right, not a piece of hardware. With a
   display per monitor they map one to one. With fewer displays (the laptop
@@ -93,8 +94,11 @@ The two rules that make it work:
   click on empty desktop would, so an empty monitor is still a place to be — and
   `Ctrl+Alt+Cmd+V` toggles virtualization: off collapses every monitor onto the
   display(s) present. The view follows focus — Alt+Tab or Cmd+Tab onto a hidden
-  monitor's window reveals it. Plug the display back in and its windows return
-  to it, at the frames they had, within about a second. Mirrored displays
+  monitor's window reveals it. A window keeps one layout, its share of its
+  display's usable area, so on a display of another size it takes the same
+  share, size and all: one filling the dock's display fills the laptop, and
+  fills the dock's display again when it is plugged back in, within about a
+  second. Moving it on the laptop moves it on the dock too. Mirrored displays
   count once. Persisted in `state.json`; virtualization is on by default.
 - **Carry window to another workspace**: `Ctrl+Cmd+Left/Right` — the focused
   window moves to the adjacent workspace and the view switches with it.

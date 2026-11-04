@@ -19,7 +19,8 @@
 use std::collections::HashMap;
 
 use ordo_core::{
-    MonitorId, Pid, Point, Rect, VirtualMonitorId, VirtualMonitorsWord, WindowId, WorkspaceId,
+    MonitorId, MonitorSnap, Pid, Point, Rect, VirtualMonitorId, VirtualMonitorsWord, WindowId,
+    WorkspaceId,
 };
 use ordo_emulated::{Hiding, ParkTrace};
 
@@ -85,7 +86,7 @@ pub trait WorkspaceBackend {
     fn topology(
         &mut self,
         windows: &HashMap<WindowId, (Pid, Rect)>,
-        monitors: &[(MonitorId, Rect, bool)],
+        monitors: &[MonitorSnap],
         user_monitor: Option<VirtualMonitorId>,
     ) -> Result<BackendTopology>;
 
@@ -209,7 +210,7 @@ pub trait WorkspaceBackend {
     fn enforce_placement(
         &mut self,
         _frames: &HashMap<WindowId, (Pid, Rect)>,
-        _monitors: &[(MonitorId, Rect, bool)],
+        _monitors: &[MonitorSnap],
         _front: Option<Pid>,
     ) {
     }
@@ -223,7 +224,7 @@ pub trait WorkspaceBackend {
     fn believed_frames(
         &self,
         _frames: &HashMap<WindowId, (Pid, Rect)>,
-        _monitors: &[(MonitorId, Rect, bool)],
+        _monitors: &[MonitorSnap],
     ) -> HashMap<WindowId, Rect> {
         HashMap::new()
     }

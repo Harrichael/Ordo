@@ -51,7 +51,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ordo_core::{
-    MonitorId, MonitorSnap, MonitorWs, Pid, Rect, VirtualMonitorId, WindowId, WindowSnap,
+    MonitorSnap, MonitorWs, Pid, Rect, VirtualMonitorId, WindowId, WindowSnap,
     WorkspaceSnap, WorldSnapshot,
 };
 
@@ -361,9 +361,14 @@ impl WorldSource for MacWorldSource {
             self.record_stats(started, stats);
             return Err(Blind::NoDisplays);
         }
-        let known: Vec<(MonitorId, Rect, bool)> = displays
+        let known: Vec<MonitorSnap> = displays
             .iter()
-            .map(|d| (d.id, d.frame, d.is_main))
+            .map(|d| MonitorSnap {
+                id: d.id,
+                frame: d.frame,
+                is_main: d.is_main,
+                usable: Some(d.usable),
+            })
             .collect();
 
         let mut scan = ax::scan();
@@ -522,14 +527,7 @@ impl WorldSource for MacWorldSource {
         }
         self.last_raw.retain(|w, _| frames.contains_key(w));
 
-        let monitors = displays
-            .iter()
-            .map(|d| MonitorSnap {
-                id: d.id,
-                frame: d.frame,
-                is_main: d.is_main,
-            })
-            .collect();
+        let monitors = known;
 
         let facts = &self.facts;
         let windows = scan

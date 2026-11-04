@@ -315,6 +315,7 @@ fn mon(id: u8, x: f64) -> MonitorSnap {
             h: 1080.0,
         },
         is_main: id == 1,
+        usable: None,
     }
 }
 
