@@ -320,6 +320,12 @@ pub struct EmulatedWorkspaces {
     /// The display set changed during a scan that saw no windows (a locked
     /// screen): the next scan that does see them is still the replug's pass.
     replug_unseen: bool,
+    /// Parked windows of the apps that were hidden when the display set last
+    /// changed. macOS re-homes a hidden app's windows onto what is left only
+    /// when the app is shown again, minutes later perhaps, so the first move
+    /// each makes after that is still the replug's pile, not its app laying
+    /// it out anew.
+    rehome_due: HashSet<WindowId>,
     /// When the apps left with nothing on screen are to be hidden: a switch
     /// asks for its un-hides straight away but hides only once the user
     /// settles, and the apps are done with the switches' writes.
@@ -371,6 +377,7 @@ impl EmulatedWorkspaces {
             learn_monitors: false,
             homecoming: HashMap::new(),
             replug_unseen: false,
+            rehome_due: HashSet::new(),
             hides_due: None,
             hiding: Hiding::default(),
             hiding_changed: false,
@@ -703,6 +710,7 @@ impl EmulatedWorkspaces {
             self.last_requested.remove(id);
             self.pending_repark.remove(id);
             self.revealed_at.remove(id);
+            self.rehome_due.remove(id);
         }
     }
 
@@ -1243,6 +1251,15 @@ impl EmulatedWorkspaces {
             self.move_windows(d, &writes, frames, &g);
         }
         self.reconcile_visibility(d, frames, &g);
+        if systemic {
+            let hidden_apps = self.hidden_apps(d, frames).clone();
+            self.rehome_due = self
+                .parked
+                .iter()
+                .filter(|w| frames.get(w).is_some_and(|(p, _)| hidden_apps.contains(p)))
+                .copied()
+                .collect();
+        }
         if std::mem::take(&mut self.hiding_changed) {
             self.apply_app_visibility(d, frames, &g);
         }
@@ -1273,6 +1290,10 @@ impl EmulatedWorkspaces {
         // A window back on screen ends its episode.
         self.enforce_attempts
             .retain(|w, _| !self.ledger.visible(*w, &proj) || stranded.contains(w));
+        // A window restored since takes its frame from its layout, wherever
+        // macOS put it.
+        let parked = &self.parked;
+        self.rehome_due.retain(|w| parked.contains(w));
         // This runs on every snapshot; don't pay for a quiet desktop.
         if hidden.is_empty() && stranded.is_empty() {
             return;
@@ -1310,12 +1331,13 @@ impl EmulatedWorkspaces {
                     .last_requested
                     .get(&w)
                     .is_some_and(|r| near_own_request(f, r));
-            if own_write || systemic {
+            let rehomed = !systemic && !own_write && self.rehome_due.remove(&w);
+            if own_write || systemic || rehomed {
                 // Forgiveness is the decision that hid an app refusing to stay
                 // parked: it looks identical to our own write still landing,
                 // and it was previously silent, so the window was excused on
                 // every pass forever with nothing written down.
-                let withheld = !systemic && self.pending_repark.contains(&w);
+                let withheld = !systemic && !rehomed && self.pending_repark.contains(&w);
                 let t = ParkTrace::new(w, ParkTraceKind::Suppressed)
                     .observed(*f)
                     .ws(
@@ -1328,6 +1350,8 @@ impl EmulatedWorkspaces {
                         "{}; {seen}",
                         if systemic {
                             "display set changed; whole pass uncounted"
+                        } else if rehomed {
+                            "macOS re-homed it after the display change; re-park uncounted"
                         } else if withheld {
                             "our own write; re-park already in flight, none issued"
                         } else {
@@ -1379,7 +1403,7 @@ impl EmulatedWorkspaces {
             // that was never parked (the blind spot) parks properly, capturing
             // its promise on the way.
             if self.parked.contains(&w) {
-                let placed = !own_write && !systemic && self.app_placed(w, f, &g);
+                let placed = !own_write && !systemic && !rehomed && self.app_placed(w, f, &g);
                 if placed {
                     self.saved.insert(w, *f);
                     self.laid.remove(&w);
@@ -4124,6 +4148,38 @@ mod tests {
         rescan(&d, &mut b);
         assert_eq!(d.frame(w(1)), usable(MAIN), "fills its display again");
         assert!(on(SECOND, d.frame(w(2))));
+    }
+
+    /// Undocked with a parked window's app hidden: macOS leaves that window
+    /// be until the app is shown again, then squeezes it onto the laptop and
+    /// keeps 40pt of it on screen. Coming on a pass after the display
+    /// change's own, that read as the app laying the window out anew, and the
+    /// window came back as a 40pt strip at the laptop's edge from then on.
+    #[test]
+    fn a_hidden_apps_window_macos_rehomes_late_keeps_its_layout() {
+        let d = FakeDesktop::new(&[
+            (w(1), Pid(10), usable(MAIN)),
+            (w(2), Pid(20), rect(2000.0, 100.0)),
+        ]);
+        let mut b = EmulatedWorkspaces::new(3);
+        rescan(&d, &mut b);
+        b.move_window_to_workspace(&d, w(1), ws(2)).unwrap();
+        d.hide_app(Pid(10));
+        b.note_app_visibility(Pid(10), true);
+        rescan(&d, &mut b);
+
+        d.set_displays(&[LAPTOP]);
+        rescan(&d, &mut b);
+
+        d.hidden.borrow_mut().remove(&Pid(10));
+        b.note_app_visibility(Pid(10), false);
+        let laptop = usable(LAPTOP);
+        d.place(w(1), Rect { x: 40.0 - laptop.w, ..laptop });
+        rescan(&d, &mut b);
+        assert!(in_park_corner(&d.frame(w(1)), &Geometry::of(&d.screens())), "parked again");
+
+        b.switch_workspace(&d, ws(2), None);
+        assert_eq!(d.frame(w(1)), laptop, "fills the laptop");
     }
 
     /// Undock and re-dock, over and over: a window comes back exactly, not a
